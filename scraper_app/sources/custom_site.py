@@ -1,5 +1,6 @@
 from botasaurus.browser import Driver, Wait, browser
 
+from ..browser_runtime import resolve_browser_arguments, resolve_browser_profile
 from ..browser_helpers import DEFAULT_COOKIE_REJECT_TEXTS, click_first_matching_text
 from ..models import ScrapeOutcome
 from ..utils import as_uri_if_path, extract_phone_numbers, first_nonempty_line, normalize_whitespace, parse_text_list
@@ -12,6 +13,9 @@ def run_custom_site_scraper(
     phone_selector: str = "",
     link_selector: str = "",
     cookie_reject_texts: str = "",
+    browser_mode: str = "isolated",
+    browser_user_data_dir: str = "",
+    browser_profile_directory: str = "Default",
 ) -> ScrapeOutcome:
     config = {
         "url": as_uri_if_path(url),
@@ -20,12 +24,15 @@ def run_custom_site_scraper(
         "phone_selector": phone_selector,
         "link_selector": link_selector,
         "cookie_reject_texts": parse_text_list(cookie_reject_texts) or list(DEFAULT_COOKIE_REJECT_TEXTS),
+        "browser_mode": browser_mode,
+        "browser_user_data_dir": browser_user_data_dir,
+        "browser_profile_directory": browser_profile_directory,
     }
     payload = _scrape_custom_site_task(config)
     return ScrapeOutcome(source="custom_site", rows=payload["rows"], meta=payload["meta"])
 
 
-@browser
+@browser(profile=resolve_browser_profile, add_arguments=resolve_browser_arguments)
 def _scrape_custom_site_task(driver: Driver, config: dict) -> dict:
     driver.get(config["url"])
     cookie_banner_action = click_first_matching_text(driver, config["cookie_reject_texts"])

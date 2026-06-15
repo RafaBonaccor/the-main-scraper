@@ -3,6 +3,9 @@ __pycache__/
 
 output/
 error_logs/
+.runtime_profiles/
+.bp/
+allegato/
 
 .venv/
 venv/

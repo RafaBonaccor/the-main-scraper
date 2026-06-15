@@ -46,14 +46,7 @@ def _normalize_formats(raw_format: str) -> list[str]:
 
 
 def _write_json(path: Path, outcome: ScrapeOutcome) -> None:
-    payload = {
-        "source": outcome.source,
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "row_count": len(outcome.rows),
-        "meta": outcome.meta,
-        "rows": outcome.rows,
-    }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_outcome_json(path, outcome)
 
 
 def _write_csv(path: Path, rows: list[dict]) -> None:
@@ -94,3 +87,17 @@ def _collect_headers(rows: list[dict]) -> list[str]:
             headers.append(key)
 
     return headers or ["value"]
+
+
+def build_outcome_payload(outcome: ScrapeOutcome) -> dict:
+    return {
+        "source": outcome.source,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "row_count": len(outcome.rows),
+        "meta": outcome.meta,
+        "rows": outcome.rows,
+    }
+
+
+def write_outcome_json(path: Path, outcome: ScrapeOutcome) -> None:
+    path.write_text(json.dumps(build_outcome_payload(outcome), ensure_ascii=False, indent=2), encoding="utf-8")

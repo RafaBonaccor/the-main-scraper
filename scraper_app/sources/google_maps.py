@@ -3,6 +3,7 @@ import time
 
 from botasaurus.browser import Driver, Wait, browser
 
+from ..browser_runtime import resolve_browser_arguments, resolve_browser_profile
 from ..browser_helpers import DEFAULT_COOKIE_REJECT_TEXTS, click_first_matching_text
 from ..models import ScrapeOutcome
 from ..utils import build_google_maps_search_url, extract_phone_numbers, normalize_whitespace
@@ -20,19 +21,38 @@ ACTION_LINES = {
 RATING_PATTERN = r"^\d(?:[.,]\d)?\(\d+\)$"
 
 
-def run_google_maps_scraper(search: str, city: str = "", max_results: int = 25) -> ScrapeOutcome:
+def run_google_maps_scraper(
+    search: str,
+    city: str = "",
+    province: str = "",
+    country: str = "",
+    max_results: int = 25,
+    browser_mode: str = "isolated",
+    browser_user_data_dir: str = "",
+    browser_profile_directory: str = "Default",
+) -> ScrapeOutcome:
     config = {
         "search": search,
         "city": city,
+        "province": province,
+        "country": country,
         "max_results": max(int(max_results), 1),
+        "browser_mode": browser_mode,
+        "browser_user_data_dir": browser_user_data_dir,
+        "browser_profile_directory": browser_profile_directory,
     }
     payload = _scrape_google_maps_task(config)
     return ScrapeOutcome(source="google_maps", rows=payload["rows"], meta=payload["meta"])
 
 
-@browser
+@browser(profile=resolve_browser_profile, add_arguments=resolve_browser_arguments)
 def _scrape_google_maps_task(driver: Driver, config: dict) -> dict:
-    search_url = build_google_maps_search_url(config["search"], config.get("city", ""))
+    search_url = build_google_maps_search_url(
+        config["search"],
+        config.get("city", ""),
+        config.get("province", ""),
+        config.get("country", ""),
+    )
     max_results = max(int(config.get("max_results", 25)), 1)
 
     driver.google_get(search_url, wait=Wait.LONG)
@@ -49,7 +69,13 @@ def _scrape_google_maps_task(driver: Driver, config: dict) -> dict:
 
     while feed is not None:
         for article in driver.select_all('[role="article"]', wait=Wait.SHORT):
-            row = _article_to_row(article, search_url, config.get("city", ""))
+            row = _article_to_row(
+                article,
+                search_url=search_url,
+                city=config.get("city", ""),
+                province=config.get("province", ""),
+                country=config.get("country", ""),
+            )
             key = row["link"] or row["phone"] or row["name"] or row["raw_text"]
             if not key:
                 continue
@@ -57,7 +83,6 @@ def _scrape_google_maps_task(driver: Driver, config: dict) -> dict:
 
         if len(rows_by_key) >= max_results:
             break
-
         if not driver.can_scroll_further('[role="feed"]', wait=Wait.SHORT):
             break
 
@@ -80,6 +105,8 @@ def _scrape_google_maps_task(driver: Driver, config: dict) -> dict:
             "cookie_banner_action": cookie_banner_action,
             "search": config["search"],
             "city": config.get("city", ""),
+            "province": config.get("province", ""),
+            "country": config.get("country", ""),
             "search_url": search_url,
             "max_results": max_results,
             "row_count": len(rows),
@@ -87,7 +114,7 @@ def _scrape_google_maps_task(driver: Driver, config: dict) -> dict:
     }
 
 
-def _article_to_row(article, search_url: str, city: str) -> dict:
+def _article_to_row(article, search_url: str, city: str, province: str, country: str) -> dict:
     raw_text = article.text.strip()
     lines = _clean_lines(raw_text)
     phones = extract_phone_numbers(raw_text)
@@ -97,6 +124,8 @@ def _article_to_row(article, search_url: str, city: str) -> dict:
         "source": "google_maps",
         "search_url": search_url,
         "city": city,
+        "province": province,
+        "country": country,
         "name": lines[0] if lines else "",
         "phone": " | ".join(phones),
         "address": _extract_address(lines, phones),
