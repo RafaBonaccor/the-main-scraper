@@ -4,6 +4,7 @@ from pathlib import Path
 from botasaurus.browser import Driver, Wait, browser
 
 from ..browser_helpers import click_first_matching_text, current_page_url, navigate_with_retries
+from ..contact_history import record_contact_result, record_contact_results
 from ..browser_runtime import normalize_browser_mode, resolve_browser_arguments, resolve_browser_profile
 
 
@@ -41,6 +42,9 @@ def run_subito_contact_action(
     submit: bool = False,
     keep_open_seconds: int = 120,
     login_wait_seconds: int = 240,
+    slow_mode: bool = False,
+    action_delay_seconds: float = 1.5,
+    page_settle_seconds: float = 3.0,
     browser_mode: str = "sessione_persistente",
     browser_user_data_dir: str = "",
     browser_profile_directory: str = "Default",
@@ -61,6 +65,9 @@ def run_subito_contact_action(
         "submit": bool(submit),
         "keep_open_seconds": max(int(keep_open_seconds), 0),
         "login_wait_seconds": max(int(login_wait_seconds), 0),
+        "slow_mode": bool(slow_mode),
+        "action_delay_seconds": float(action_delay_seconds),
+        "page_settle_seconds": float(page_settle_seconds),
         "browser_mode": browser_mode,
         "browser_user_data_dir": browser_user_data_dir,
         "browser_profile_directory": browser_profile_directory,
@@ -76,6 +83,9 @@ def run_subito_bulk_contact_action(
     delay_between_seconds: int = 2,
     keep_open_seconds: int = 120,
     login_wait_seconds: int = 240,
+    slow_mode: bool = False,
+    action_delay_seconds: float = 1.5,
+    page_settle_seconds: float = 3.0,
     browser_mode: str = "sessione_persistente",
     browser_user_data_dir: str = "",
     browser_profile_directory: str = "Default",
@@ -97,6 +107,9 @@ def run_subito_bulk_contact_action(
         "delay_between_seconds": max(int(delay_between_seconds), 0),
         "keep_open_seconds": max(int(keep_open_seconds), 0),
         "login_wait_seconds": max(int(login_wait_seconds), 0),
+        "slow_mode": bool(slow_mode),
+        "action_delay_seconds": float(action_delay_seconds),
+        "page_settle_seconds": float(page_settle_seconds),
         "browser_mode": browser_mode,
         "browser_user_data_dir": browser_user_data_dir,
         "browser_profile_directory": browser_profile_directory,
@@ -117,6 +130,7 @@ def _run_subito_contact_task(driver: Driver, config: dict) -> dict:
     link = config["link"]
     keep_open_seconds = max(int(config.get("keep_open_seconds", 120)), 0)
     result = _contact_single_listing(driver, config)
+    record_contact_result(result, source="subito")
 
     if keep_open_seconds > 0:
         driver.sleep(keep_open_seconds)
@@ -129,6 +143,8 @@ def _run_subito_contact_task(driver: Driver, config: dict) -> dict:
 def _run_subito_bulk_contact_task(driver: Driver, config: dict) -> dict:
     links = list(config.get("links", []) or [])
     delay_between_seconds = max(int(config.get("delay_between_seconds", 2)), 0)
+    if bool(config.get("slow_mode", False)):
+        delay_between_seconds = max(delay_between_seconds, 6)
     keep_open_seconds = max(int(config.get("keep_open_seconds", 120)), 0)
 
     results = []
@@ -137,6 +153,8 @@ def _run_subito_bulk_contact_task(driver: Driver, config: dict) -> dict:
         results.append(result)
         if index < len(links) - 1 and delay_between_seconds > 0:
             driver.sleep(delay_between_seconds)
+
+    record_contact_results(results, source="subito")
 
     if keep_open_seconds > 0:
         driver.sleep(keep_open_seconds)
@@ -164,10 +182,16 @@ def _contact_single_listing(driver: Driver, config: dict) -> dict:
     message = str(config.get("message", "") or "").strip()
     submit = bool(config.get("submit", False))
     login_wait_seconds = max(int(config.get("login_wait_seconds", 240)), 0)
+    slow_mode = bool(config.get("slow_mode", False))
+    action_delay_seconds = _normalized_delay_seconds(config.get("action_delay_seconds", 1.5), default=1.5 if slow_mode else 0.0)
+    page_settle_seconds = _normalized_delay_seconds(config.get("page_settle_seconds", 3.0), default=3.0 if slow_mode else 0.0)
 
     navigated = navigate_with_retries(driver, link, wait=Wait.LONG)
+    _sleep_if_needed(driver, page_settle_seconds)
     cookie_banner_action = click_first_matching_text(driver, SUBITO_COOKIE_REJECT_TEXTS)
+    _sleep_if_needed(driver, action_delay_seconds)
     driver.select("body", wait=Wait.VERY_LONG)
+    _sleep_if_needed(driver, action_delay_seconds)
 
     contact_button_action = click_first_matching_text(driver, SUBITO_CONTACT_BUTTON_TEXTS)
     if not contact_button_action:
@@ -188,13 +212,13 @@ def _contact_single_listing(driver: Driver, config: dict) -> dict:
             "attachment_path": attachment,
         }
 
-    driver.sleep(1.5)
+    driver.sleep(max(1.5, action_delay_seconds))
     if _has_login_gate(driver):
         if _wait_for_login_completion(driver, login_wait_seconds):
-            driver.sleep(1.5)
+            driver.sleep(max(1.5, action_delay_seconds))
             if not _has_message_field(driver):
                 click_first_matching_text(driver, SUBITO_CONTACT_BUTTON_TEXTS)
-                driver.sleep(1.5)
+                driver.sleep(max(1.5, action_delay_seconds))
         else:
             return {
                 "ok": False,
@@ -239,7 +263,7 @@ def _contact_single_listing(driver: Driver, config: dict) -> dict:
 
     if attachment:
         attachment_button_action = click_first_matching_text(driver, SUBITO_ATTACHMENT_BUTTON_TEXTS) or ""
-        driver.sleep(1)
+        driver.sleep(max(1.0, action_delay_seconds))
         driver.run_js(
             """
 const input = [...document.querySelectorAll("input[type='file']")].find((element) => !element.disabled);
@@ -255,15 +279,16 @@ return true;
         driver.select("input[type='file']", wait=Wait.LONG)
         driver.upload_file("input[type='file']", attachment, wait=Wait.LONG)
         attachment_uploaded = True
-        driver.sleep(1.5)
+        driver.sleep(max(1.5, action_delay_seconds))
 
     send_button_action = ""
     submitted = False
     if submit:
+        _sleep_if_needed(driver, action_delay_seconds)
         send_button_action = click_first_matching_text(driver, SUBITO_SEND_BUTTON_TEXTS) or _click_submit_button(driver) or ""
         submitted = bool(send_button_action)
         if submitted:
-            driver.sleep(1.5)
+            driver.sleep(max(1.5, action_delay_seconds))
 
     return {
         "ok": submitted if submit else True,
@@ -391,3 +416,15 @@ return true;
         )
     )
     return "submit" if clicked else None
+
+
+def _normalized_delay_seconds(value: float | int | str, default: float = 0.0) -> float:
+    try:
+        return max(float(value), 0.0)
+    except (TypeError, ValueError):
+        return max(default, 0.0)
+
+
+def _sleep_if_needed(driver: Driver, seconds: float) -> None:
+    if seconds > 0:
+        driver.sleep(seconds)

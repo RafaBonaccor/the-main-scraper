@@ -16,6 +16,7 @@ from .browser_runtime import (
     default_chrome_user_data_dir,
     normalize_browser_mode,
 )
+from .contact_history import annotate_rows_with_contact_history, summarize_contact_status
 
 
 APP_BG = "#f3efe6"
@@ -27,6 +28,12 @@ BUTTON_FG = "#ffffff"
 TEXT = "#1f2523"
 MUTED = "#5f6c67"
 DECISION_ORDER = {"accepted": 0, "maybe": 1, "rejected": 2}
+CONTACT_STATUS_LABELS = {
+    "new": "nuovo",
+    "prepared": "preparato",
+    "submitted": "inviato",
+    "failed": "fallito",
+}
 SUBITO_JOB_OPTIONS = (
     ("pulizie", "Pulizie"),
     ("colf", "Colf"),
@@ -74,6 +81,23 @@ class VerticalScrolledFrame(ttk.Frame):
         self.canvas.yview_scroll(delta, "units")
 
 
+def detect_default_attachment_path(project_root: Path) -> str:
+    attachment_dir = project_root / "allegato"
+    if not attachment_dir.exists():
+        return ""
+
+    candidates = [
+        path
+        for path in attachment_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in {".pdf", ".doc", ".docx"}
+    ]
+    if not candidates:
+        return ""
+
+    latest = max(candidates, key=lambda path: path.stat().st_mtime)
+    return str(latest.resolve())
+
+
 class ScraperApp:
     def __init__(self, root: tk.Tk, script_path: Path) -> None:
         self.root = root
@@ -99,6 +123,7 @@ class ScraperApp:
         self.subito_anchor_place_var = tk.StringVar(value="Morlupo")
         self.subito_max_distance_var = tk.StringVar(value="30")
         self.subito_nearby_only_var = tk.BooleanVar(value=False)
+        self.subito_include_details_var = tk.BooleanVar(value=False)
         self.subito_max_results_var = tk.StringVar(value="25")
 
         self.custom_url_var = tk.StringVar()
@@ -111,11 +136,14 @@ class ScraperApp:
         self.browser_mode_var = tk.StringVar(value="sessione_persistente")
         self.browser_user_data_dir_var = tk.StringVar(value=default_chrome_user_data_dir())
         self.browser_profile_directory_var = tk.StringVar(value="Default")
+        self.slow_mode_var = tk.BooleanVar(value=True)
+        self.action_delay_seconds_var = tk.StringVar(value="2.5")
+        self.page_settle_seconds_var = tk.StringVar(value="4.0")
 
         self.output_format_var = tk.StringVar(value="all")
         self.output_dir_var = tk.StringVar(value=str((script_path.parent / "output").resolve()))
         self.filename_var = tk.StringVar()
-        self.attachment_path_var = tk.StringVar()
+        self.attachment_path_var = tk.StringVar(value=detect_default_attachment_path(script_path.parent))
         self.contact_message_var = tk.StringVar(value="Buongiorno, allego il mio curriculum per la posizione. Grazie per l'attenzione.")
         self.contact_submit_var = tk.BooleanVar(value=False)
         self.contact_keep_open_seconds_var = tk.StringVar(value="120")
@@ -126,6 +154,7 @@ class ScraperApp:
         self.result_meta_var = tk.StringVar(value="Nessun output caricato")
         self.detail_title_var = tk.StringVar(value="Nessun annuncio selezionato")
         self.detail_source_var = tk.StringVar(value="-")
+        self.detail_contact_var = tk.StringVar(value="-")
         self.detail_decision_var = tk.StringVar(value="-")
         self.detail_date_var = tk.StringVar(value="-")
         self.detail_distance_var = tk.StringVar(value="-")
@@ -278,6 +307,7 @@ class ScraperApp:
         self._row(card, 6, "Distanza max km", self.subito_max_distance_var, 12)
         self._row(card, 7, "Max risultati", self.subito_max_results_var, 12)
         ttk.Checkbutton(card, text="Tieni solo annunci accettati", variable=self.subito_nearby_only_var).grid(row=8, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(card, text="Apri ogni annuncio ed estrai descrizione completa", variable=self.subito_include_details_var).grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     def _build_custom_tab(self) -> None:
         card = self._card(self.custom_tab, "Configurazione avanzata")
@@ -309,13 +339,18 @@ class ScraperApp:
         ttk.Label(card, text="Profile Directory").grid(row=2, column=0, sticky="w")
         self.browser_profile_dir_entry = ttk.Entry(card, textvariable=self.browser_profile_directory_var, width=18)
         self.browser_profile_dir_entry.grid(row=2, column=1, sticky="w", padx=(10, 0))
+        ttk.Checkbutton(card, text="Modalita lenta per connessione instabile", variable=self.slow_mode_var).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(card, text="Pausa azioni (sec)").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(card, textvariable=self.action_delay_seconds_var, width=10).grid(row=4, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
+        ttk.Label(card, text="Attesa post-caricamento (sec)").grid(row=5, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(card, textvariable=self.page_settle_seconds_var, width=10).grid(row=5, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
         ttk.Label(
             card,
-            text="sessione_persistente usa un profilo Chrome dedicato del progetto e mantiene il login tra un run e l altro. Su Subito, se lasci Profile Directory a Default, viene usato automaticamente il profilo dedicato Subito. chrome_normale crea invece uno snapshot leggero del tuo profilo reale, mentre profilo_personalizzato ti lascia scegliere una cartella User Data diversa.",
+            text="sessione_persistente usa un profilo Chrome dedicato del progetto e mantiene il login tra un run e l altro. Su Subito, se lasci Profile Directory a Default, viene usato automaticamente il profilo dedicato Subito. chrome_normale crea invece uno snapshot leggero del tuo profilo reale, mentre profilo_personalizzato ti lascia scegliere una cartella User Data diversa. La modalita lenta aggiunge pause fisse e piu tempo di assestamento dopo i caricamenti.",
             style="Hint.TLabel",
             wraplength=760,
             justify="left",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
         card.columnconfigure(1, weight=1)
 
     def _build_export_card(self, parent: ttk.Frame) -> None:
@@ -360,9 +395,10 @@ class ScraperApp:
 
         card = self._card(table_shell, "Annunci estratti")
         card.pack(fill="both", expand=True)
-        columns = ("decision", "published_at", "distance_km", "location", "title", "company", "schedule")
+        columns = ("contact_status", "decision", "published_at", "distance_km", "location", "title", "company", "schedule")
         self.results_tree = ttk.Treeview(card, columns=columns, show="headings", selectmode="extended")
         for key, label, width in (
+            ("contact_status", "Contatto", 95),
             ("decision", "Decisione", 100),
             ("published_at", "Data", 110),
             ("distance_km", "Km", 70),
@@ -372,7 +408,7 @@ class ScraperApp:
             ("schedule", "Orario", 100),
         ):
             self.results_tree.heading(key, text=label)
-            self.results_tree.column(key, width=width, anchor="center" if key in {"decision", "published_at", "distance_km", "schedule"} else "w")
+            self.results_tree.column(key, width=width, anchor="center" if key in {"contact_status", "decision", "published_at", "distance_km", "schedule"} else "w")
         self.results_tree.tag_configure("accepted", background="#edf7f0")
         self.results_tree.tag_configure("maybe", background="#fff7e8")
         self.results_tree.tag_configure("rejected", background="#fdeeee")
@@ -403,19 +439,20 @@ class ScraperApp:
             justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w")
         self._detail_row(detail_card, 1, "Sorgente", self.detail_source_var)
-        self._detail_row(detail_card, 1, "Decisione", self.detail_decision_var, column_offset=2)
-        self._detail_row(detail_card, 2, "Data", self.detail_date_var)
-        self._detail_row(detail_card, 2, "Distanza", self.detail_distance_var, column_offset=2)
-        self._detail_row(detail_card, 3, "Luogo", self.detail_location_var)
-        self._detail_row(detail_card, 3, "Azienda", self.detail_company_var, column_offset=2)
-        self._detail_row(detail_card, 4, "Settore", self.detail_sector_var)
-        self._detail_row(detail_card, 4, "Ruolo", self.detail_role_var, column_offset=2)
-        self._detail_row(detail_card, 5, "Orario", self.detail_schedule_var)
-        self._detail_row(detail_card, 5, "Prezzo", self.detail_price_var, column_offset=2)
-        ttk.Label(detail_card, text="Link").grid(row=6, column=0, sticky="w", pady=(12, 6))
+        self._detail_row(detail_card, 1, "Contatto", self.detail_contact_var, column_offset=2)
+        self._detail_row(detail_card, 2, "Decisione", self.detail_decision_var)
+        self._detail_row(detail_card, 2, "Data", self.detail_date_var, column_offset=2)
+        self._detail_row(detail_card, 3, "Distanza", self.detail_distance_var)
+        self._detail_row(detail_card, 3, "Luogo", self.detail_location_var, column_offset=2)
+        self._detail_row(detail_card, 4, "Azienda", self.detail_company_var)
+        self._detail_row(detail_card, 4, "Settore", self.detail_sector_var, column_offset=2)
+        self._detail_row(detail_card, 5, "Ruolo", self.detail_role_var)
+        self._detail_row(detail_card, 5, "Orario", self.detail_schedule_var, column_offset=2)
+        self._detail_row(detail_card, 6, "Prezzo", self.detail_price_var)
+        ttk.Label(detail_card, text="Link").grid(row=7, column=0, sticky="w", pady=(12, 6))
         self.detail_link_entry = ttk.Entry(detail_card, textvariable=self.detail_link_var)
-        self.detail_link_entry.grid(row=6, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(12, 6))
-        ttk.Label(detail_card, text="Testo annuncio").grid(row=7, column=0, sticky="nw", pady=(12, 6))
+        self.detail_link_entry.grid(row=7, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(12, 6))
+        ttk.Label(detail_card, text="Testo annuncio").grid(row=8, column=0, sticky="nw", pady=(12, 6))
         self.detail_raw_text = ScrolledText(
             detail_card,
             wrap="word",
@@ -428,16 +465,16 @@ class ScraperApp:
             pady=10,
             font=("Segoe UI", 10),
         )
-        self.detail_raw_text.grid(row=7, column=1, columnspan=3, sticky="nsew", padx=(10, 0), pady=(12, 6))
+        self.detail_raw_text.grid(row=8, column=1, columnspan=3, sticky="nsew", padx=(10, 0), pady=(12, 6))
         detail_card.columnconfigure(1, weight=1)
         detail_card.columnconfigure(3, weight=1)
-        detail_card.rowconfigure(7, weight=1)
+        detail_card.rowconfigure(8, weight=1)
 
         contact_card = self._card(detail_body, "Contatto Subito")
         contact_card.pack(fill="x", pady=(12, 0))
         ttk.Label(
             contact_card,
-            text="Richiede un annuncio Subito selezionato. Con sessione_persistente fai il login una volta sola e i run successivi lo riusano. Se al primo contatto Subito chiede accesso, il flusso aspetta che tu faccia login e poi continua.",
+            text="Richiede un annuncio Subito selezionato. Con sessione_persistente fai il login una volta sola e i run successivi lo riusano. Se al primo contatto Subito chiede accesso, il flusso aspetta che tu faccia login e poi continua. Gli annunci gia inviati vengono marcati nella tabella e i bottoni batch li saltano automaticamente.",
             style="Hint.TLabel",
             wraplength=430,
             justify="left",
@@ -470,9 +507,9 @@ class ScraperApp:
         ttk.Button(contact_card, text="Apri allegato", style="Secondary.TButton", command=self._open_attachment_file).grid(row=4, column=2, sticky="e")
         self.contact_button = ttk.Button(contact_card, text="Prepara annuncio", style="Accent.TButton", command=self._start_contact_action)
         self.contact_button.grid(row=5, column=0, sticky="ew", pady=(12, 0), padx=(0, 6))
-        self.contact_selected_button = ttk.Button(contact_card, text="Invia CV selezionati", style="Accent.TButton", command=self._start_batch_contact_selected)
+        self.contact_selected_button = ttk.Button(contact_card, text="Invia CV selezionati (solo nuovi)", style="Accent.TButton", command=self._start_batch_contact_selected)
         self.contact_selected_button.grid(row=5, column=1, sticky="ew", pady=(12, 0), padx=(6, 6))
-        self.contact_accepted_button = ttk.Button(contact_card, text="Invia CV accettati", style="Accent.TButton", command=self._start_batch_contact_accepted)
+        self.contact_accepted_button = ttk.Button(contact_card, text="Invia CV accettati (solo nuovi)", style="Accent.TButton", command=self._start_batch_contact_accepted)
         self.contact_accepted_button.grid(row=5, column=2, sticky="ew", pady=(12, 0))
         self.open_selected_button = ttk.Button(contact_card, text="Apri annuncio", style="Secondary.TButton", command=self._open_selected_link)
         self.open_selected_button.grid(row=6, column=2, sticky="ew", pady=(10, 0))
@@ -507,7 +544,7 @@ class ScraperApp:
         selected = self.notebook.tab(self.notebook.select(), "text")
         if selected == "Subito Jobs":
             self.hint_var.set(
-                "Subito Jobs mostra gli annunci nella tab Risultati con dettaglio completo. sessione_persistente tiene un profilo Chrome dedicato con login riusabile, i profili lavoro lanciano ricerche come pulizie/colf/badante, e dopo il parsing puoi inviare il CV ai selezionati o agli accettati."
+                "Subito Jobs mostra gli annunci nella tab Risultati con dettaglio completo. sessione_persistente tiene un profilo Chrome dedicato con login riusabile, i profili lavoro lanciano ricerche come pulizie/colf/badante, puoi anche aprire ogni annuncio per prendere la descrizione completa, e la GUI tiene traccia degli annunci gia preparati o inviati per evitare ricontatti involontari."
             )
         elif selected == "Google Maps":
             self.hint_var.set(
@@ -529,12 +566,13 @@ class ScraperApp:
     def _update_result_actions(self) -> None:
         row = self._get_selected_row()
         selected_rows = self._get_selected_rows()
+        selected_new_rows = [item for item in selected_rows if not self._row_has_submitted_contact(item)]
         accepted_rows = self._get_accepted_subito_rows()
         has_row = row is not None and bool(str(row.get("link", "") or "").strip())
         is_subito = has_row and str(row.get("source", "") or "").strip().lower() == "subito"
         self.open_selected_button.configure(state="normal" if has_row else "disabled")
         self.contact_button.configure(state="normal" if is_subito else "disabled")
-        self.contact_selected_button.configure(state="normal" if selected_rows else "disabled")
+        self.contact_selected_button.configure(state="normal" if selected_new_rows else "disabled")
         self.contact_accepted_button.configure(state="normal" if accepted_rows else "disabled")
 
     def _choose_output_dir(self) -> None:
@@ -581,6 +619,7 @@ class ScraperApp:
     def _clear_detail_panel(self) -> None:
         self.detail_title_var.set("Nessun annuncio selezionato")
         self.detail_source_var.set("-")
+        self.detail_contact_var.set("-")
         self.detail_decision_var.set("-")
         self.detail_date_var.set("-")
         self.detail_distance_var.set("-")
@@ -700,6 +739,8 @@ class ScraperApp:
                 cmd += ["--job-keywords", ",".join(selected_job_keywords)]
             if self.subito_nearby_only_var.get():
                 cmd.append("--nearby-only")
+            if self.subito_include_details_var.get():
+                cmd.append("--include-details")
         else:
             if not self.custom_url_var.get().strip() or not self.custom_item_selector_var.get().strip():
                 raise ValueError("Inserisci URL e selector item per il sito custom.")
@@ -734,6 +775,8 @@ class ScraperApp:
         link = str(row.get("link", "") or "").strip()
         if not link:
             raise ValueError("L annuncio selezionato non ha un link valido.")
+        if self.contact_submit_var.get() and self._row_has_submitted_contact(row):
+            raise ValueError("Questo annuncio risulta gia contattato con invio completato. Aprilo manualmente se vuoi verificarlo, ma evita un nuovo invio automatico.")
 
         attachment = self.attachment_path_var.get().strip()
         if attachment and not Path(attachment).exists():
@@ -763,21 +806,27 @@ class ScraperApp:
         for row in rows:
             if str(row.get("source", "") or "").strip().lower() != "subito":
                 continue
+            if self._row_has_submitted_contact(row):
+                continue
             link = str(row.get("link", "") or "").strip()
             if not link or link in seen:
                 continue
             seen.add(link)
             links.append(link)
         if not links:
-            raise ValueError("Non ci sono link Subito validi per l'invio del CV.")
+            raise ValueError("Non ci sono link Subito nuovi da contattare. Gli annunci gia inviati vengono esclusi automaticamente.")
 
         attachment = self.attachment_path_var.get().strip()
+        if not attachment:
+            raise ValueError("Per inviare i CV seleziona prima un allegato.")
         if attachment and not Path(attachment).exists():
             raise ValueError("Il file allegato selezionato non esiste.")
         message = self._get_contact_message()
         keep_open_raw = self.contact_keep_open_seconds_var.get().strip() or "120"
         if not keep_open_raw.isdigit():
             raise ValueError("Tieni browser aperto deve essere un intero positivo.")
+        if not self.contact_submit_var.get():
+            raise ValueError("Per inviare davvero i CV devi spuntare 'Invia davvero il messaggio finale'.")
 
         links_file = self._write_contact_links_file(links)
         cmd = [
@@ -802,11 +851,48 @@ class ScraperApp:
         return cmd
 
     def _browser_command_args(self) -> list[str]:
-        return [
+        action_delay = self._validated_delay_text(self.action_delay_seconds_var.get().strip() or "1.5", "Pausa azioni")
+        page_settle = self._validated_delay_text(self.page_settle_seconds_var.get().strip() or "3.0", "Attesa post-caricamento")
+        args = [
             "--browser-mode", self.browser_mode_var.get().strip(),
             "--browser-user-data-dir", self.browser_user_data_dir_var.get().strip(),
             "--browser-profile-directory", self.browser_profile_directory_var.get().strip(),
+            "--action-delay-seconds", action_delay,
+            "--page-settle-seconds", page_settle,
         ]
+        if self.slow_mode_var.get():
+            args.append("--slow-mode")
+        return args
+
+    def _validated_delay_text(self, raw_value: str, label: str) -> str:
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"{label} deve essere un numero valido.") from exc
+        if value < 0:
+            raise ValueError(f"{label} non puo essere negativa.")
+        return str(value)
+
+    def _contact_status_label(self, row: dict) -> str:
+        status = str(row.get("contact_status", "new") or "new").strip().lower()
+        return CONTACT_STATUS_LABELS.get(status, CONTACT_STATUS_LABELS["new"])
+
+    def _row_has_submitted_contact(self, row: dict) -> bool:
+        return bool(row.get("contact_already_submitted", False))
+
+    def _contact_detail_line(self, row: dict) -> str:
+        status = self._contact_status_label(row)
+        attempts = int(row.get("contact_attempt_count", 0) or 0)
+        last_attempt_at = str(row.get("contact_last_attempt_at", "") or "").strip()
+        last_submitted_at = str(row.get("contact_last_submitted_at", "") or "").strip()
+        parts = [f"Stato contatto: {status}"]
+        if attempts > 0:
+            parts.append(f"tentativi {attempts}")
+        if last_submitted_at:
+            parts.append(f"ultimo invio {last_submitted_at}")
+        elif last_attempt_at:
+            parts.append(f"ultimo tentativo {last_attempt_at}")
+        return " | ".join(parts)
 
     def _selected_subito_job_keywords(self) -> list[str]:
         selected_indexes = self.subito_jobs_listbox.curselection()
@@ -851,6 +937,8 @@ class ScraperApp:
                     self._load_results()
                 elif completed_kind == "contact":
                     if code == 0:
+                        if self.ui_result_json_path.exists():
+                            self._load_results()
                         messagebox.showinfo("Contatto pronto", "Flusso Contatta eseguito. Controlla il browser e il log.")
                     else:
                         messagebox.showerror("Contatto fallito", "Il flusso Contatta non e stato completato. Controlla il log.")
@@ -873,15 +961,18 @@ class ScraperApp:
         except Exception as exc:
             self.result_meta_var.set(f"Errore caricamento risultati: {exc}")
             return
-        rows = sorted(payload.get("rows", []), key=self._result_sort_key)
+        rows = sorted(annotate_rows_with_contact_history(payload.get("rows", [])), key=self._result_sort_key)
         self.result_rows = rows
         counts = dict((payload.get("meta", {}) or {}).get("geo_counts", {}))
+        contact_counts = summarize_contact_status(rows)
         if not counts:
             counts = {"accepted": 0, "maybe": 0, "rejected": 0}
             for row in rows:
                 counts[str(row.get("geo_decision", "maybe"))] = counts.get(str(row.get("geo_decision", "maybe")), 0) + 1
         self.result_total_var.set(f"{len(rows)} risultati")
-        self.result_counts_var.set(f"accepted {counts.get('accepted', 0)} | maybe {counts.get('maybe', 0)} | rejected {counts.get('rejected', 0)}")
+        self.result_counts_var.set(
+            f"accepted {counts.get('accepted', 0)} | maybe {counts.get('maybe', 0)} | rejected {counts.get('rejected', 0)} | nuovi {contact_counts.get('new', 0)} | inviati {contact_counts.get('submitted', 0)}"
+        )
         meta = payload.get("meta", {}) or {}
         self.result_meta_var.set(
             f"Sorgente: {payload.get('source', self.current_run_source)} | Anchor: {meta.get('geo_anchor_place', '-')} | Generato: {payload.get('generated_at', '-')}"
@@ -898,6 +989,7 @@ class ScraperApp:
             else:
                 distance_display = str(distance)
             values = (
+                self._contact_status_label(row),
                 decision,
                 str(row.get("published_at", "") or "-"),
                 distance_display,
@@ -959,6 +1051,7 @@ class ScraperApp:
     def _populate_detail_panel(self, row: dict) -> None:
         self.detail_title_var.set(str(row.get("title", row.get("name", "")) or "Annuncio senza titolo"))
         self.detail_source_var.set(str(row.get("source", "") or "-"))
+        self.detail_contact_var.set(self._contact_status_label(row))
         self.detail_decision_var.set(str(row.get("geo_decision", "") or "-"))
         self.detail_date_var.set(str(row.get("published_at", "") or "-"))
 
@@ -982,10 +1075,23 @@ class ScraperApp:
         reason = str(row.get("geo_decision_reason", "") or "").strip()
         if reason:
             detail_text_parts.append(f"Filtro geografico: {reason}")
+        contact_line = self._contact_detail_line(row)
+        if contact_line:
+            if detail_text_parts:
+                detail_text_parts.append("")
+            detail_text_parts.append(contact_line)
+        description = str(row.get("description", "") or "").strip()
+        if description:
+            if detail_text_parts:
+                detail_text_parts.append("")
+            detail_text_parts.append("Descrizione completa:")
+            detail_text_parts.append(description)
         raw_text = str(row.get("raw_text", "") or "").strip()
         if raw_text:
             if detail_text_parts:
                 detail_text_parts.append("")
+            if description:
+                detail_text_parts.append("Testo card lista:")
             detail_text_parts.append(raw_text)
         self._set_detail_raw_text("\n".join(detail_text_parts))
 
@@ -1015,6 +1121,8 @@ class ScraperApp:
             if str(row.get("source", "") or "").strip().lower() != "subito":
                 continue
             if str(row.get("geo_decision", "") or "").strip().lower() != "accepted":
+                continue
+            if self._row_has_submitted_contact(row):
                 continue
             link = str(row.get("link", "") or "").strip()
             if not link or link in seen_links:

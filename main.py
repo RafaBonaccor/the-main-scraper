@@ -6,6 +6,7 @@ from scraper_app.bootstrap import ensure_project_venv
 
 ensure_project_venv(__file__)
 
+from scraper_app.contact_history import annotate_rows_with_contact_history, summarize_contact_status
 from scraper_app.contact_runner import run_contact_action
 from scraper_app.exporters import export_outcome, write_outcome_json
 from scraper_app.models import ExportOptions
@@ -48,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Comma-separated job keywords to run separately and merge, e.g. 'pulizie,colf,badante'.",
     )
+    subito_parser.add_argument("--include-details", action="store_true", help="Visit each kept listing and extract the full description from the detail page.")
     subito_parser.add_argument("--max-results", default=25, type=int, help="Maximum number of listings to keep.")
     subito_parser.add_argument("--anchor-place", default="Morlupo", help="Reference place used for distance sorting.")
     subito_parser.add_argument("--max-distance-km", default=30.0, type=float, help="Maximum distance in km from the anchor place.")
@@ -114,6 +116,9 @@ def _add_browser_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--browser-user-data-dir", default="")
     parser.add_argument("--browser-profile-directory", default="Default")
+    parser.add_argument("--slow-mode", action="store_true", help="Use slower, more conservative browser pacing for unstable connections.")
+    parser.add_argument("--action-delay-seconds", default=1.5, type=float, help="Pause between interactive browser actions.")
+    parser.add_argument("--page-settle-seconds", default=3.0, type=float, help="Extra wait after page navigation before interacting.")
 
 
 def main() -> int:
@@ -141,6 +146,8 @@ def main() -> int:
     source = payload.pop("source")
     payload.pop("command", None)
     outcome = run_scraper(source=source, **payload)
+    outcome.rows = annotate_rows_with_contact_history(outcome.rows)
+    outcome.meta["contact_counts"] = summarize_contact_status(outcome.rows)
     export_paths = export_outcome(
         outcome,
         ExportOptions(

@@ -47,7 +47,11 @@ def run_subito_scraper(
     region: str = "lazio",
     city: str = "roma",
     category: str = "offerte-lavoro",
+    include_details: bool = False,
     max_results: int = 25,
+    slow_mode: bool = False,
+    action_delay_seconds: float = 1.5,
+    page_settle_seconds: float = 3.0,
     browser_mode: str = "isolated",
     browser_user_data_dir: str = "",
     browser_profile_directory: str = "Default",
@@ -58,7 +62,11 @@ def run_subito_scraper(
         "region": region,
         "city": city,
         "category": category,
+        "include_details": bool(include_details),
         "max_results": max(int(max_results), 1),
+        "slow_mode": bool(slow_mode),
+        "action_delay_seconds": float(action_delay_seconds),
+        "page_settle_seconds": float(page_settle_seconds),
         "browser_mode": browser_mode,
         "browser_user_data_dir": browser_user_data_dir,
         "browser_profile_directory": browser_profile_directory,
@@ -84,10 +92,17 @@ def _scrape_subito_task(driver: Driver, config: dict) -> dict:
         city=config.get("city", ""),
     )
     max_results = max(int(config.get("max_results", 25)), 1)
+    include_details = bool(config.get("include_details", False))
+    slow_mode = bool(config.get("slow_mode", False))
+    action_delay_seconds = _normalized_delay_seconds(config.get("action_delay_seconds", 1.5), default=1.5 if slow_mode else 0.0)
+    page_settle_seconds = _normalized_delay_seconds(config.get("page_settle_seconds", 3.0), default=3.0 if slow_mode else 0.0)
 
     navigate_with_retries(driver, search_url, wait=Wait.LONG)
+    _sleep_if_needed(driver, page_settle_seconds)
     cookie_banner_action = click_first_matching_text(driver, SUBITO_COOKIE_REJECT_TEXTS)
+    _sleep_if_needed(driver, action_delay_seconds)
     driver.select_all("article", wait=Wait.VERY_LONG)
+    _sleep_if_needed(driver, action_delay_seconds)
 
     extracted_rows = driver.run_js(
         """
@@ -143,6 +158,15 @@ return [...document.querySelectorAll("article")].map((article) => {
             break
 
     rows = list(rows_by_key.values())[:max_results]
+    details_loaded = 0
+    detail_pages_visited = 0
+    if include_details and rows:
+        details_loaded, detail_pages_visited = _enrich_rows_with_detail_pages(
+            driver,
+            rows,
+            action_delay_seconds=action_delay_seconds,
+            page_settle_seconds=page_settle_seconds,
+        )
     return {
         "rows": rows,
         "meta": {
@@ -152,6 +176,12 @@ return [...document.querySelectorAll("article")].map((article) => {
             "city": config.get("city", ""),
             "category": config.get("category", ""),
             "search_url": search_url,
+            "include_details": include_details,
+            "slow_mode": slow_mode,
+            "action_delay_seconds": action_delay_seconds,
+            "page_settle_seconds": page_settle_seconds,
+            "details_loaded": details_loaded,
+            "detail_pages_visited": detail_pages_visited,
             "max_results": max_results,
             "row_count": len(rows),
         },
@@ -328,3 +358,103 @@ def _looks_like_location(value: str) -> bool:
 
 def _looks_like_price(value: str) -> bool:
     return "€" in value or value.lower() == "gratis"
+
+
+def _enrich_rows_with_detail_pages(
+    driver: Driver,
+    rows: list[dict],
+    action_delay_seconds: float = 0.0,
+    page_settle_seconds: float = 0.0,
+) -> tuple[int, int]:
+    details_loaded = 0
+    detail_pages_visited = 0
+
+    for row in rows:
+        link = str(row.get("link", "") or "").strip()
+        if not link:
+            continue
+
+        detail_pages_visited += 1
+        try:
+            navigate_with_retries(driver, link, wait=Wait.LONG)
+            _sleep_if_needed(driver, page_settle_seconds)
+            click_first_matching_text(driver, SUBITO_COOKIE_REJECT_TEXTS)
+            _sleep_if_needed(driver, action_delay_seconds)
+            driver.select("body", wait=Wait.LONG)
+            _sleep_if_needed(driver, action_delay_seconds)
+            detail_payload = driver.run_js(
+                """
+const cleanText = (value) => (value || "").replace(/\\u00a0/g, " ").replace(/\\r/g, "").trim();
+const textOf = (element) => cleanText(element?.innerText || element?.textContent || "");
+const longestText = (values) => {
+  const candidates = values
+    .map((value) => cleanText(value))
+    .filter((value) => value && !/^descrizione$/i.test(value) && value.length > 40);
+  candidates.sort((a, b) => b.length - a.length);
+  return candidates[0] || "";
+};
+
+let description = longestText(
+  [...document.querySelectorAll("[data-testid*='description'], [class*='description']")]
+    .map((element) => textOf(element))
+);
+
+const heading = [...document.querySelectorAll("h2, h3, h4, h5, h6, [class*='headline']")]
+  .find((element) => /^descrizione$/i.test(textOf(element)));
+
+if (!description && heading) {
+  const container = heading.closest("section, article, div");
+  if (container) {
+    description = longestText(
+      [...container.querySelectorAll("p, li, div")]
+        .map((element) => textOf(element))
+    );
+  }
+}
+
+if (!description && heading) {
+  let sibling = heading.nextElementSibling;
+  const siblingTexts = [];
+  while (sibling && siblingTexts.length < 8) {
+    const text = textOf(sibling);
+    if (text && !/^descrizione$/i.test(text)) {
+      siblingTexts.push(text);
+    }
+    sibling = sibling.nextElementSibling;
+  }
+  description = cleanText(siblingTexts.join("\\n"));
+}
+
+return {
+  description,
+  published_at: textOf(document.querySelector("[class*='insertion-date']")),
+};
+                """,
+            ) or {}
+        except Exception:
+            continue
+
+        description = normalize_whitespace(str(detail_payload.get("description", "") or ""))
+        if description:
+            row["description"] = description
+            details_loaded += 1
+
+        published_at = normalize_whitespace(str(detail_payload.get("published_at", "") or ""))
+        if published_at and not str(row.get("published_at", "") or "").strip():
+            row["published_at"] = published_at
+
+        _sleep_if_needed(driver, action_delay_seconds)
+
+    return details_loaded, detail_pages_visited
+
+
+def _normalized_delay_seconds(value: float | int | str, default: float = 0.0) -> float:
+    try:
+        return max(float(value), 0.0)
+    except (TypeError, ValueError):
+        return max(default, 0.0)
+
+
+def _sleep_if_needed(driver: Driver, seconds: float) -> None:
+    if seconds > 0:
+        driver.sleep(seconds)

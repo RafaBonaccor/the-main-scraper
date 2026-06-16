@@ -5,11 +5,31 @@ from urllib.parse import quote, urlencode
 
 
 PHONE_PATTERN = re.compile(r"\+?\d[\d\s().-]{7,}\d")
-PRICE_PATTERN = re.compile(r"(?:\d[\d.\s,]*\s?€|€\s?\d[\d.\s,]*|Gratis)", re.IGNORECASE)
+PRICE_PATTERN = re.compile(r"(?:\d[\d.\s,]*(?:\s?(?:€|â‚¬))|(?:€|â‚¬)\s?\d[\d.\s,]*|Gratis)", re.IGNORECASE)
 
 
 def normalize_whitespace(value: str) -> str:
-    return " ".join((value or "").split())
+    return " ".join(_repair_mojibake(value or "").split())
+
+
+def _repair_mojibake(value: str) -> str:
+    text = value or ""
+    if not any(marker in text for marker in ("Ã", "Â", "â‚¬", "â€™", "â€œ", "â€")):
+        return text
+
+    try:
+        text = text.encode("latin1").decode("utf-8")
+    except UnicodeError:
+        pass
+
+    return (
+        text.replace("â‚¬", "€")
+        .replace("Â·", "·")
+        .replace("Â", "")
+        .replace("â€™", "'")
+        .replace("â€œ", '"')
+        .replace("â€\x9d", '"')
+    )
 
 
 def split_nonempty_lines(text: str) -> list[str]:
