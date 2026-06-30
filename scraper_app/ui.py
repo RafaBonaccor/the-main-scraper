@@ -5,7 +5,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -17,6 +17,21 @@ from .browser_runtime import (
     normalize_browser_mode,
 )
 from .contact_history import annotate_rows_with_contact_history, summarize_contact_status
+from .date_filter import describe_age_days, to_datetime_for_sorting
+from .job_profiles import (
+    is_builtin_job_profile,
+    load_job_profiles,
+    normalize_job_keywords,
+    parse_job_keywords,
+    save_custom_job_profile,
+    delete_custom_job_profile,
+)
+from .runtime_controls import (
+    clear_runtime_control_requests,
+    request_skip_current_item,
+    request_stop_after_current_item,
+)
+from .utils import build_subito_search_url
 
 
 APP_BG = "#f3efe6"
@@ -34,6 +49,99 @@ CONTACT_STATUS_LABELS = {
     "submitted": "inviato",
     "failed": "fallito",
 }
+CONTACT_STATUS_SORT_ORDER = {
+    "new": 0,
+    "prepared": 1,
+    "failed": 2,
+    "submitted": 3,
+}
+SCREENING_DECISION_LABELS = {
+    "candida": "candida",
+    "valuta": "valuta",
+    "no": "no",
+}
+SCREENING_DECISION_ORDER = {
+    "candida": 0,
+    "valuta": 1,
+    "no": 2,
+}
+LEAD_PRIORITY_ORDER = {"alta": 0, "media": 1, "bassa": 2}
+RESULT_SORT_OPTIONS = (
+    "Score opportunita",
+    "Priorita lead",
+    "Nome attivita",
+    "Categoria Maps",
+    "Valutazione Maps",
+    "Numero recensioni",
+    "Priorita consigliata",
+    "Score candidatura",
+    "Contatto",
+    "Decisione geo",
+    "Data annuncio",
+    "Data estrazione",
+    "Distanza",
+    "Luogo",
+    "Titolo",
+    "Azienda",
+    "Orario",
+)
+RESULT_SORT_COLUMN_MAP = {
+    "opportunity_score": "Score opportunita",
+    "lead_priority": "Priorita lead",
+    "name": "Nome attivita",
+    "category": "Categoria Maps",
+    "rating": "Valutazione Maps",
+    "reviews_count": "Numero recensioni",
+    "screening_decision": "Priorita consigliata",
+    "screening_score": "Score candidatura",
+    "contact_status": "Contatto",
+    "decision": "Decisione geo",
+    "published_at": "Data annuncio",
+    "extracted_at": "Data estrazione",
+    "distance_km": "Distanza",
+    "location": "Luogo",
+    "title": "Titolo",
+    "company": "Azienda",
+    "schedule": "Orario",
+}
+RESULT_SORT_DEFAULT_DESC = {
+    "Score opportunita": True,
+    "Priorita lead": False,
+    "Nome attivita": False,
+    "Categoria Maps": False,
+    "Valutazione Maps": True,
+    "Numero recensioni": True,
+    "Priorita consigliata": False,
+    "Score candidatura": True,
+    "Contatto": False,
+    "Decisione geo": False,
+    "Data annuncio": True,
+    "Data estrazione": True,
+    "Distanza": False,
+    "Luogo": False,
+    "Titolo": False,
+    "Azienda": False,
+    "Orario": False,
+}
+RESULT_SORT_MODE_DEFAULT_COLUMN = {
+    "Score opportunita": "opportunity_score",
+    "Priorita lead": "lead_priority",
+    "Nome attivita": "name",
+    "Categoria Maps": "category",
+    "Valutazione Maps": "rating",
+    "Numero recensioni": "reviews_count",
+    "Priorita consigliata": "screening_decision",
+    "Score candidatura": "screening_score",
+    "Contatto": "contact_status",
+    "Decisione geo": "decision",
+    "Data annuncio": "published_at",
+    "Data estrazione": "extracted_at",
+    "Distanza": "distance_km",
+    "Luogo": "location",
+    "Titolo": "title",
+    "Azienda": "company",
+    "Orario": "schedule",
+}
 SUBITO_JOB_OPTIONS = (
     ("pulizie", "Pulizie"),
     ("colf", "Colf"),
@@ -42,6 +150,19 @@ SUBITO_JOB_OPTIONS = (
     ("domestica", "Domestica"),
     ("baby sitter", "Baby sitter"),
     ("governante", "Governante"),
+)
+SUBITO_NEARBY_CITY_OPTIONS = (
+    "roma",
+    "morlupo",
+    "fiano romano",
+    "rignano flaminio",
+    "monterotondo",
+    "capena",
+    "riano",
+    "castelnuovo di porto",
+    "sacrofano",
+    "formello",
+    "campagnano di roma",
 )
 
 
@@ -108,6 +229,7 @@ class ScraperApp:
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.current_run_source = ""
         self.result_rows: list[dict] = []
+        self.result_row_lookup: dict[str, dict] = {}
         self.ui_result_json_path = (script_path.parent / "output" / "_ui_last_result.json").resolve()
 
         self.google_search_var = tk.StringVar(value="avvocati")
@@ -115,6 +237,10 @@ class ScraperApp:
         self.google_province_var = tk.StringVar()
         self.google_country_var = tk.StringVar(value="Italia")
         self.google_max_results_var = tk.StringVar(value="25")
+        self.google_exclude_sponsored_var = tk.BooleanVar(value=True)
+        self.google_include_details_var = tk.BooleanVar(value=True)
+        self.google_audit_websites_var = tk.BooleanVar(value=True)
+        self.google_website_timeout_var = tk.StringVar(value="10")
 
         self.subito_query_var = tk.StringVar()
         self.subito_region_var = tk.StringVar(value="lazio")
@@ -122,9 +248,19 @@ class ScraperApp:
         self.subito_category_var = tk.StringVar(value="offerte-lavoro")
         self.subito_anchor_place_var = tk.StringVar(value="Morlupo")
         self.subito_max_distance_var = tk.StringVar(value="30")
+        self.subito_max_age_hours_var = tk.StringVar(value="")
+        self.subito_max_age_days_var = tk.StringVar(value="14")
+        self.subito_exact_age_days_var = tk.StringVar(value="")
+        self.subito_auto_interval_hours_var = tk.StringVar(value="6")
         self.subito_nearby_only_var = tk.BooleanVar(value=False)
         self.subito_include_details_var = tk.BooleanVar(value=False)
+        self.subito_llm_screening_var = tk.BooleanVar(value=False)
+        self.subito_openai_model_var = tk.StringVar(value="gpt-5.5")
         self.subito_max_results_var = tk.StringVar(value="25")
+        self.subito_custom_job_keywords_var = tk.StringVar()
+        self.subito_profile_name_var = tk.StringVar()
+        self.subito_profiles_info_var = tk.StringVar(value="Keyword attive: nessuna. Seleziona lavori, profili o keyword extra.")
+        self.subito_job_profiles: dict[str, list[str]] = {}
 
         self.custom_url_var = tk.StringVar()
         self.custom_item_selector_var = tk.StringVar(value="article")
@@ -149,11 +285,14 @@ class ScraperApp:
         self.contact_keep_open_seconds_var = tk.StringVar(value="120")
         self.status_var = tk.StringVar(value="Idle")
         self.hint_var = tk.StringVar()
+        self.auto_monitor_status_var = tk.StringVar(value="Monitor automatico disattivato")
+        self.result_sort_var = tk.StringVar(value="Score opportunita")
         self.result_total_var = tk.StringVar(value="0 risultati")
         self.result_counts_var = tk.StringVar(value="accepted 0 | maybe 0 | rejected 0")
         self.result_meta_var = tk.StringVar(value="Nessun output caricato")
-        self.detail_title_var = tk.StringVar(value="Nessun annuncio selezionato")
+        self.detail_title_var = tk.StringVar(value="Nessun lead selezionato")
         self.detail_source_var = tk.StringVar(value="-")
+        self.detail_screening_var = tk.StringVar(value="-")
         self.detail_contact_var = tk.StringVar(value="-")
         self.detail_decision_var = tk.StringVar(value="-")
         self.detail_date_var = tk.StringVar(value="-")
@@ -165,6 +304,17 @@ class ScraperApp:
         self.detail_schedule_var = tk.StringVar(value="-")
         self.detail_price_var = tk.StringVar(value="-")
         self.detail_link_var = tk.StringVar(value="")
+        self.detail_website_var = tk.StringVar(value="")
+        self.auto_monitor_enabled = False
+        self.auto_monitor_after_id: str | None = None
+        self.auto_monitor_command: list[str] | None = None
+        self.auto_monitor_interval_ms = 0
+        self.current_results_generated_at = ""
+        self.result_sort_reverse = RESULT_SORT_DEFAULT_DESC.get("Score opportunita", True)
+        self.result_sort_active_column = RESULT_SORT_MODE_DEFAULT_COLUMN.get("Score opportunita", "")
+        self._updating_result_sort_var = False
+        self.results_column_labels: dict[str, str] = {}
+        self.current_result_source = "google_maps"
 
         self.root.title("The Main Scraper")
         self.root.geometry("1320x920")
@@ -173,12 +323,16 @@ class ScraperApp:
 
         self._configure_styles()
         self._build()
+        self._refresh_subito_saved_profiles()
+        self._update_subito_job_keywords_preview()
         self._update_hint()
         self._update_browser_mode()
         self._update_result_actions()
-        self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._update_hint())
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._handle_source_tab_changed())
         self.browser_mode_var.trace_add("write", lambda *_: self._update_browser_mode())
         self.browser_mode_var.trace_add("write", lambda *_: self._update_result_actions())
+        self.subito_custom_job_keywords_var.trace_add("write", lambda *_: self._update_subito_job_keywords_preview())
+        self.result_sort_var.trace_add("write", lambda *_: self._handle_result_sort_change())
         self.root.after(150, self._drain_logs)
 
     def _configure_styles(self) -> None:
@@ -214,7 +368,7 @@ class ScraperApp:
         left = ttk.Frame(header, style="App.TFrame")
         left.pack(side="left", fill="x", expand=True)
         ttk.Label(left, text="The Main Scraper", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(left, text="Subito Jobs con output nel popup e modalita browser reale.", style="Subtitle.TLabel").pack(anchor="w", pady=(4, 0))
+        ttk.Label(left, text="Google Maps lead generation e ricerca lavoro su Subito.it.", style="Subtitle.TLabel").pack(anchor="w", pady=(4, 0))
         ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").pack(side="right", anchor="ne")
 
         config_shell = ttk.Frame(container, style="Panel.TFrame", height=390)
@@ -259,13 +413,35 @@ class ScraperApp:
         self._build_log_tab()
 
     def _build_google_tab(self) -> None:
-        card = self._card(self.google_tab, "Ricerca locale")
+        card = self._card(self.google_tab, "Ricerca lead locali")
         card.pack(fill="x")
-        self._row(card, 0, "Query o URL", self.google_search_var)
-        self._row(card, 1, "Citta", self.google_city_var, 30)
+        self._row(card, 0, "Categorie o URL", self.google_search_var)
+        self._row(card, 1, "Citta o zone", self.google_city_var, 30)
         self._row(card, 2, "Provincia", self.google_province_var, 30)
         self._row(card, 3, "Paese", self.google_country_var, 30)
-        self._row(card, 4, "Max risultati", self.google_max_results_var, 12)
+        self._row(card, 4, "Max per ricerca", self.google_max_results_var, 12)
+        ttk.Checkbutton(
+            card,
+            text="Escludi risultati sponsorizzati, spesso fuori dalla zona richiesta",
+            variable=self.google_exclude_sponsored_var,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Checkbutton(
+            card,
+            text="Apri ogni attivita per estrarre sito, categoria, telefono, rating e recensioni",
+            variable=self.google_include_details_var,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Checkbutton(
+            card,
+            text="Analizza i siti trovati per email pubbliche, social e qualita tecnica di base",
+            variable=self.google_audit_websites_var,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(card, text="Timeout audit sito (sec)").grid(row=8, column=0, sticky="w")
+        ttk.Entry(card, textvariable=self.google_website_timeout_var, width=12).grid(row=8, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(
+            card,
+            text="Separa categorie e citta con virgole. Esempio: ristoranti, dentisti / Roma, Monterotondo.",
+            style="Hint.TLabel",
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def _build_subito_tab(self) -> None:
         card = self._card(self.subito_tab, "Annunci lavoro")
@@ -291,8 +467,6 @@ class ScraperApp:
         jobs_frame.columnconfigure(0, weight=1)
         for index, (_keyword, label) in enumerate(SUBITO_JOB_OPTIONS):
             self.subito_jobs_listbox.insert("end", label)
-            if index < 3:
-                self.subito_jobs_listbox.selection_set(index)
         ttk.Label(
             jobs_frame,
             text="Seleziona uno o piu lavori. Ogni keyword viene cercata e poi i risultati vengono uniti.",
@@ -300,14 +474,99 @@ class ScraperApp:
             wraplength=420,
             justify="left",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(jobs_frame, text="Keyword extra (virgole)").grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        ttk.Entry(jobs_frame, textvariable=self.subito_custom_job_keywords_var).grid(row=3, column=0, columnspan=2, sticky="ew")
+        ttk.Label(jobs_frame, text="Profili salvati").grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        saved_profiles_frame = ttk.Frame(jobs_frame, style="Panel.TFrame")
+        saved_profiles_frame.grid(row=5, column=0, columnspan=2, sticky="ew")
+        self.subito_saved_profiles_listbox = tk.Listbox(
+            saved_profiles_frame,
+            selectmode="multiple",
+            exportselection=False,
+            height=5,
+            bg="#ffffff",
+            fg=TEXT,
+            relief="solid",
+            borderwidth=1,
+        )
+        saved_profiles_scroll = ttk.Scrollbar(saved_profiles_frame, orient="vertical", command=self.subito_saved_profiles_listbox.yview)
+        self.subito_saved_profiles_listbox.configure(yscrollcommand=saved_profiles_scroll.set)
+        self.subito_saved_profiles_listbox.grid(row=0, column=0, sticky="nsew")
+        saved_profiles_scroll.grid(row=0, column=1, sticky="ns")
+        saved_profiles_frame.columnconfigure(0, weight=1)
+        ttk.Label(jobs_frame, text="Nome profilo da salvare").grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        profile_actions = ttk.Frame(jobs_frame, style="Panel.TFrame")
+        profile_actions.grid(row=7, column=0, columnspan=2, sticky="ew")
+        ttk.Entry(profile_actions, textvariable=self.subito_profile_name_var, width=24).grid(row=0, column=0, sticky="ew")
+        ttk.Button(profile_actions, text="Salva profilo", style="Secondary.TButton", command=self._save_subito_profile).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(profile_actions, text="Elimina selezionati", style="Secondary.TButton", command=self._delete_selected_subito_profiles).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(profile_actions, text="Pulisci profili", style="Secondary.TButton", command=self._clear_saved_profile_selection).grid(row=0, column=3, padx=(8, 0))
+        profile_actions.columnconfigure(0, weight=1)
+        ttk.Label(
+            jobs_frame,
+            textvariable=self.subito_profiles_info_var,
+            style="Hint.TLabel",
+            wraplength=420,
+            justify="left",
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.subito_jobs_listbox.bind("<<ListboxSelect>>", lambda _e: self._update_subito_job_keywords_preview())
+        self.subito_saved_profiles_listbox.bind("<<ListboxSelect>>", lambda _e: self._update_subito_job_keywords_preview())
         self._row(card, 2, "Regione", self.subito_region_var, 24)
-        self._row(card, 3, "Citta", self.subito_city_var, 24)
-        self._row(card, 4, "Categoria", self.subito_category_var, 24)
-        self._row(card, 5, "Punto riferimento", self.subito_anchor_place_var, 24)
-        self._row(card, 6, "Distanza max km", self.subito_max_distance_var, 12)
-        self._row(card, 7, "Max risultati", self.subito_max_results_var, 12)
-        ttk.Checkbutton(card, text="Tieni solo annunci accettati", variable=self.subito_nearby_only_var).grid(row=8, column=0, columnspan=2, sticky="w")
-        ttk.Checkbutton(card, text="Apri ogni annuncio ed estrai descrizione completa", variable=self.subito_include_details_var).grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._row(card, 3, "Citta / zone (virgole)", self.subito_city_var, 24)
+        ttk.Label(card, text="Paesini vicini salvati").grid(row=4, column=0, sticky="nw", pady=(0, 10))
+        nearby_frame = ttk.Frame(card, style="Panel.TFrame")
+        nearby_frame.grid(row=4, column=1, sticky="ew", padx=(10, 0), pady=(0, 10))
+        self.subito_nearby_cities_listbox = tk.Listbox(
+            nearby_frame,
+            selectmode="multiple",
+            exportselection=False,
+            height=6,
+            bg="#ffffff",
+            fg=TEXT,
+            relief="solid",
+            borderwidth=1,
+        )
+        nearby_scroll = ttk.Scrollbar(nearby_frame, orient="vertical", command=self.subito_nearby_cities_listbox.yview)
+        self.subito_nearby_cities_listbox.configure(yscrollcommand=nearby_scroll.set)
+        self.subito_nearby_cities_listbox.grid(row=0, column=0, sticky="nsew")
+        nearby_scroll.grid(row=0, column=1, sticky="ns")
+        nearby_actions = ttk.Frame(nearby_frame, style="Panel.TFrame")
+        nearby_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(nearby_actions, text="Usa selezionati", style="Secondary.TButton", command=self._apply_nearby_city_selection).grid(row=0, column=0, sticky="w")
+        ttk.Button(nearby_actions, text="Pulisci zone", style="Secondary.TButton", command=self._clear_nearby_city_selection).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(
+            nearby_frame,
+            text="Seleziona uno o piu paesi: il campo citta sopra viene aggiornato automaticamente.",
+            style="Hint.TLabel",
+            wraplength=420,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        nearby_frame.columnconfigure(0, weight=1)
+        for index, city_name in enumerate(SUBITO_NEARBY_CITY_OPTIONS):
+            self.subito_nearby_cities_listbox.insert("end", city_name)
+            if city_name == "roma":
+                self.subito_nearby_cities_listbox.selection_set(index)
+        self.subito_nearby_cities_listbox.bind("<<ListboxSelect>>", lambda _e: self._apply_nearby_city_selection())
+        self._apply_nearby_city_selection()
+        self._row(card, 5, "Categoria", self.subito_category_var, 24)
+        self._row(card, 6, "Punto riferimento", self.subito_anchor_place_var, 24)
+        self._row(card, 7, "Distanza max km", self.subito_max_distance_var, 12)
+        self._row(card, 8, "Max risultati", self.subito_max_results_var, 12)
+        self._row(card, 9, "Ultime ore", self.subito_max_age_hours_var, 12)
+        self._row(card, 10, "Max eta annuncio (giorni)", self.subito_max_age_days_var, 12)
+        self._row(card, 11, "Solo giorno (giorni fa)", self.subito_exact_age_days_var, 12)
+        self._row(card, 12, "Monitor ogni (ore)", self.subito_auto_interval_hours_var, 12)
+        ttk.Checkbutton(card, text="Tieni solo annunci accettati", variable=self.subito_nearby_only_var).grid(row=13, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(card, text="Apri ogni annuncio ed estrai descrizione completa", variable=self.subito_include_details_var).grid(row=14, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(card, text="Analizza descrizioni con OpenAI", variable=self.subito_llm_screening_var).grid(row=15, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._row(card, 16, "Modello OpenAI", self.subito_openai_model_var, 24)
+        ttk.Label(
+            card,
+            text="Richiede OPENAI_API_KEY nell ambiente. Puoi indicare piu citta separate da virgola, per esempio: monterotondo, fiano romano, roma, capena. Se compili 'Ultime ore', quel filtro ha priorita sugli altri filtri data e vengono tenuti solo gli annunci con orario disponibile. Se compili 'Solo giorno', quel filtro ha priorita sulla soglia in giorni. Quando lo screening e attivo, la descrizione completa viene recuperata automaticamente e i risultati vengono smistati in candida / valuta / no.",
+            style="Hint.TLabel",
+            wraplength=460,
+            justify="left",
+        ).grid(row=17, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
     def _build_custom_tab(self) -> None:
         card = self._card(self.custom_tab, "Configurazione avanzata")
@@ -346,7 +605,7 @@ class ScraperApp:
         ttk.Entry(card, textvariable=self.page_settle_seconds_var, width=10).grid(row=5, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
         ttk.Label(
             card,
-            text="sessione_persistente usa un profilo Chrome dedicato del progetto e mantiene il login tra un run e l altro. Su Subito, se lasci Profile Directory a Default, viene usato automaticamente il profilo dedicato Subito. chrome_normale crea invece uno snapshot leggero del tuo profilo reale, mentre profilo_personalizzato ti lascia scegliere una cartella User Data diversa. La modalita lenta aggiunge pause fisse e piu tempo di assestamento dopo i caricamenti.",
+            text="sessione_persistente usa un profilo Chrome dedicato del progetto. chrome_normale crea uno snapshot leggero del profilo reale, mentre profilo_personalizzato usa una cartella User Data scelta da te. La modalita lenta aggiunge pause e piu tempo di assestamento sulle connessioni instabili.",
             style="Hint.TLabel",
             wraplength=760,
             justify="left",
@@ -373,7 +632,24 @@ class ScraperApp:
         ttk.Button(card, text="Apri output", style="Secondary.TButton", command=self._open_output_dir).grid(row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6))
         ttk.Button(card, text="Ricarica risultati", style="Secondary.TButton", command=self._load_results).grid(row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 0))
         ttk.Button(card, text="Pulisci log", style="Secondary.TButton", command=self._clear_log).grid(row=2, column=0, sticky="ew", pady=(10, 0), padx=(0, 6))
-        ttk.Button(card, text="Apri annuncio selezionato", style="Secondary.TButton", command=self._open_selected_link).grid(row=2, column=1, sticky="ew", pady=(10, 0), padx=(6, 0))
+        ttk.Button(card, text="Apri lead su Maps", style="Secondary.TButton", command=self._open_selected_link).grid(row=2, column=1, sticky="ew", pady=(10, 0), padx=(6, 0))
+        self.stop_process_button = ttk.Button(card, text="Ferma processo", style="Secondary.TButton", command=self._stop_current_process)
+        self.stop_process_button.grid(row=3, column=0, sticky="ew", pady=(10, 0), padx=(0, 6))
+        self.stop_after_item_button = ttk.Button(card, text="Ferma dopo attivita", style="Secondary.TButton", command=self._request_stop_after_current_item)
+        self.stop_after_item_button.grid(row=3, column=1, sticky="ew", pady=(10, 0), padx=(6, 0))
+        self.skip_item_button = ttk.Button(card, text="Salta attivita corrente", style="Secondary.TButton", command=self._request_skip_current_item)
+        self.skip_item_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.auto_monitor_button = ttk.Button(card, text="Avvia monitor automatico", style="Accent.TButton", command=self._start_auto_monitor)
+        self.auto_monitor_button.grid(row=5, column=0, sticky="ew", pady=(10, 0), padx=(0, 6))
+        self.stop_auto_monitor_button = ttk.Button(card, text="Ferma monitor automatico", style="Secondary.TButton", command=self._stop_auto_monitor)
+        self.stop_auto_monitor_button.grid(row=5, column=1, sticky="ew", pady=(10, 0), padx=(6, 0))
+        ttk.Label(card, textvariable=self.auto_monitor_status_var, style="Hint.TLabel", wraplength=360, justify="left").grid(
+            row=6,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(10, 0),
+        )
         card.columnconfigure(0, weight=1)
         card.columnconfigure(1, weight=1)
 
@@ -382,8 +658,17 @@ class ScraperApp:
         summary.pack(fill="x")
         ttk.Label(summary, textvariable=self.result_total_var, style="Metric.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(summary, textvariable=self.result_counts_var, style="Metric.TLabel").grid(row=0, column=1, sticky="w", padx=(18, 0))
-        ttk.Label(summary, textvariable=self.result_meta_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(summary, text="Ordine: data piu recente, poi priorita geografica", style="Muted.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(summary, text="Ordina per").grid(row=0, column=2, sticky="e", padx=(18, 6))
+        self.result_sort_box = ttk.Combobox(
+            summary,
+            textvariable=self.result_sort_var,
+            values=RESULT_SORT_OPTIONS,
+            state="readonly",
+            width=22,
+        )
+        self.result_sort_box.grid(row=0, column=3, sticky="w")
+        ttk.Label(summary, textvariable=self.result_meta_var).grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(summary, text="Puoi riordinare la tabella dalla tendina oppure cliccando sulle intestazioni delle colonne.", style="Muted.TLabel").grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         split = ttk.Panedwindow(self.results_tab, orient="horizontal")
         split.pack(fill="both", expand=True, pady=(12, 0))
@@ -393,22 +678,39 @@ class ScraperApp:
         split.add(table_shell, weight=3)
         split.add(detail_shell, weight=2)
 
-        card = self._card(table_shell, "Annunci estratti")
+        card = self._card(table_shell, "Lead estratti")
         card.pack(fill="both", expand=True)
-        columns = ("contact_status", "decision", "published_at", "distance_km", "location", "title", "company", "schedule")
+        columns = ("lead_priority", "opportunity_score", "name", "category", "city", "phone", "email", "website_status", "rating", "reviews_count")
         self.results_tree = ttk.Treeview(card, columns=columns, show="headings", selectmode="extended")
+        self.results_column_labels = {
+            "lead_priority": "Priorita",
+            "opportunity_score": "Score",
+            "name": "Attivita",
+            "category": "Categoria",
+            "city": "Citta",
+            "phone": "Telefono",
+            "email": "Email",
+            "website_status": "Stato sito",
+            "rating": "Rating",
+            "reviews_count": "Recensioni",
+        }
         for key, label, width in (
-            ("contact_status", "Contatto", 95),
-            ("decision", "Decisione", 100),
-            ("published_at", "Data", 110),
-            ("distance_km", "Km", 70),
-            ("location", "Luogo", 150),
-            ("title", "Titolo", 360),
-            ("company", "Azienda", 180),
-            ("schedule", "Orario", 100),
+            ("lead_priority", "Priorita", 90),
+            ("opportunity_score", "Score", 70),
+            ("name", "Attivita", 260),
+            ("category", "Categoria", 150),
+            ("city", "Citta", 120),
+            ("phone", "Telefono", 145),
+            ("email", "Email", 210),
+            ("website_status", "Stato sito", 110),
+            ("rating", "Rating", 75),
+            ("reviews_count", "Recensioni", 90),
         ):
-            self.results_tree.heading(key, text=label)
-            self.results_tree.column(key, width=width, anchor="center" if key in {"contact_status", "decision", "published_at", "distance_km", "schedule"} else "w")
+            self.results_tree.heading(key, text=label, command=lambda current_key=key: self._on_results_heading_click(current_key))
+            self.results_tree.column(key, width=width, anchor="center" if key in {"lead_priority", "opportunity_score", "website_status", "rating", "reviews_count"} else "w")
+        self.results_tree.tag_configure("alta", background="#fff0e7")
+        self.results_tree.tag_configure("media", background="#fff8df")
+        self.results_tree.tag_configure("bassa", background="#edf7f0")
         self.results_tree.tag_configure("accepted", background="#edf7f0")
         self.results_tree.tag_configure("maybe", background="#fff7e8")
         self.results_tree.tag_configure("rejected", background="#fdeeee")
@@ -422,12 +724,14 @@ class ScraperApp:
         card.columnconfigure(0, weight=1)
         self.results_tree.bind("<Double-1>", lambda _e: self._open_selected_link())
         self.results_tree.bind("<<TreeviewSelect>>", lambda _e: self._handle_result_selection())
+        self._update_result_heading_labels()
 
         detail_scroll = VerticalScrolledFrame(detail_shell, background=PANEL_BG)
         detail_scroll.pack(fill="both", expand=True)
         detail_body = detail_scroll.body
 
-        detail_card = self._card(detail_body, "Dettaglio annuncio")
+        detail_card = self._card(detail_body, "Dettaglio lead")
+        self.detail_card = detail_card
         detail_card.pack(fill="x")
         tk.Label(
             detail_card,
@@ -439,20 +743,23 @@ class ScraperApp:
             justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w")
         self._detail_row(detail_card, 1, "Sorgente", self.detail_source_var)
-        self._detail_row(detail_card, 1, "Contatto", self.detail_contact_var, column_offset=2)
-        self._detail_row(detail_card, 2, "Decisione", self.detail_decision_var)
-        self._detail_row(detail_card, 2, "Data", self.detail_date_var, column_offset=2)
-        self._detail_row(detail_card, 3, "Distanza", self.detail_distance_var)
-        self._detail_row(detail_card, 3, "Luogo", self.detail_location_var, column_offset=2)
-        self._detail_row(detail_card, 4, "Azienda", self.detail_company_var)
-        self._detail_row(detail_card, 4, "Settore", self.detail_sector_var, column_offset=2)
-        self._detail_row(detail_card, 5, "Ruolo", self.detail_role_var)
-        self._detail_row(detail_card, 5, "Orario", self.detail_schedule_var, column_offset=2)
-        self._detail_row(detail_card, 6, "Prezzo", self.detail_price_var)
-        ttk.Label(detail_card, text="Link").grid(row=7, column=0, sticky="w", pady=(12, 6))
+        self._detail_row(detail_card, 1, "Priorita", self.detail_screening_var, column_offset=2)
+        self._detail_row(detail_card, 2, "Stato lead", self.detail_contact_var)
+        self._detail_row(detail_card, 2, "Stato sito", self.detail_decision_var, column_offset=2)
+        self._detail_row(detail_card, 3, "Estratto", self.detail_date_var)
+        self._detail_row(detail_card, 3, "Rating", self.detail_distance_var, column_offset=2)
+        self._detail_row(detail_card, 4, "Indirizzo", self.detail_location_var)
+        self._detail_row(detail_card, 4, "Email", self.detail_company_var, column_offset=2)
+        self._detail_row(detail_card, 5, "Categoria", self.detail_sector_var)
+        self._detail_row(detail_card, 5, "Telefono", self.detail_role_var, column_offset=2)
+        self._detail_row(detail_card, 6, "Recensioni", self.detail_schedule_var)
+        self._detail_row(detail_card, 6, "Risposta sito", self.detail_price_var, column_offset=2)
+        ttk.Label(detail_card, text="Google Maps").grid(row=7, column=0, sticky="w", pady=(12, 6))
         self.detail_link_entry = ttk.Entry(detail_card, textvariable=self.detail_link_var)
         self.detail_link_entry.grid(row=7, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(12, 6))
-        ttk.Label(detail_card, text="Testo annuncio").grid(row=8, column=0, sticky="nw", pady=(12, 6))
+        ttk.Label(detail_card, text="Sito web").grid(row=8, column=0, sticky="w", pady=(6, 6))
+        ttk.Entry(detail_card, textvariable=self.detail_website_var).grid(row=8, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(6, 6))
+        ttk.Label(detail_card, text="Analisi lead").grid(row=9, column=0, sticky="nw", pady=(12, 6))
         self.detail_raw_text = ScrolledText(
             detail_card,
             wrap="word",
@@ -465,16 +772,34 @@ class ScraperApp:
             pady=10,
             font=("Segoe UI", 10),
         )
-        self.detail_raw_text.grid(row=8, column=1, columnspan=3, sticky="nsew", padx=(10, 0), pady=(12, 6))
+        self.detail_raw_text.grid(row=9, column=1, columnspan=3, sticky="nsew", padx=(10, 0), pady=(12, 6))
         detail_card.columnconfigure(1, weight=1)
         detail_card.columnconfigure(3, weight=1)
-        detail_card.rowconfigure(8, weight=1)
+        detail_card.rowconfigure(9, weight=1)
+
+        lead_card = self._card(detail_body, "Azioni lead")
+        self.lead_card = lead_card
+        lead_card.pack(fill="x", pady=(12, 0))
+        ttk.Label(
+            lead_card,
+            text="Apri la scheda Maps per verificare i dati oppure visita il sito pubblico prima di preparare la demo commerciale.",
+            style="Hint.TLabel",
+            wraplength=430,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        self.open_selected_button = ttk.Button(lead_card, text="Apri Google Maps", style="Accent.TButton", command=self._open_selected_link)
+        self.open_selected_button.grid(row=1, column=0, sticky="ew", pady=(12, 0), padx=(0, 6))
+        self.open_website_button = ttk.Button(lead_card, text="Apri sito web", style="Secondary.TButton", command=self._open_selected_website)
+        self.open_website_button.grid(row=1, column=1, sticky="ew", pady=(12, 0), padx=(6, 0))
+        lead_card.columnconfigure(0, weight=1)
+        lead_card.columnconfigure(1, weight=1)
 
         contact_card = self._card(detail_body, "Contatto Subito")
+        self.contact_card = contact_card
         contact_card.pack(fill="x", pady=(12, 0))
         ttk.Label(
             contact_card,
-            text="Richiede un annuncio Subito selezionato. Con sessione_persistente fai il login una volta sola e i run successivi lo riusano. Se al primo contatto Subito chiede accesso, il flusso aspetta che tu faccia login e poi continua. Gli annunci gia inviati vengono marcati nella tabella e i bottoni batch li saltano automaticamente.",
+            text="Richiede un annuncio Subito selezionato. Con sessione_persistente fai il login una volta sola e i run successivi lo riusano. Se al primo contatto Subito chiede accesso, il flusso aspetta che tu faccia login e poi continua. Gli annunci gia inviati vengono marcati nella tabella e i bottoni batch li saltano automaticamente. Se hai attivato lo screening OpenAI, il batch usa prima gli annunci consigliati.",
             style="Hint.TLabel",
             wraplength=430,
             justify="left",
@@ -507,14 +832,99 @@ class ScraperApp:
         ttk.Button(contact_card, text="Apri allegato", style="Secondary.TButton", command=self._open_attachment_file).grid(row=4, column=2, sticky="e")
         self.contact_button = ttk.Button(contact_card, text="Prepara annuncio", style="Accent.TButton", command=self._start_contact_action)
         self.contact_button.grid(row=5, column=0, sticky="ew", pady=(12, 0), padx=(0, 6))
-        self.contact_selected_button = ttk.Button(contact_card, text="Invia CV selezionati (solo nuovi)", style="Accent.TButton", command=self._start_batch_contact_selected)
+        self.contact_selected_button = ttk.Button(contact_card, text="Invia CV solo ai selezionati", style="Accent.TButton", command=self._start_batch_contact_selected)
         self.contact_selected_button.grid(row=5, column=1, sticky="ew", pady=(12, 0), padx=(6, 6))
-        self.contact_accepted_button = ttk.Button(contact_card, text="Invia CV accettati (solo nuovi)", style="Accent.TButton", command=self._start_batch_contact_accepted)
+        self.contact_accepted_button = ttk.Button(contact_card, text="Invia CV a tutti i consigliati", style="Accent.TButton", command=self._start_batch_contact_accepted)
         self.contact_accepted_button.grid(row=5, column=2, sticky="ew", pady=(12, 0))
-        self.open_selected_button = ttk.Button(contact_card, text="Apri annuncio", style="Secondary.TButton", command=self._open_selected_link)
-        self.open_selected_button.grid(row=6, column=2, sticky="ew", pady=(10, 0))
+        self.subito_open_selected_button = ttk.Button(contact_card, text="Apri annuncio", style="Secondary.TButton", command=self._open_selected_link)
+        self.subito_open_selected_button.grid(row=6, column=2, sticky="ew", pady=(10, 0))
         contact_card.columnconfigure(1, weight=1)
         contact_card.columnconfigure(2, weight=1)
+        self.contact_card.pack_forget()
+
+    def _configure_results_columns(self, source: str) -> None:
+        if source == "google_maps":
+            column_config = (
+                ("lead_priority", "Priorita", 90, "center"),
+                ("opportunity_score", "Score", 70, "center"),
+                ("name", "Attivita", 260, "w"),
+                ("category", "Categoria", 150, "w"),
+                ("city", "Citta", 120, "w"),
+                ("phone", "Telefono", 145, "w"),
+                ("email", "Email", 210, "w"),
+                ("website_status", "Stato sito", 110, "center"),
+                ("rating", "Rating", 75, "center"),
+                ("reviews_count", "Recensioni", 90, "center"),
+            )
+        else:
+            column_config = (
+                ("screening_decision", "Candidatura", 105, "center"),
+                ("screening_score", "Score", 70, "center"),
+                ("contact_status", "Contatto", 95, "center"),
+                ("decision", "Decisione", 100, "center"),
+                ("published_at", "Data", 110, "center"),
+                ("extracted_at", "Estratto", 125, "center"),
+                ("distance_km", "Km", 70, "center"),
+                ("location", "Luogo", 150, "w"),
+                ("title", "Titolo", 360, "w"),
+                ("company", "Azienda", 180, "w"),
+                ("schedule", "Orario", 100, "center"),
+            )
+
+        columns = tuple(item[0] for item in column_config)
+        self.results_tree.configure(columns=columns)
+        self.results_column_labels = {key: label for key, label, _width, _anchor in column_config}
+        for key, label, width, anchor in column_config:
+            self.results_tree.heading(key, text=label, command=lambda current_key=key: self._on_results_heading_click(current_key))
+            self.results_tree.column(key, width=width, anchor=anchor)
+
+    def _handle_source_tab_changed(self) -> None:
+        self._update_hint()
+        selected = self.notebook.tab(self.notebook.select(), "text")
+        self._configure_result_panels("subito" if selected == "Subito Jobs" else "google_maps")
+
+    def _configure_result_panels(self, source: str) -> None:
+        if not hasattr(self, "lead_card") or not hasattr(self, "contact_card"):
+            return
+        if source == "subito":
+            self.lead_card.pack_forget()
+            if not self.contact_card.winfo_manager():
+                self.contact_card.pack(fill="x", pady=(12, 0))
+        else:
+            self.contact_card.pack_forget()
+            if not self.lead_card.winfo_manager():
+                self.lead_card.pack(fill="x", pady=(12, 0))
+
+    def _configure_detail_labels(self, source: str) -> None:
+        if not hasattr(self, "detail_card"):
+            return
+        if source == "google_maps":
+            labels = {
+                (1, 0): "Sorgente", (1, 2): "Priorita",
+                (2, 0): "Stato lead", (2, 2): "Stato sito",
+                (3, 0): "Estratto", (3, 2): "Rating",
+                (4, 0): "Indirizzo", (4, 2): "Email",
+                (5, 0): "Categoria", (5, 2): "Telefono",
+                (6, 0): "Recensioni", (6, 2): "Risposta sito",
+                (7, 0): "Google Maps", (8, 0): "Sito web", (9, 0): "Analisi lead",
+            }
+            self.detail_card.configure(text="Dettaglio lead")
+        else:
+            labels = {
+                (1, 0): "Sorgente", (1, 2): "Candidatura",
+                (2, 0): "Contatto", (2, 2): "Decisione geo",
+                (3, 0): "Data", (3, 2): "Distanza",
+                (4, 0): "Luogo", (4, 2): "Azienda",
+                (5, 0): "Settore", (5, 2): "Ruolo",
+                (6, 0): "Orario", (6, 2): "Prezzo",
+                (7, 0): "Link", (8, 0): "Sito web", (9, 0): "Testo annuncio",
+            }
+            self.detail_card.configure(text="Dettaglio annuncio")
+        for (row, column), text in labels.items():
+            for widget in self.detail_card.grid_slaves(row=row, column=column):
+                if isinstance(widget, (ttk.Label, tk.Label)):
+                    widget.configure(text=text)
+                    break
 
     def _build_log_tab(self) -> None:
         card = self._card(self.log_tab, "Log esecuzione")
@@ -544,11 +954,11 @@ class ScraperApp:
         selected = self.notebook.tab(self.notebook.select(), "text")
         if selected == "Subito Jobs":
             self.hint_var.set(
-                "Subito Jobs mostra gli annunci nella tab Risultati con dettaglio completo. sessione_persistente tiene un profilo Chrome dedicato con login riusabile, i profili lavoro lanciano ricerche come pulizie/colf/badante, puoi anche aprire ogni annuncio per prendere la descrizione completa, e la GUI tiene traccia degli annunci gia preparati o inviati per evitare ricontatti involontari."
+                "Subito Jobs mostra gli annunci nella tab Risultati con dettaglio completo. sessione_persistente tiene un profilo Chrome dedicato con login riusabile, puoi combinare keyword libere e profili lavoro salvati, cercare su piu citta o zone separate da virgola, filtrare gli annunci delle ultime N ore oppure di oggi, ieri o di N giorni fa, aprire ogni annuncio per prendere la descrizione completa, attivare lo screening OpenAI per smistare candida / valuta / no, e avviare un monitor automatico che rilancia la stessa ricerca ogni X ore finche la GUI resta aperta."
             )
         elif selected == "Google Maps":
             self.hint_var.set(
-                "Google Maps usa la stessa configurazione browser. Se vuoi tenere cookie e sessioni di lavoro nel progetto usa sessione_persistente, altrimenti puoi usare chrome_normale o un profilo personalizzato."
+                "Inserisci una o piu categorie e una o piu citta. Il sistema raccoglie le attivita, apre le schede Maps, trova sito e contatti pubblici, analizza i siti e ordina i lead in base all opportunita commerciale."
             )
         else:
             self.hint_var.set(
@@ -569,8 +979,11 @@ class ScraperApp:
         selected_new_rows = [item for item in selected_rows if not self._row_has_submitted_contact(item)]
         accepted_rows = self._get_accepted_subito_rows()
         has_row = row is not None and bool(str(row.get("link", "") or "").strip())
+        has_website = row is not None and bool(str(row.get("website", "") or "").strip())
         is_subito = has_row and str(row.get("source", "") or "").strip().lower() == "subito"
         self.open_selected_button.configure(state="normal" if has_row else "disabled")
+        self.subito_open_selected_button.configure(state="normal" if has_row else "disabled")
+        self.open_website_button.configure(state="normal" if has_website else "disabled")
         self.contact_button.configure(state="normal" if is_subito else "disabled")
         self.contact_selected_button.configure(state="normal" if selected_new_rows else "disabled")
         self.contact_accepted_button.configure(state="normal" if accepted_rows else "disabled")
@@ -608,6 +1021,8 @@ class ScraperApp:
 
     def _clear_results(self) -> None:
         self.result_rows = []
+        self.result_row_lookup = {}
+        self.current_results_generated_at = ""
         self.result_total_var.set("0 risultati")
         self.result_counts_var.set("accepted 0 | maybe 0 | rejected 0")
         self.result_meta_var.set("Nessun output caricato")
@@ -617,8 +1032,9 @@ class ScraperApp:
         self._update_result_actions()
 
     def _clear_detail_panel(self) -> None:
-        self.detail_title_var.set("Nessun annuncio selezionato")
+        self.detail_title_var.set("Nessun lead selezionato")
         self.detail_source_var.set("-")
+        self.detail_screening_var.set("-")
         self.detail_contact_var.set("-")
         self.detail_decision_var.set("-")
         self.detail_date_var.set("-")
@@ -630,6 +1046,7 @@ class ScraperApp:
         self.detail_schedule_var.set("-")
         self.detail_price_var.set("-")
         self.detail_link_var.set("")
+        self.detail_website_var.set("")
         self._set_detail_raw_text("")
 
     def _set_detail_raw_text(self, text: str) -> None:
@@ -644,6 +1061,104 @@ class ScraperApp:
         self.contact_message_var.set(value)
         return value
 
+    def _start_auto_monitor(self) -> None:
+        if self.notebook.tab(self.notebook.select(), "text") != "Subito Jobs":
+            messagebox.showerror("Monitor automatico", "Il monitor automatico e disponibile solo nella tab Subito Jobs.")
+            return
+        if self.process is not None:
+            messagebox.showinfo("Monitor automatico", "Attendi la fine del processo corrente prima di avviare il monitor.")
+            return
+        interval_hours = self._parse_auto_interval_hours()
+        if interval_hours is None:
+            return
+        try:
+            command = self._build_scrape_command()
+        except ValueError as exc:
+            messagebox.showerror("Monitor automatico", str(exc))
+            return
+        if len(command) < 4 or command[3] != "subito":
+            messagebox.showerror("Monitor automatico", "Il monitor automatico supporta solo lo scraping Subito.")
+            return
+        self.auto_monitor_enabled = True
+        self.auto_monitor_command = list(command)
+        self.auto_monitor_interval_ms = max(int(interval_hours * 3600 * 1000), 60_000)
+        self._cancel_auto_monitor_timer()
+        self.auto_monitor_status_var.set(f"Monitor attivo: run ogni {interval_hours:g} ore. Avvio iniziale in corso.")
+        self.current_run_source = command[3]
+        self._append_log(f"[auto] Monitor attivato: run ogni {interval_hours:g} ore.\n")
+        self._start_process(list(command), kind="scrape", load_results=True)
+
+    def _stop_auto_monitor(self) -> None:
+        was_enabled = self.auto_monitor_enabled or self.auto_monitor_after_id is not None
+        self.auto_monitor_enabled = False
+        self.auto_monitor_command = None
+        self.auto_monitor_interval_ms = 0
+        self._cancel_auto_monitor_timer()
+        self.auto_monitor_status_var.set("Monitor automatico disattivato")
+        if was_enabled:
+            self._append_log("[auto] Monitor automatico fermato.\n")
+
+    def _parse_auto_interval_hours(self) -> float | None:
+        raw_value = self.subito_auto_interval_hours_var.get().strip()
+        if not raw_value:
+            messagebox.showerror("Monitor automatico", "Inserisci ogni quante ore deve ripartire il monitor.")
+            return None
+        try:
+            interval_hours = float(raw_value)
+        except ValueError:
+            messagebox.showerror("Monitor automatico", "Monitor ogni (ore) deve essere un numero valido, ad esempio 6.")
+            return None
+        if interval_hours <= 0:
+            messagebox.showerror("Monitor automatico", "Monitor ogni (ore) deve essere maggiore di zero.")
+            return None
+        return interval_hours
+
+    def _cancel_auto_monitor_timer(self) -> None:
+        if self.auto_monitor_after_id is not None:
+            self.root.after_cancel(self.auto_monitor_after_id)
+            self.auto_monitor_after_id = None
+
+    def _command_argument_value(self, command: list[str], flag: str) -> str:
+        try:
+            index = command.index(flag)
+        except ValueError:
+            return ""
+        next_index = index + 1
+        if next_index >= len(command):
+            return ""
+        return str(command[next_index] or "")
+
+    def _schedule_next_auto_run(self, *, code: int) -> None:
+        if not self.auto_monitor_enabled or not self.auto_monitor_command or self.auto_monitor_interval_ms <= 0:
+            return
+        self._cancel_auto_monitor_timer()
+        next_run_at = datetime.now() + timedelta(milliseconds=self.auto_monitor_interval_ms)
+        status = "ok" if code == 0 else f"errore exit {code}"
+        self.auto_monitor_status_var.set(
+            f"Monitor attivo: prossimo run alle {next_run_at.strftime('%H:%M')} ({status})."
+        )
+        self._append_log(
+            f"[auto] Prossimo run pianificato per le {next_run_at.strftime('%H:%M:%S')}.\n"
+        )
+        self.auto_monitor_after_id = self.root.after(self.auto_monitor_interval_ms, self._run_scheduled_auto_monitor)
+
+    def _run_scheduled_auto_monitor(self) -> None:
+        self.auto_monitor_after_id = None
+        if not self.auto_monitor_enabled or not self.auto_monitor_command:
+            return
+        if self.process is not None:
+            retry_at = datetime.now() + timedelta(minutes=1)
+            self.auto_monitor_status_var.set(
+                f"Monitor attivo: processo ancora in corso, nuovo tentativo alle {retry_at.strftime('%H:%M')}."
+            )
+            self._append_log("[auto] Processo ancora attivo, ritento tra 60 secondi.\n")
+            self.auto_monitor_after_id = self.root.after(60_000, self._run_scheduled_auto_monitor)
+            return
+        self.auto_monitor_status_var.set("Monitor attivo: avvio run programmato.")
+        self.current_run_source = self.auto_monitor_command[3]
+        self._append_log("[auto] Avvio run programmato.\n")
+        self._start_process(list(self.auto_monitor_command), kind="scrape", load_results=True)
+
     def _start_scrape(self) -> None:
         try:
             command = self._build_scrape_command()
@@ -655,6 +1170,14 @@ class ScraperApp:
         self._start_process(command, kind="scrape", load_results=True)
 
     def _start_contact_action(self) -> None:
+        row = self._get_selected_row()
+        if self.contact_submit_var.get() and row is not None:
+            title = str(row.get("title", row.get("name", "")) or "Annuncio senza titolo").strip()
+            if not messagebox.askyesno(
+                "Conferma invio singolo",
+                f"Stai per inviare il CV a questo annuncio:\n\n{title}\n\nConfermi?",
+            ):
+                return
         try:
             command = self._build_contact_command()
         except ValueError as exc:
@@ -668,16 +1191,18 @@ class ScraperApp:
         if not rows:
             messagebox.showerror("Invio CV", "Seleziona almeno un annuncio Subito.")
             return
-        self._start_batch_contact(rows)
+        self._start_batch_contact(rows, scope_label="solo agli annunci selezionati")
 
     def _start_batch_contact_accepted(self) -> None:
         rows = self._get_accepted_subito_rows()
         if not rows:
-            messagebox.showerror("Invio CV", "Non ci sono annunci accepted disponibili.")
+            messagebox.showerror("Invio CV", "Non ci sono annunci consigliati disponibili.")
             return
-        self._start_batch_contact(rows)
+        self._start_batch_contact(rows, scope_label="a tutti gli annunci consigliati")
 
-    def _start_batch_contact(self, rows: list[dict]) -> None:
+    def _start_batch_contact(self, rows: list[dict], scope_label: str) -> None:
+        if not self._confirm_batch_contact(rows, scope_label):
+            return
         try:
             command = self._build_contact_batch_command(rows)
         except ValueError as exc:
@@ -686,10 +1211,42 @@ class ScraperApp:
         self.bottom_notebook.select(self.log_tab)
         self._start_process(command, kind="contact", load_results=False)
 
+    def _confirm_batch_contact(self, rows: list[dict], scope_label: str) -> bool:
+        unique_rows: list[dict] = []
+        seen_links: set[str] = set()
+        for row in rows:
+            link = str(row.get("link", "") or "").strip()
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            unique_rows.append(row)
+        if not unique_rows:
+            messagebox.showerror("Invio CV", "Non ci sono annunci validi da inviare.")
+            return False
+
+        preview_lines = []
+        for row in unique_rows[:8]:
+            title = str(row.get("title", row.get("name", "")) or "Annuncio senza titolo").strip()
+            location = str(row.get("location", "") or "").strip()
+            preview_lines.append(f"- {title}" + (f" | {location}" if location else ""))
+        remaining = len(unique_rows) - len(preview_lines)
+        if remaining > 0:
+            preview_lines.append(f"... altri {remaining} annunci")
+        message = (
+            f"Stai per inviare il CV {scope_label}.\n\n"
+            f"Annunci coinvolti: {len(unique_rows)}\n"
+            f"Allegato: {Path(self.attachment_path_var.get().strip()).name or '-'}\n\n"
+            "Anteprima:\n"
+            + "\n".join(preview_lines)
+            + "\n\nConfermi?"
+        )
+        return messagebox.askyesno("Conferma invio CV", message)
+
     def _start_process(self, command: list[str], kind: str, load_results: bool) -> None:
         if self.process is not None:
             messagebox.showinfo("Processo in esecuzione", "Attendi la fine del processo corrente.")
             return
+        clear_runtime_control_requests()
         self.process_kind = kind
         self.process_should_load_results = load_results
         self.status_var.set("Running")
@@ -698,11 +1255,37 @@ class ScraperApp:
         if kind == "contact":
             self.contact_button.configure(state="disabled")
         if kind == "scrape":
+            ui_result_json = self._command_argument_value(command, "--ui-result-json")
+            if ui_result_json:
+                self.ui_result_json_path = Path(ui_result_json).resolve()
             self.ui_result_json_path.parent.mkdir(parents=True, exist_ok=True)
             if self.ui_result_json_path.exists():
                 self.ui_result_json_path.unlink()
         self.process = subprocess.Popen(command, cwd=self.script_path.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         threading.Thread(target=self._read_process_output, daemon=True).start()
+
+    def _stop_current_process(self) -> None:
+        if self.process is None:
+            messagebox.showinfo("Ferma processo", "Nessun processo in esecuzione.")
+            return
+        clear_runtime_control_requests()
+        self._append_log("[control] Richiesta di stop immediato del processo.\n")
+        self.status_var.set("Stopping")
+        self.process.terminate()
+
+    def _request_stop_after_current_item(self) -> None:
+        if self.process is None:
+            messagebox.showinfo("Ferma dopo attivita", "Nessun processo in esecuzione.")
+            return
+        request_stop_after_current_item()
+        self._append_log("[control] Il processo si fermerà dopo l'annuncio corrente.\n")
+
+    def _request_skip_current_item(self) -> None:
+        if self.process is None:
+            messagebox.showinfo("Salta attivita", "Nessun processo in esecuzione.")
+            return
+        request_skip_current_item()
+        self._append_log("[control] Richiesto skip dell'attivita corrente.\n")
 
     def _build_scrape_command(self) -> list[str]:
         self.ui_result_json_path = (Path(self.output_dir_var.get()).resolve() / "_ui_last_result.json")
@@ -713,34 +1296,96 @@ class ScraperApp:
                 raise ValueError("Inserisci una query o URL per Google Maps.")
             if not self.google_max_results_var.get().strip().isdigit():
                 raise ValueError("Max risultati Google Maps deve essere un intero positivo.")
+            try:
+                website_timeout = float(self.google_website_timeout_var.get().strip())
+            except ValueError as exc:
+                raise ValueError("Timeout audit sito deve essere un numero valido.") from exc
+            if website_timeout <= 0:
+                raise ValueError("Timeout audit sito deve essere maggiore di zero.")
             cmd += ["google_maps", "--search", self.google_search_var.get().strip(), "--max-results", self.google_max_results_var.get().strip()]
             for flag, var in (("--city", self.google_city_var), ("--province", self.google_province_var), ("--country", self.google_country_var)):
                 if var.get().strip():
                     cmd += [flag, var.get().strip()]
+            cmd += ["--website-timeout-seconds", str(website_timeout)]
+            cmd.append("--exclude-sponsored" if self.google_exclude_sponsored_var.get() else "--no-exclude-sponsored")
+            cmd.append("--include-details" if self.google_include_details_var.get() else "--no-include-details")
+            cmd.append("--audit-websites" if self.google_audit_websites_var.get() else "--no-audit-websites")
         elif selected == "Subito Jobs":
             if not self.subito_max_results_var.get().strip().isdigit():
                 raise ValueError("Max risultati Subito deve essere un intero positivo.")
+            raw_query = self.subito_query_var.get().strip()
+            is_direct_url = raw_query.lower().startswith(("http://", "https://"))
+            selected_job_keywords = self._effective_subito_job_keywords()
+            query_argument_value = raw_query
+            city_value = self.subito_city_var.get().strip()
+            region_value = self.subito_region_var.get().strip()
+            category_value = self.subito_category_var.get().strip()
+            if (
+                not is_direct_url
+                and not raw_query
+                and not selected_job_keywords
+                and city_value
+                and "," not in city_value
+            ):
+                query_argument_value = build_subito_search_url(
+                    query_value="",
+                    region=region_value or "lazio",
+                    category=category_value or "offerte-lavoro",
+                    city=city_value,
+                )
+                is_direct_url = True
+            max_age_hours_raw = self.subito_max_age_hours_var.get().strip()
+            if max_age_hours_raw and not max_age_hours_raw.isdigit():
+                raise ValueError("Ultime ore deve essere un intero maggiore o uguale a zero.")
+            max_age_hours = int(max_age_hours_raw) if max_age_hours_raw else 0
+            if not self.subito_max_age_days_var.get().strip().isdigit():
+                raise ValueError("Max eta annuncio deve essere un intero maggiore o uguale a zero.")
+            exact_age_raw = self.subito_exact_age_days_var.get().strip()
+            if exact_age_raw and not exact_age_raw.isdigit():
+                raise ValueError("Solo giorno deve essere un intero maggiore o uguale a zero. Esempio: 1 = ieri.")
             try:
                 float(self.subito_max_distance_var.get().strip())
             except ValueError as exc:
                 raise ValueError("Distanza max Subito deve essere un numero valido.") from exc
-            cmd += ["subito", "--max-results", self.subito_max_results_var.get().strip(), "--max-distance-km", self.subito_max_distance_var.get().strip()]
-            for flag, var in (
-                ("--query", self.subito_query_var),
-                ("--region", self.subito_region_var),
-                ("--city", self.subito_city_var),
-                ("--category", self.subito_category_var),
-                ("--anchor-place", self.subito_anchor_place_var),
+            cmd += [
+                "subito",
+                "--max-results",
+                self.subito_max_results_var.get().strip(),
+                "--max-distance-km",
+                self.subito_max_distance_var.get().strip(),
+                "--max-age-hours",
+                str(max_age_hours),
+                "--max-age-days",
+                self.subito_max_age_days_var.get().strip(),
+            ]
+            if exact_age_raw:
+                cmd += ["--exact-age-days", exact_age_raw]
+            if query_argument_value:
+                cmd += ["--query", query_argument_value]
+            for flag, value in (
+                ("--region", region_value),
+                ("--city", city_value),
+                ("--category", category_value),
+                ("--anchor-place", self.subito_anchor_place_var.get().strip()),
             ):
-                if var.get().strip():
-                    cmd += [flag, var.get().strip()]
-            selected_job_keywords = self._selected_subito_job_keywords()
-            if selected_job_keywords:
+                if is_direct_url and flag in {"--region", "--city", "--category"}:
+                    continue
+                if value:
+                    cmd += [flag, value]
+            if selected_job_keywords and not is_direct_url:
                 cmd += ["--job-keywords", ",".join(selected_job_keywords)]
             if self.subito_nearby_only_var.get():
                 cmd.append("--nearby-only")
-            if self.subito_include_details_var.get():
+            include_details = self.subito_include_details_var.get() or self.subito_llm_screening_var.get() or max_age_hours > 0
+            if include_details:
                 cmd.append("--include-details")
+            if self.subito_llm_screening_var.get():
+                if not os.environ.get("OPENAI_API_KEY", "").strip():
+                    raise ValueError("Per lo screening OpenAI devi impostare OPENAI_API_KEY.")
+                model_name = self.subito_openai_model_var.get().strip()
+                if not model_name:
+                    raise ValueError("Inserisci un modello OpenAI valido per lo screening.")
+                cmd += ["--llm-screening", "--openai-model", model_name]
         else:
             if not self.custom_url_var.get().strip() or not self.custom_item_selector_var.get().strip():
                 raise ValueError("Inserisci URL e selector item per il sito custom.")
@@ -877,6 +1522,25 @@ class ScraperApp:
         status = str(row.get("contact_status", "new") or "new").strip().lower()
         return CONTACT_STATUS_LABELS.get(status, CONTACT_STATUS_LABELS["new"])
 
+    def _screening_status_label(self, row: dict) -> str:
+        status = str(row.get("screening_decision", "") or "").strip().lower()
+        return SCREENING_DECISION_LABELS.get(status, "-")
+
+    def _screening_detail_label(self, row: dict) -> str:
+        status = self._screening_status_label(row)
+        score = str(row.get("screening_score", "") or "").strip()
+        if status == "-":
+            return "-"
+        if score:
+            return f"{status} ({score})"
+        return status
+
+    def _screening_score_value(self, row: dict) -> int:
+        try:
+            return int(row.get("screening_score", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def _row_has_submitted_contact(self, row: dict) -> bool:
         return bool(row.get("contact_already_submitted", False))
 
@@ -901,6 +1565,117 @@ class ScraperApp:
             if 0 <= index < len(SUBITO_JOB_OPTIONS):
                 keywords.append(SUBITO_JOB_OPTIONS[index][0])
         return keywords
+
+    def _selected_saved_profile_names(self) -> list[str]:
+        if not hasattr(self, "subito_saved_profiles_listbox"):
+            return []
+        selected_indexes = self.subito_saved_profiles_listbox.curselection()
+        names = list(self.subito_job_profiles.keys())
+        selected_names: list[str] = []
+        for index in selected_indexes:
+            if 0 <= index < len(names):
+                selected_names.append(names[index])
+        return selected_names
+
+    def _selected_nearby_city_values(self) -> list[str]:
+        if not hasattr(self, "subito_nearby_cities_listbox"):
+            return []
+        selected_indexes = self.subito_nearby_cities_listbox.curselection()
+        selected_values: list[str] = []
+        for index in selected_indexes:
+            if 0 <= index < len(SUBITO_NEARBY_CITY_OPTIONS):
+                selected_values.append(SUBITO_NEARBY_CITY_OPTIONS[index])
+        return selected_values
+
+    def _apply_nearby_city_selection(self) -> None:
+        selected_values = self._selected_nearby_city_values()
+        if selected_values:
+            self.subito_city_var.set(", ".join(selected_values))
+
+    def _clear_nearby_city_selection(self) -> None:
+        if hasattr(self, "subito_nearby_cities_listbox"):
+            self.subito_nearby_cities_listbox.selection_clear(0, "end")
+        self.subito_city_var.set("")
+
+    def _effective_subito_job_keywords(self) -> list[str]:
+        keywords: list[str] = []
+        keywords.extend(self._selected_subito_job_keywords())
+        keywords.extend(parse_job_keywords(self.subito_custom_job_keywords_var.get()))
+        for profile_name in self._selected_saved_profile_names():
+            keywords.extend(self.subito_job_profiles.get(profile_name, []))
+        return normalize_job_keywords(keywords)
+
+    def _refresh_subito_saved_profiles(self, preserve_selection: list[str] | None = None) -> None:
+        self.subito_job_profiles = load_job_profiles()
+        if not hasattr(self, "subito_saved_profiles_listbox"):
+            return
+
+        selected_names = preserve_selection if preserve_selection is not None else self._selected_saved_profile_names()
+        self.subito_saved_profiles_listbox.delete(0, "end")
+        for name in self.subito_job_profiles:
+            self.subito_saved_profiles_listbox.insert("end", name)
+        for index, name in enumerate(self.subito_job_profiles):
+            if name in selected_names:
+                self.subito_saved_profiles_listbox.selection_set(index)
+        self._update_subito_job_keywords_preview()
+
+    def _update_subito_job_keywords_preview(self) -> None:
+        keywords = self._effective_subito_job_keywords()
+        if keywords:
+            self.subito_profiles_info_var.set(f"Keyword attive: {', '.join(keywords)}")
+        else:
+            self.subito_profiles_info_var.set("Keyword attive: nessuna. Seleziona lavori, profili o keyword extra.")
+
+    def _save_subito_profile(self) -> None:
+        profile_name = self.subito_profile_name_var.get().strip()
+        if not profile_name:
+            messagebox.showerror("Profili lavoro", "Inserisci un nome profilo.")
+            return
+        if is_builtin_job_profile(profile_name):
+            messagebox.showerror("Profili lavoro", "Questo nome e gia usato da un profilo predefinito.")
+            return
+        keywords = self._effective_subito_job_keywords()
+        if not keywords:
+            messagebox.showerror("Profili lavoro", "Seleziona almeno una keyword prima di salvare il profilo.")
+            return
+        save_custom_job_profile(profile_name, keywords)
+        self._refresh_subito_saved_profiles(preserve_selection=[*self._selected_saved_profile_names(), profile_name])
+        self.subito_profile_name_var.set(profile_name)
+        messagebox.showinfo("Profili lavoro", f"Profilo '{profile_name}' salvato.")
+
+    def _delete_selected_subito_profiles(self) -> None:
+        selected_names = self._selected_saved_profile_names()
+        if not selected_names:
+            messagebox.showerror("Profili lavoro", "Seleziona almeno un profilo da eliminare.")
+            return
+
+        skipped_builtin: list[str] = []
+        deleted_any = False
+        for name in selected_names:
+            if is_builtin_job_profile(name):
+                skipped_builtin.append(name)
+                continue
+            deleted_any = delete_custom_job_profile(name) or deleted_any
+
+        self._refresh_subito_saved_profiles(preserve_selection=[])
+        if skipped_builtin and deleted_any:
+            messagebox.showinfo(
+                "Profili lavoro",
+                "Profili personalizzati eliminati. I profili predefiniti non possono essere cancellati: "
+                + ", ".join(skipped_builtin),
+            )
+        elif skipped_builtin:
+            messagebox.showinfo(
+                "Profili lavoro",
+                "I profili predefiniti non possono essere cancellati: " + ", ".join(skipped_builtin),
+            )
+        elif deleted_any:
+            messagebox.showinfo("Profili lavoro", "Profili personalizzati eliminati.")
+
+    def _clear_saved_profile_selection(self) -> None:
+        if hasattr(self, "subito_saved_profiles_listbox"):
+            self.subito_saved_profiles_listbox.selection_clear(0, "end")
+        self._update_subito_job_keywords_preview()
 
     def _write_contact_links_file(self, links: list[str]) -> Path:
         output_dir = Path(self.output_dir_var.get()).resolve()
@@ -928,6 +1703,7 @@ class ScraperApp:
                 completed_kind = self.process_kind
                 should_load_results = self.process_should_load_results
                 self.process = None
+                clear_runtime_control_requests()
                 self.process_kind = ""
                 self.process_should_load_results = False
                 self.status_var.set("Idle" if code == 0 else "Error")
@@ -935,6 +1711,8 @@ class ScraperApp:
                 self._update_result_actions()
                 if code == 0 and should_load_results:
                     self._load_results()
+                if completed_kind == "scrape" and self.auto_monitor_enabled:
+                    self._schedule_next_auto_run(code=code)
                 elif completed_kind == "contact":
                     if code == 0:
                         if self.ui_result_json_path.exists():
@@ -961,59 +1739,347 @@ class ScraperApp:
         except Exception as exc:
             self.result_meta_var.set(f"Errore caricamento risultati: {exc}")
             return
-        rows = sorted(annotate_rows_with_contact_history(payload.get("rows", [])), key=self._result_sort_key)
-        self.result_rows = rows
-        counts = dict((payload.get("meta", {}) or {}).get("geo_counts", {}))
+        generated_at = str(payload.get("generated_at", "") or "")
+        rows = annotate_rows_with_contact_history(payload.get("rows", []))
+        for index, row in enumerate(rows, start=1):
+            if generated_at and not str(row.get("extracted_at", "") or "").strip():
+                row["extracted_at"] = generated_at
+            if row.get("extracted_order") in ("", None):
+                row["extracted_order"] = index
+        source = str(payload.get("source", self.current_run_source) or "").strip().lower()
+        self.current_result_source = source
+        self._configure_results_columns(source)
+        self._configure_result_panels(source)
+        lead_sort_modes = {
+            "Score opportunita",
+            "Priorita lead",
+            "Nome attivita",
+            "Categoria Maps",
+            "Valutazione Maps",
+            "Numero recensioni",
+        }
+        current_sort = self.result_sort_var.get().strip()
+        if source == "google_maps" and current_sort not in lead_sort_modes:
+            current_sort = "Score opportunita"
+        elif source != "google_maps" and current_sort in lead_sort_modes:
+            current_sort = "Priorita consigliata"
+        self._updating_result_sort_var = True
+        self.result_sort_var.set(current_sort)
+        self._updating_result_sort_var = False
+        self.result_sort_reverse = RESULT_SORT_DEFAULT_DESC.get(current_sort, False)
+        self.result_sort_active_column = RESULT_SORT_MODE_DEFAULT_COLUMN.get(current_sort, "")
+        self._update_result_heading_labels()
+        self.current_results_generated_at = generated_at
+        self.result_rows = self._sorted_result_rows(rows)
+        self.result_row_lookup = {}
+        meta = payload.get("meta", {}) or {}
+        if source == "google_maps":
+            priority_counts = dict(meta.get("lead_priority_counts", {}))
+            if not priority_counts:
+                priority_counts = {"alta": 0, "media": 0, "bassa": 0}
+                for row in rows:
+                    priority = str(row.get("lead_priority", "") or "").strip().lower()
+                    if priority in priority_counts:
+                        priority_counts[priority] += 1
+            self.result_total_var.set(f"{len(rows)} lead")
+            self.result_counts_var.set(
+                f"alta {priority_counts.get('alta', 0)} | "
+                f"media {priority_counts.get('media', 0)} | "
+                f"bassa {priority_counts.get('bassa', 0)}"
+            )
+            meta_parts = [
+                f"Sorgente: Google Maps",
+                f"Ricerche: {meta.get('search_count', 1)}",
+                f"Siti analizzati: {meta.get('audited_website_count', 0)}",
+                f"Generato: {payload.get('generated_at', '-')}",
+            ]
+            total_errors = len(meta.get("search_errors", []) or []) + len(meta.get("detail_errors", []) or []) + len(meta.get("audit_errors", []) or [])
+            if total_errors:
+                meta_parts.append(f"Errori isolati: {total_errors}")
+            self.result_meta_var.set(" | ".join(meta_parts))
+            self._render_results_rows(self.result_rows)
+            self._update_result_actions()
+            self.bottom_notebook.select(self.results_tab)
+            return
+        counts = dict(meta.get("geo_counts", {}))
         contact_counts = summarize_contact_status(rows)
+        screening_counts = dict(meta.get("screening_counts", {}))
+        age_counts = dict(meta.get("age_filter_counts", {}))
         if not counts:
             counts = {"accepted": 0, "maybe": 0, "rejected": 0}
             for row in rows:
                 counts[str(row.get("geo_decision", "maybe"))] = counts.get(str(row.get("geo_decision", "maybe")), 0) + 1
+        if not screening_counts:
+            screening_counts = {"candida": 0, "valuta": 0, "no": 0}
+            for row in rows:
+                screening = str(row.get("screening_decision", "") or "").strip().lower()
+                if screening in screening_counts:
+                    screening_counts[screening] += 1
         self.result_total_var.set(f"{len(rows)} risultati")
-        self.result_counts_var.set(
-            f"accepted {counts.get('accepted', 0)} | maybe {counts.get('maybe', 0)} | rejected {counts.get('rejected', 0)} | nuovi {contact_counts.get('new', 0)} | inviati {contact_counts.get('submitted', 0)}"
-        )
-        meta = payload.get("meta", {}) or {}
-        self.result_meta_var.set(
-            f"Sorgente: {payload.get('source', self.current_run_source)} | Anchor: {meta.get('geo_anchor_place', '-')} | Generato: {payload.get('generated_at', '-')}"
-        )
-        for item in self.results_tree.get_children():
-            self.results_tree.delete(item)
-        for index, row in enumerate(rows):
-            decision = str(row.get("geo_decision", "") or "-")
-            distance = row.get("distance_km", "-")
-            if distance in ("", None):
-                distance_display = "-"
-            elif isinstance(distance, float):
-                distance_display = f"{distance:.1f}"
-            else:
-                distance_display = str(distance)
-            values = (
-                self._contact_status_label(row),
-                decision,
-                str(row.get("published_at", "") or "-"),
-                distance_display,
-                str(row.get("location", "") or ""),
-                str(row.get("title", row.get("name", "")) or ""),
-                str(row.get("company", "") or ""),
-                str(row.get("schedule", "") or ""),
+        counts_parts = []
+        if any(screening_counts.values()):
+            counts_parts.extend(
+                [
+                    f"candida {screening_counts.get('candida', 0)}",
+                    f"valuta {screening_counts.get('valuta', 0)}",
+                    f"no {screening_counts.get('no', 0)}",
+                ]
             )
-            tag = decision if decision in {"accepted", "maybe", "rejected"} else ""
-            self.results_tree.insert("", "end", iid=str(index), values=values, tags=(tag,))
-        if rows:
-            self.results_tree.selection_set("0")
-            self.results_tree.focus("0")
-            self.results_tree.see("0")
-            self._populate_detail_panel(rows[0])
-        else:
-            self._clear_detail_panel()
+        counts_parts.extend(
+            [
+                f"accepted {counts.get('accepted', 0)}",
+                f"maybe {counts.get('maybe', 0)}",
+                f"fresh {age_counts.get('fresh', 0)}" if any(age_counts.values()) else "",
+                f"nuovi {contact_counts.get('new', 0)}",
+                f"inviati {contact_counts.get('submitted', 0)}",
+            ]
+        )
+        self.result_counts_var.set(" | ".join(part for part in counts_parts if part))
+        meta_parts = [
+            f"Sorgente: {payload.get('source', self.current_run_source)}",
+            f"Anchor: {meta.get('geo_anchor_place', '-')}",
+            f"Generato: {payload.get('generated_at', '-')}",
+        ]
+        city_values = meta.get("cities", [])
+        if isinstance(city_values, list) and city_values:
+            meta_parts.append(f"Citta: {', '.join(str(value) for value in city_values)}")
+        exact_label = str(meta.get("age_filter_exact_label", "") or "").strip()
+        max_hours = int(meta.get("age_filter_max_hours", 0) or 0)
+        if max_hours > 0:
+            meta_parts.append(f"Ultime ore: {max_hours}h")
+        elif exact_label:
+            meta_parts.append(f"Giorno: {exact_label}")
+        elif meta.get("age_filter_enabled"):
+            meta_parts.append(f"Eta max: {meta.get('age_filter_max_days', '-') }g")
+        removed_count = int(meta.get("age_filter_removed_count", 0) or 0)
+        if removed_count > 0:
+            meta_parts.append(f"Scartati per data: {removed_count}")
+        if meta.get("screening_enabled"):
+            meta_parts.append(f"OpenAI: {meta.get('screening_model', '-')}")
+        self.result_meta_var.set(" | ".join(meta_parts))
+        self._render_results_rows(self.result_rows)
         self._update_result_actions()
         self.bottom_notebook.select(self.results_tab)
 
+    def _render_results_rows(self, rows: list[dict]) -> None:
+        for item in self.results_tree.get_children():
+            self.results_tree.delete(item)
+        self.result_row_lookup = {}
+        for index, row in enumerate(rows):
+            row_id = f"row-{index}"
+            self.result_row_lookup[row_id] = row
+            if str(row.get("source", "") or "").strip().lower() == "google_maps":
+                values = (
+                    str(row.get("lead_priority", "") or "-"),
+                    str(row.get("opportunity_score", "") or "-"),
+                    str(row.get("name", row.get("title", "")) or ""),
+                    str(row.get("category", row.get("sector", "")) or ""),
+                    str(row.get("city", row.get("location", "")) or ""),
+                    str(row.get("phone", "") or ""),
+                    str(row.get("email", "") or ""),
+                    str(row.get("website_status", "") or "-"),
+                    str(row.get("rating", "") or "-"),
+                    str(row.get("reviews_count", "") or "-"),
+                )
+                priority = str(row.get("lead_priority", "") or "").lower()
+                tag = priority if priority in LEAD_PRIORITY_ORDER else ""
+            else:
+                distance = row.get("distance_km", "-")
+                if distance in ("", None):
+                    distance_display = "-"
+                elif isinstance(distance, float):
+                    distance_display = f"{distance:.1f}"
+                else:
+                    distance_display = str(distance)
+                decision = str(row.get("geo_decision", "") or "-")
+                values = (
+                    self._screening_status_label(row),
+                    str(row.get("screening_score", "") or "-"),
+                    self._contact_status_label(row),
+                    decision,
+                    str(row.get("published_at", "") or "-"),
+                    self._extracted_display_value(row),
+                    distance_display,
+                    str(row.get("location", "") or ""),
+                    str(row.get("title", row.get("name", "")) or ""),
+                    str(row.get("company", "") or ""),
+                    str(row.get("schedule", "") or ""),
+                )
+                tag = decision if decision in {"accepted", "maybe", "rejected"} else ""
+            self.results_tree.insert("", "end", iid=row_id, values=values, tags=(tag,))
+        if rows:
+            first_row_id = "row-0"
+            self.results_tree.focus(first_row_id)
+            self.results_tree.see(first_row_id)
+            self._populate_detail_panel(rows[0])
+            self.results_tree.selection_remove(first_row_id)
+        else:
+            self._clear_detail_panel()
+
+    def _sorted_result_rows(self, rows: list[dict]) -> list[dict]:
+        return sorted(list(rows), key=self._result_sort_key, reverse=self.result_sort_reverse)
+
+    def _apply_result_sort(self) -> None:
+        if not getattr(self, "results_tree", None):
+            return
+        if not self.result_rows:
+            return
+        self.result_rows = self._sorted_result_rows(self.result_rows)
+        self._render_results_rows(self.result_rows)
+        self._update_result_actions()
+        self._update_result_heading_labels()
+
+    def _handle_result_sort_change(self) -> None:
+        if self._updating_result_sort_var:
+            return
+        sort_mode = self.result_sort_var.get().strip()
+        self.result_sort_reverse = RESULT_SORT_DEFAULT_DESC.get(sort_mode, False)
+        self.result_sort_active_column = RESULT_SORT_MODE_DEFAULT_COLUMN.get(sort_mode, "")
+        if not self.result_rows:
+            self._update_result_heading_labels()
+            return
+        self._apply_result_sort()
+
+    def _on_results_heading_click(self, column: str) -> None:
+        sort_mode = RESULT_SORT_COLUMN_MAP.get(column)
+        if not sort_mode:
+            return
+        if self.result_sort_var.get().strip() == sort_mode:
+            self.result_sort_reverse = not self.result_sort_reverse
+            self.result_sort_active_column = column
+            self._apply_result_sort()
+            return
+        self._updating_result_sort_var = True
+        self.result_sort_var.set(sort_mode)
+        self._updating_result_sort_var = False
+        self.result_sort_reverse = RESULT_SORT_DEFAULT_DESC.get(sort_mode, False)
+        self.result_sort_active_column = column
+        self._apply_result_sort()
+
+    def _update_result_heading_labels(self) -> None:
+        if not getattr(self, "results_tree", None):
+            return
+        active_column = self.result_sort_active_column or RESULT_SORT_MODE_DEFAULT_COLUMN.get(self.result_sort_var.get().strip(), "")
+        arrow = " ↓" if self.result_sort_reverse else " ↑"
+        for column, base_label in self.results_column_labels.items():
+            label = base_label
+            if column == active_column:
+                label = f"{base_label}{arrow}"
+            self.results_tree.heading(column, text=label, command=lambda current_key=column: self._on_results_heading_click(current_key))
+
     def _result_sort_key(self, row: dict) -> tuple:
-        published = self._parse_published_at(str(row.get("published_at", "") or ""))
+        sort_mode = self.result_sort_var.get().strip()
+        if sort_mode == "Score opportunita":
+            return (
+                self._safe_float(row.get("opportunity_score"), default=-1),
+                str(row.get("name", "") or "").lower(),
+            )
+        if sort_mode == "Priorita lead":
+            return (
+                LEAD_PRIORITY_ORDER.get(str(row.get("lead_priority", "") or "").lower(), 99),
+                -self._safe_float(row.get("opportunity_score"), default=-1),
+                str(row.get("name", "") or "").lower(),
+            )
+        if sort_mode == "Nome attivita":
+            return (str(row.get("name", "") or "").lower(),)
+        if sort_mode == "Categoria Maps":
+            return (
+                str(row.get("category", "") or "").lower(),
+                str(row.get("name", "") or "").lower(),
+            )
+        if sort_mode == "Valutazione Maps":
+            return (
+                self._safe_float(row.get("rating"), default=-1),
+                self._safe_int(row.get("reviews_count"), default=-1),
+            )
+        if sort_mode == "Numero recensioni":
+            return (
+                self._safe_int(row.get("reviews_count"), default=-1),
+                self._safe_float(row.get("rating"), default=-1),
+            )
+        contact_status = str(row.get("contact_status", "") or "new").strip().lower()
+        published = self._published_datetime_for_sort(row)
+        extracted = self._parse_iso_datetime(str(row.get("extracted_at", "") or self.current_results_generated_at or ""))
+        extracted_order = self._safe_int(row.get("extracted_order"), default=0)
+        distance = row.get("distance_km")
+        title = str(row.get("title", row.get("name", "")) or "").lower()
+        company = str(row.get("company", "") or "").lower()
+        location = str(row.get("location", "") or "").lower()
+        schedule = str(row.get("schedule", "") or "").lower()
+        contact_attempt = self._parse_iso_datetime(str(row.get("contact_last_attempt_at", "") or ""))
+        screening_score = self._screening_score_value(row)
+        if sort_mode == "Contatto":
+            contact_status = str(row.get("contact_status", "") or "new").strip().lower()
+            return (
+                CONTACT_STATUS_SORT_ORDER.get(contact_status, 99),
+                contact_attempt is None,
+                contact_attempt.timestamp() if contact_attempt else 0,
+                self._fallback_priority_sort_key(row),
+            )
+        if sort_mode == "Score candidatura":
+            return (
+                screening_score,
+                self._fallback_priority_sort_key(row),
+            )
+        if sort_mode == "Decisione geo":
+            return (
+                DECISION_ORDER.get(str(row.get("geo_decision", "maybe")), 99),
+                self._fallback_priority_sort_key(row),
+            )
+        if sort_mode == "Data annuncio":
+            published = self._published_datetime_for_sort(row)
+            return (
+                published is None,
+                published.timestamp() if published else 0,
+                self._fallback_priority_sort_key(row),
+            )
+        if sort_mode == "Data estrazione":
+            return (
+                extracted is None,
+                extracted.timestamp() if extracted else 0,
+                extracted_order,
+                self._fallback_priority_sort_key(row),
+            )
+        if sort_mode == "Distanza":
+            return (
+                distance is None,
+                distance if distance is not None else 9999,
+                self._fallback_priority_sort_key(row),
+            )
+        if sort_mode == "Luogo":
+            return (
+                location,
+                self._fallback_priority_sort_key(row),
+            )
+        if sort_mode == "Titolo":
+            return (
+                title,
+                self._fallback_priority_sort_key(row),
+            )
+        if sort_mode == "Azienda":
+            return (
+                company,
+                self._fallback_priority_sort_key(row),
+            )
+        if sort_mode == "Orario":
+            return (
+                schedule,
+                self._fallback_priority_sort_key(row),
+            )
+        return self._fallback_priority_sort_key(row)
+
+    def _fallback_priority_sort_key(self, row: dict) -> tuple:
+        if str(row.get("source", "") or "").strip().lower() == "google_maps":
+            return (
+                LEAD_PRIORITY_ORDER.get(str(row.get("lead_priority", "") or "").lower(), 99),
+                -self._safe_float(row.get("opportunity_score"), default=-1),
+                str(row.get("name", "") or "").lower(),
+            )
+        published = self._published_datetime_for_sort(row)
         distance = row.get("distance_km")
         return (
+            SCREENING_DECISION_ORDER.get(str(row.get("screening_decision", "") or "").strip().lower(), 1),
+            -self._screening_score_value(row),
             published is None,
             -(published.timestamp()) if published else 0,
             DECISION_ORDER.get(str(row.get("geo_decision", "maybe")), 99),
@@ -1022,23 +2088,53 @@ class ScraperApp:
             str(row.get("title", row.get("name", ""))).lower(),
         )
 
+    def _published_datetime_for_sort(self, row: dict) -> datetime | None:
+        published_value = str(
+            row.get("published_datetime_iso", "")
+            or row.get("published_date_iso", "")
+            or row.get("published_at", "")
+            or ""
+        )
+        return self._parse_published_at(published_value)
+
     def _parse_published_at(self, value: str) -> datetime | None:
-        raw = value.strip().lower()
+        raw = value.strip()
         if not raw:
             return None
-        today = date.today()
-        if raw.startswith("oggi"):
-            return datetime.combine(today, datetime.min.time())
-        if raw.startswith("ieri"):
-            return datetime.combine(today - timedelta(days=1), datetime.min.time())
-        raw = raw.split("alle", 1)[0].strip()
-        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%d/%m"):
-            try:
-                parsed = datetime.strptime(raw, fmt)
-                return parsed.replace(year=today.year) if fmt == "%d/%m" else parsed
-            except ValueError:
-                continue
-        return None
+        try:
+            if "T" in raw or (len(raw) == 10 and raw[4] == "-" and raw[7] == "-"):
+                return datetime.fromisoformat(raw)
+        except ValueError:
+            pass
+        return to_datetime_for_sorting(raw)
+
+    def _parse_iso_datetime(self, value: str) -> datetime | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _extracted_display_value(self, row: dict) -> str:
+        raw_value = str(row.get("extracted_at", "") or self.current_results_generated_at or "").strip()
+        parsed = self._parse_iso_datetime(raw_value)
+        if parsed is None:
+            return raw_value or "-"
+        return parsed.strftime("%Y-%m-%d %H:%M")
+
+    def _safe_int(self, value: object, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _safe_float(self, value: object, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
     def _handle_result_selection(self) -> None:
         row = self._get_selected_row()
@@ -1049,11 +2145,58 @@ class ScraperApp:
         self._update_result_actions()
 
     def _populate_detail_panel(self, row: dict) -> None:
+        source = str(row.get("source", "") or "").strip().lower()
+        self._configure_detail_labels(source)
+        if source == "google_maps":
+            self.detail_title_var.set(str(row.get("name", "") or "Attivita senza nome"))
+            self.detail_source_var.set("Google Maps")
+            priority = str(row.get("lead_priority", "") or "-")
+            score = str(row.get("opportunity_score", "") or "-")
+            self.detail_screening_var.set(f"{priority} ({score})")
+            self.detail_contact_var.set(str(row.get("lead_status", "") or "nuovo"))
+            self.detail_decision_var.set(str(row.get("website_status", "") or "-"))
+            self.detail_date_var.set(self._extracted_display_value(row))
+            rating = str(row.get("rating", "") or "-")
+            self.detail_distance_var.set(rating)
+            self.detail_location_var.set(str(row.get("address", row.get("location", "")) or "-"))
+            self.detail_company_var.set(str(row.get("website_emails", row.get("email", "")) or "-"))
+            self.detail_sector_var.set(str(row.get("category", "") or "-"))
+            self.detail_role_var.set(str(row.get("phone", "") or "-"))
+            self.detail_schedule_var.set(str(row.get("reviews_count", "") or "-"))
+            response_ms = row.get("website_response_ms", "")
+            self.detail_price_var.set(f"{response_ms} ms" if response_ms not in ("", None) else "-")
+            self.detail_link_var.set(str(row.get("link", "") or ""))
+            self.detail_website_var.set(str(row.get("website_final_url", "") or row.get("website", "") or ""))
+
+            detail_text_parts = []
+            lead_reason = str(row.get("lead_reason", "") or "").strip()
+            if lead_reason:
+                detail_text_parts.append(f"Motivo priorita: {lead_reason}")
+            for label, field in (
+                ("Titolo sito", "website_title"),
+                ("Descrizione sito", "website_meta_description"),
+                ("Tecnologia", "website_generator"),
+                ("Facebook", "social_facebook"),
+                ("Instagram", "social_instagram"),
+                ("LinkedIn", "social_linkedin"),
+                ("Errore sito", "website_error"),
+                ("Errore dettaglio Maps", "detail_error"),
+            ):
+                value = str(row.get(field, "") or "").strip()
+                if value:
+                    detail_text_parts.append(f"{label}: {value}")
+            raw_text = str(row.get("raw_text", "") or "").strip()
+            if raw_text:
+                detail_text_parts.extend(("", "Testo scheda Maps:", raw_text))
+            self._set_detail_raw_text("\n".join(detail_text_parts))
+            return
+
         self.detail_title_var.set(str(row.get("title", row.get("name", "")) or "Annuncio senza titolo"))
         self.detail_source_var.set(str(row.get("source", "") or "-"))
+        self.detail_screening_var.set(self._screening_detail_label(row))
         self.detail_contact_var.set(self._contact_status_label(row))
         self.detail_decision_var.set(str(row.get("geo_decision", "") or "-"))
-        self.detail_date_var.set(str(row.get("published_at", "") or "-"))
+        self.detail_date_var.set(self._date_detail_label(row))
 
         distance = row.get("distance_km")
         if distance in ("", None):
@@ -1070,16 +2213,37 @@ class ScraperApp:
         self.detail_schedule_var.set(str(row.get("schedule", "") or "-"))
         self.detail_price_var.set(str(row.get("price", "") or "-"))
         self.detail_link_var.set(str(row.get("link", "") or ""))
+        self.detail_website_var.set(str(row.get("website", "") or ""))
 
         detail_text_parts = []
+        screening_reason = str(row.get("screening_reason", "") or "").strip()
+        if screening_reason:
+            detail_text_parts.append(f"Smistamento candidatura: {screening_reason}")
         reason = str(row.get("geo_decision_reason", "") or "").strip()
         if reason:
+            if detail_text_parts:
+                detail_text_parts.append("")
             detail_text_parts.append(f"Filtro geografico: {reason}")
+        age_reason = str(row.get("age_filter_reason", "") or "").strip()
+        if age_reason:
+            if detail_text_parts:
+                detail_text_parts.append("")
+            detail_text_parts.append(f"Filtro data: {age_reason}")
         contact_line = self._contact_detail_line(row)
         if contact_line:
             if detail_text_parts:
                 detail_text_parts.append("")
             detail_text_parts.append(contact_line)
+        llm_reason = str(row.get("llm_reason", "") or "").strip()
+        if llm_reason and llm_reason != screening_reason:
+            if detail_text_parts:
+                detail_text_parts.append("")
+            detail_text_parts.append(f"Motivo OpenAI: {llm_reason}")
+        llm_red_flags = str(row.get("llm_red_flags", "") or "").strip()
+        if llm_red_flags:
+            if detail_text_parts:
+                detail_text_parts.append("")
+            detail_text_parts.append(f"Red flag: {llm_red_flags}")
         description = str(row.get("description", "") or "").strip()
         if description:
             if detail_text_parts:
@@ -1099,19 +2263,37 @@ class ScraperApp:
         rows = self._get_selected_rows()
         return rows[0] if rows else None
 
+    def _date_detail_label(self, row: dict) -> str:
+        published_at = str(row.get("published_at", "") or "").strip()
+        age_days = row.get("age_days")
+        age_hours = row.get("age_hours")
+        if published_at and age_hours not in ("", None):
+            try:
+                return f"{published_at} ({float(age_hours):.1f}h fa)"
+            except (TypeError, ValueError):
+                return published_at
+        if published_at and age_days not in ("", None):
+            return f"{published_at} ({describe_age_days(int(age_days))})"
+        if published_at:
+            return published_at
+        if age_days not in ("", None):
+            return describe_age_days(int(age_days))
+        return "-"
+
     def _get_selected_rows(self) -> list[dict]:
         selected = self.results_tree.selection()
         rows: list[dict] = []
-        seen_indexes: set[int] = set()
+        seen_keys: set[str] = set()
         for item in selected:
-            index = int(item)
-            if index in seen_indexes:
+            row = self.result_row_lookup.get(str(item))
+            if not row:
                 continue
-            seen_indexes.add(index)
-            if 0 <= index < len(self.result_rows):
-                row = self.result_rows[index]
-                if str(row.get("source", "") or "").strip().lower() == "subito" and str(row.get("link", "") or "").strip():
-                    rows.append(row)
+            link = str(row.get("link", "") or "").strip()
+            key = link or str(row.get("website", "") or "").strip() or str(item)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            rows.append(row)
         return rows
 
     def _get_accepted_subito_rows(self) -> list[dict]:
@@ -1120,7 +2302,11 @@ class ScraperApp:
         for row in self.result_rows:
             if str(row.get("source", "") or "").strip().lower() != "subito":
                 continue
-            if str(row.get("geo_decision", "") or "").strip().lower() != "accepted":
+            screening_decision = str(row.get("screening_decision", "") or "").strip().lower()
+            if screening_decision:
+                if screening_decision != "candida":
+                    continue
+            elif str(row.get("geo_decision", "") or "").strip().lower() != "accepted":
                 continue
             if self._row_has_submitted_contact(row):
                 continue
@@ -1138,6 +2324,14 @@ class ScraperApp:
         link = str(row.get("link", "") or "").strip()
         if link:
             os.startfile(link)
+
+    def _open_selected_website(self) -> None:
+        row = self._get_selected_row()
+        if row is None:
+            return
+        website = str(row.get("website_final_url", "") or row.get("website", "") or "").strip()
+        if website:
+            os.startfile(website)
 
 
 def launch_gui(script_path: Path) -> None:

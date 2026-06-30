@@ -94,7 +94,13 @@ def current_page_url(driver: Driver) -> str:
         return ""
 
 
-def navigate_with_retries(driver: Driver, url: str, wait: int = Wait.LONG, use_google_get: bool = False) -> bool:
+def navigate_with_retries(
+    driver: Driver,
+    url: str,
+    wait: int = Wait.LONG,
+    use_google_get: bool = False,
+    timeout_seconds: float = 60,
+) -> bool:
     target = str(url or "").strip()
     if not target:
         return False
@@ -102,11 +108,15 @@ def navigate_with_retries(driver: Driver, url: str, wait: int = Wait.LONG, use_g
     for _ in range(3):
         try:
             if use_google_get:
-                driver.google_get(target, wait=wait)
+                driver.google_get(target, wait=wait, timeout=timeout_seconds)
             else:
-                driver.get(target)
+                try:
+                    driver.get(target, wait=wait, timeout=timeout_seconds)
+                except TypeError:
+                    driver.get(target)
         except Exception:
             pass
+        driver.sleep(1)
 
         if _url_matches_target(current_page_url(driver), target):
             return True

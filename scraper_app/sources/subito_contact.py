@@ -6,6 +6,7 @@ from botasaurus.browser import Driver, Wait, browser
 from ..browser_helpers import click_first_matching_text, current_page_url, navigate_with_retries
 from ..contact_history import record_contact_result, record_contact_results
 from ..browser_runtime import normalize_browser_mode, resolve_browser_arguments, resolve_browser_profile
+from ..runtime_controls import consume_skip_current_item_request, consume_stop_after_current_item_request
 
 
 SUBITO_COOKIE_REJECT_TEXTS = (
@@ -24,6 +25,7 @@ SUBITO_ATTACHMENT_BUTTON_TEXTS = (
     "Aggiungi un allegato",
     "Allega file",
     "Carica allegato",
+    "Allega",
 )
 
 SUBITO_SEND_BUTTON_TEXTS = (
@@ -127,10 +129,10 @@ def _normalize_subito_profile_directory(browser_mode: str, browser_profile_direc
 
 @browser(profile=resolve_browser_profile, add_arguments=resolve_browser_arguments)
 def _run_subito_contact_task(driver: Driver, config: dict) -> dict:
-    link = config["link"]
     keep_open_seconds = max(int(config.get("keep_open_seconds", 120)), 0)
-    result = _contact_single_listing(driver, config)
-    record_contact_result(result, source="subito")
+    result = _safe_contact_single_listing(driver, config)
+    if not result.get("skipped", False):
+        record_contact_result(result, source="subito")
 
     if keep_open_seconds > 0:
         driver.sleep(keep_open_seconds)
@@ -148,25 +150,39 @@ def _run_subito_bulk_contact_task(driver: Driver, config: dict) -> dict:
     keep_open_seconds = max(int(config.get("keep_open_seconds", 120)), 0)
 
     results = []
+    stopped_by_user = False
     for index, link in enumerate(links):
-        result = _contact_single_listing(driver, {**config, "link": link})
+        if consume_stop_after_current_item_request():
+            stopped_by_user = True
+            break
+        if consume_skip_current_item_request():
+            results.append(_build_skipped_result(config={**config, "link": link}, reason="Annuncio saltato su richiesta dell utente."))
+            continue
+        result = _safe_contact_single_listing(driver, {**config, "link": link})
         results.append(result)
+        if result.get("stop_after_current"):
+            stopped_by_user = True
+            break
         if index < len(links) - 1 and delay_between_seconds > 0:
             driver.sleep(delay_between_seconds)
 
-    record_contact_results(results, source="subito")
+    record_contact_results([item for item in results if not item.get("skipped", False)], source="subito")
 
     if keep_open_seconds > 0:
         driver.sleep(keep_open_seconds)
 
     prepared_count = sum(1 for item in results if item.get("prepared"))
     sent_count = sum(1 for item in results if item.get("submitted"))
+    failed_count = sum(1 for item in results if not item.get("ok"))
+    skipped_count = sum(1 for item in results if item.get("skipped"))
     return {
         "ok": sent_count > 0 if bool(config.get("submit", False)) else prepared_count > 0,
         "links_count": len(links),
         "prepared_count": prepared_count,
         "sent_count": sent_count,
-        "failed_count": len(links) - prepared_count,
+        "failed_count": failed_count,
+        "skipped_count": skipped_count,
+        "stopped_by_user": stopped_by_user,
         "attachment_path": str(config.get("attachment", "") or ""),
         "message": str(config.get("message", "") or ""),
         "submit": bool(config.get("submit", False)),
@@ -174,6 +190,19 @@ def _run_subito_bulk_contact_task(driver: Driver, config: dict) -> dict:
         "keep_open_seconds": keep_open_seconds,
         "results": results,
     }
+
+
+def _safe_contact_single_listing(driver: Driver, config: dict) -> dict:
+    try:
+        return _contact_single_listing(driver, config)
+    except SkipCurrentListing:
+        return _build_skipped_result(config=config, reason="Annuncio saltato su richiesta dell utente.")
+    except Exception as exc:
+        return _build_contact_error_result(
+            driver,
+            config,
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
 
 def _contact_single_listing(driver: Driver, config: dict) -> dict:
@@ -186,12 +215,15 @@ def _contact_single_listing(driver: Driver, config: dict) -> dict:
     action_delay_seconds = _normalized_delay_seconds(config.get("action_delay_seconds", 1.5), default=1.5 if slow_mode else 0.0)
     page_settle_seconds = _normalized_delay_seconds(config.get("page_settle_seconds", 3.0), default=3.0 if slow_mode else 0.0)
 
+    _raise_if_skip_requested(config)
     navigated = navigate_with_retries(driver, link, wait=Wait.LONG)
     _sleep_if_needed(driver, page_settle_seconds)
+    _raise_if_skip_requested(config)
     cookie_banner_action = click_first_matching_text(driver, SUBITO_COOKIE_REJECT_TEXTS)
     _sleep_if_needed(driver, action_delay_seconds)
     driver.select("body", wait=Wait.VERY_LONG)
     _sleep_if_needed(driver, action_delay_seconds)
+    _raise_if_skip_requested(config)
 
     contact_button_action = click_first_matching_text(driver, SUBITO_CONTACT_BUTTON_TEXTS)
     if not contact_button_action:
@@ -258,28 +290,37 @@ def _contact_single_listing(driver: Driver, config: dict) -> dict:
         }
 
     message_filled = _fill_message_field(driver, message) if message else False
+    _raise_if_skip_requested(config)
     attachment_button_action = ""
     attachment_uploaded = False
 
     if attachment:
         attachment_button_action = click_first_matching_text(driver, SUBITO_ATTACHMENT_BUTTON_TEXTS) or ""
         driver.sleep(max(1.0, action_delay_seconds))
-        driver.run_js(
-            """
-const input = [...document.querySelectorAll("input[type='file']")].find((element) => !element.disabled);
-if (!input) {
-  return false;
-}
-input.style.display = "block";
-input.style.visibility = "visible";
-input.style.opacity = "1";
-return true;
-            """,
-        )
-        driver.select("input[type='file']", wait=Wait.LONG)
-        driver.upload_file("input[type='file']", attachment, wait=Wait.LONG)
+        upload_selector = _prepare_attachment_input(driver)
+        if not upload_selector:
+            return {
+                "ok": False,
+                "prepared": False,
+                "submitted": False,
+                "link": link,
+                "navigated": navigated,
+                "current_url": current_page_url(driver),
+                "cookie_banner_action": cookie_banner_action,
+                "contact_button_action": contact_button_action,
+                "attachment_button_action": attachment_button_action,
+                "attachment_uploaded": False,
+                "message_filled": message_filled,
+                "login_required": False,
+                "login_wait_seconds": login_wait_seconds,
+                "send_button_action": "",
+                "attachment_path": attachment,
+                "error": "Attachment input non trovato su questa pagina.",
+            }
+        driver.upload_file(upload_selector, attachment, wait=Wait.LONG)
         attachment_uploaded = True
         driver.sleep(max(1.5, action_delay_seconds))
+        _raise_if_skip_requested(config)
 
     send_button_action = ""
     submitted = False
@@ -307,6 +348,122 @@ return true;
         "send_button_action": send_button_action,
         "attachment_path": attachment,
     }
+
+
+def _build_contact_error_result(driver: Driver, config: dict, *, error: str) -> dict:
+    attachment = str(config.get("attachment", "") or "").strip()
+    login_wait_seconds = max(int(config.get("login_wait_seconds", 240)), 0)
+    current_url = ""
+    try:
+        current_url = current_page_url(driver)
+    except Exception:
+        current_url = ""
+
+    return {
+        "ok": False,
+        "prepared": False,
+        "submitted": False,
+        "link": str(config.get("link", "") or "").strip(),
+        "navigated": False,
+        "current_url": current_url,
+        "cookie_banner_action": "",
+        "contact_button_action": "",
+        "attachment_button_action": "",
+        "attachment_uploaded": False,
+        "message_filled": False,
+        "login_required": False,
+        "login_wait_seconds": login_wait_seconds,
+        "send_button_action": "",
+        "attachment_path": attachment,
+        "error": error,
+    }
+
+
+def _build_skipped_result(config: dict, *, reason: str) -> dict:
+    attachment = str(config.get("attachment", "") or "").strip()
+    login_wait_seconds = max(int(config.get("login_wait_seconds", 240)), 0)
+    return {
+        "ok": False,
+        "prepared": False,
+        "submitted": False,
+        "skipped": True,
+        "link": str(config.get("link", "") or "").strip(),
+        "navigated": False,
+        "current_url": "",
+        "cookie_banner_action": "",
+        "contact_button_action": "",
+        "attachment_button_action": "",
+        "attachment_uploaded": False,
+        "message_filled": False,
+        "login_required": False,
+        "login_wait_seconds": login_wait_seconds,
+        "send_button_action": "",
+        "attachment_path": attachment,
+        "error": reason,
+    }
+
+
+def _raise_if_skip_requested(config: dict) -> None:
+    if consume_skip_current_item_request():
+        raise SkipCurrentListing(str(config.get("link", "") or "").strip())
+
+
+class SkipCurrentListing(Exception):
+    pass
+
+
+def _prepare_attachment_input(driver: Driver) -> str:
+    selector = str(
+        driver.run_js(
+            """
+const ensureSelector = (input) => {
+  if (!input.id) {
+    input.id = "__codex_attachment_input";
+  }
+  input.style.display = "block";
+  input.style.visibility = "visible";
+  input.style.opacity = "1";
+  input.style.position = "fixed";
+  input.style.left = "0";
+  input.style.top = "0";
+  input.style.zIndex = "2147483647";
+  return `#${input.id}`;
+};
+
+const collectInputs = (root) => {
+  const inputs = [...root.querySelectorAll("input")];
+  for (const element of [...root.querySelectorAll("*")]) {
+    if (element.shadowRoot) {
+      inputs.push(...collectInputs(element.shadowRoot));
+    }
+  }
+  return inputs;
+};
+
+const candidates = collectInputs(document).filter((element) => {
+  if (!element || element.disabled) {
+    return false;
+  }
+  const type = (element.getAttribute("type") || element.type || "").toLowerCase();
+  return type === "file";
+});
+
+if (!candidates.length) {
+  return "";
+}
+
+return ensureSelector(candidates[0]);
+            """,
+        )
+        or ""
+    ).strip()
+    if not selector:
+        return ""
+    try:
+        driver.select(selector, wait=Wait.LONG)
+    except Exception:
+        return ""
+    return selector
 
 
 def _fill_message_field(driver: Driver, message: str) -> bool:

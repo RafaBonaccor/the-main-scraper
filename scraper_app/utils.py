@@ -119,7 +119,7 @@ def build_subito_search_url(
 
     region_slug = slugify_path_segment(region) or "italia"
     category_slug = slugify_path_segment(category) or "offerte-lavoro"
-    city_slug = slugify_path_segment(city)
+    city_slug = _build_subito_city_path(city, region_slug)
 
     base_url = f"https://www.subito.it/annunci-{region_slug}/vendita/{category_slug}/"
     if city_slug:
@@ -141,3 +141,22 @@ def as_uri_if_path(value: str) -> str:
     if candidate.exists():
         return candidate.resolve().as_uri()
     return value
+
+
+def _build_subito_city_path(raw_city: str, region_slug: str) -> str:
+    city_value = str(raw_city or "").strip()
+    if not city_value:
+        return ""
+
+    if "/" in city_value:
+        parts = [slugify_path_segment(part) for part in city_value.split("/") if slugify_path_segment(part)]
+        return "/".join(parts)
+
+    city_slug = slugify_path_segment(city_value)
+    if not city_slug:
+        return ""
+
+    if region_slug == "lazio" and city_slug != "roma":
+        return f"roma/{city_slug}"
+
+    return city_slug

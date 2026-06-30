@@ -4,7 +4,9 @@ from botasaurus.browser import Driver, Wait, browser
 
 from ..browser_runtime import normalize_browser_mode, resolve_browser_arguments, resolve_browser_profile
 from ..browser_helpers import click_first_matching_text, navigate_with_retries
+from ..date_filter import listing_has_time, parse_listing_date
 from ..models import ScrapeOutcome
+from ..runtime_controls import consume_skip_current_item_request, consume_stop_after_current_item_request
 from ..utils import (
     build_subito_search_url,
     extract_first_price,
@@ -298,9 +300,23 @@ def _extract_location(selected_location: str, lines: list[str], title: str, pric
 def _extract_published_at(lines: list[str]) -> str:
     for line in lines:
         cleaned = strip_leading_counter(normalize_whitespace(line))
-        if SUBITO_DATE_PATTERN.match(cleaned):
+        if _looks_like_published_at(cleaned):
             return cleaned
     return ""
+
+
+def _looks_like_published_at(value: str) -> bool:
+    cleaned = strip_leading_counter(normalize_whitespace(value))
+    lowered = cleaned.lower()
+    if not cleaned:
+        return False
+    if SUBITO_DATE_PATTERN.match(cleaned):
+        return True
+    if parse_listing_date(cleaned) is not None:
+        return True
+    if listing_has_time(cleaned) and any(token in lowered for token in ("oggi", "ieri", "fa")):
+        return True
+    return False
 
 
 def _extract_job_details(lines: list[str], title: str, location: str, price: str) -> dict[str, str]:
@@ -370,20 +386,28 @@ def _enrich_rows_with_detail_pages(
     detail_pages_visited = 0
 
     for row in rows:
+        if consume_stop_after_current_item_request():
+            break
         link = str(row.get("link", "") or "").strip()
         if not link:
+            continue
+        if consume_skip_current_item_request():
             continue
 
         detail_pages_visited += 1
         try:
             navigate_with_retries(driver, link, wait=Wait.LONG)
             _sleep_if_needed(driver, page_settle_seconds)
+            if consume_skip_current_item_request():
+                continue
             click_first_matching_text(driver, SUBITO_COOKIE_REJECT_TEXTS)
             _sleep_if_needed(driver, action_delay_seconds)
             driver.select("body", wait=Wait.LONG)
             _sleep_if_needed(driver, action_delay_seconds)
+            if consume_skip_current_item_request():
+                continue
             detail_payload = driver.run_js(
-                """
+                r"""
 const cleanText = (value) => (value || "").replace(/\\u00a0/g, " ").replace(/\\r/g, "").trim();
 const textOf = (element) => cleanText(element?.innerText || element?.textContent || "");
 const longestText = (values) => {
@@ -392,6 +416,20 @@ const longestText = (values) => {
     .filter((value) => value && !/^descrizione$/i.test(value) && value.length > 40);
   candidates.sort((a, b) => b.length - a.length);
   return candidates[0] || "";
+};
+const dateRegex = /(?:oggi|ieri|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|\d{1,2}\s+(?:gen(?:naio)?|feb(?:braio)?|mar(?:zo)?|apr(?:ile)?|mag(?:gio)?|giu(?:gno)?|lug(?:lio)?|ago(?:sto)?|set(?:t(?:embre)?)?|ott(?:obre)?|nov(?:embre)?|dic(?:embre)?))(?:\s+alle\s+\d{1,2}:\d{2})?|\b\d{1,2}:\d{2}\b|\b(?:\d+\s*ore?\s*fa|un[' ]?ora\s*fa|\d+\s*min(?:uti)?\s*fa|un\s*minuto\s*fa|pochi\s*minuti\s*fa)\b/i;
+const uniqueTexts = (values) => {
+  const results = [];
+  const seen = new Set();
+  for (const value of values) {
+    const cleaned = cleanText(value);
+    if (!cleaned || seen.has(cleaned)) {
+      continue;
+    }
+    seen.add(cleaned);
+    results.push(cleaned);
+  }
+  return results;
 };
 
 let description = longestText(
@@ -425,9 +463,24 @@ if (!description && heading) {
   description = cleanText(siblingTexts.join("\\n"));
 }
 
+const dateCandidates = uniqueTexts(
+  [...document.querySelectorAll("time, [datetime], [data-testid*='date'], [class*='date'], [class*='time'], [aria-label*='Pubblic'], [class*='insertion-date']")]
+    .map((element) => textOf(element))
+).filter((value) => value.length <= 120);
+
+let publishedAt = dateCandidates.find((value) => dateRegex.test(value)) || "";
+
+if (!publishedAt) {
+  const bodyTexts = uniqueTexts(
+    [...document.querySelectorAll("body *")]
+      .map((element) => textOf(element))
+  ).filter((value) => value.length > 0 && value.length <= 120);
+  publishedAt = bodyTexts.find((value) => dateRegex.test(value)) || "";
+}
+
 return {
   description,
-  published_at: textOf(document.querySelector("[class*='insertion-date']")),
+  published_at: publishedAt,
 };
                 """,
             ) or {}
