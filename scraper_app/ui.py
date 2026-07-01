@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
+from urllib.parse import quote_plus
 
 from .browser_runtime import (
     browser_mode_requires_custom_dir,
@@ -31,7 +32,8 @@ from .runtime_controls import (
     request_skip_current_item,
     request_stop_after_current_item,
 )
-from .utils import build_subito_search_url
+from .utils import build_google_maps_search_url, build_subito_search_url
+from .vinted_database import load_vinted_rows
 
 
 APP_BG = "#f3efe6"
@@ -67,6 +69,8 @@ SCREENING_DECISION_ORDER = {
 }
 LEAD_PRIORITY_ORDER = {"alta": 0, "media": 1, "bassa": 2}
 RESULT_SORT_OPTIONS = (
+    "Prezzo Vinted",
+    "Ricerca Vinted",
     "Score opportunita",
     "Priorita lead",
     "Nome attivita",
@@ -86,6 +90,8 @@ RESULT_SORT_OPTIONS = (
     "Orario",
 )
 RESULT_SORT_COLUMN_MAP = {
+    "price_value": "Prezzo Vinted",
+    "search_term": "Ricerca Vinted",
     "opportunity_score": "Score opportunita",
     "lead_priority": "Priorita lead",
     "name": "Nome attivita",
@@ -105,6 +111,8 @@ RESULT_SORT_COLUMN_MAP = {
     "schedule": "Orario",
 }
 RESULT_SORT_DEFAULT_DESC = {
+    "Prezzo Vinted": False,
+    "Ricerca Vinted": False,
     "Score opportunita": True,
     "Priorita lead": False,
     "Nome attivita": False,
@@ -124,6 +132,8 @@ RESULT_SORT_DEFAULT_DESC = {
     "Orario": False,
 }
 RESULT_SORT_MODE_DEFAULT_COLUMN = {
+    "Prezzo Vinted": "price_value",
+    "Ricerca Vinted": "search_term",
     "Score opportunita": "opportunity_score",
     "Priorita lead": "lead_priority",
     "Nome attivita": "name",
@@ -242,6 +252,17 @@ class ScraperApp:
         self.google_audit_websites_var = tk.BooleanVar(value=True)
         self.google_website_timeout_var = tk.StringVar(value="10")
 
+        self.vinted_search_var = tk.StringVar(value="macbook")
+        self.vinted_max_results_var = tk.StringVar(value="100")
+        self.vinted_db_path_var = tk.StringVar(value=str((script_path.parent / "data" / "scraper.db").resolve()))
+        self.vinted_db_filter_var = tk.StringVar()
+        self.vinted_db_limit_var = tk.StringVar(value="500")
+        self.vinted_only_ricercato_var = tk.BooleanVar(value=True)
+        self.vinted_keep_browser_open_var = tk.BooleanVar(value=True)
+        self.vinted_keep_open_seconds_var = tk.StringVar(value="0")
+        self.vinted_search_preview_var = tk.StringVar()
+        self.vinted_status_var = tk.StringVar(value="Pronto per una nuova ricerca Vinted.")
+
         self.subito_query_var = tk.StringVar()
         self.subito_region_var = tk.StringVar(value="lazio")
         self.subito_city_var = tk.StringVar(value="roma")
@@ -333,6 +354,8 @@ class ScraperApp:
         self.browser_mode_var.trace_add("write", lambda *_: self._update_result_actions())
         self.subito_custom_job_keywords_var.trace_add("write", lambda *_: self._update_subito_job_keywords_preview())
         self.result_sort_var.trace_add("write", lambda *_: self._handle_result_sort_change())
+        self.vinted_search_var.trace_add("write", lambda *_: self._update_vinted_search_preview())
+        self._update_vinted_search_preview()
         self.root.after(150, self._drain_logs)
 
     def _configure_styles(self) -> None:
@@ -368,7 +391,7 @@ class ScraperApp:
         left = ttk.Frame(header, style="App.TFrame")
         left.pack(side="left", fill="x", expand=True)
         ttk.Label(left, text="The Main Scraper", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(left, text="Google Maps lead generation e ricerca lavoro su Subito.it.", style="Subtitle.TLabel").pack(anchor="w", pady=(4, 0))
+        ttk.Label(left, text="Google Maps, Vinted e ricerca lavoro su Subito.it.", style="Subtitle.TLabel").pack(anchor="w", pady=(4, 0))
         ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").pack(side="right", anchor="ne")
 
         config_shell = ttk.Frame(container, style="Panel.TFrame", height=390)
@@ -387,12 +410,15 @@ class ScraperApp:
         self.notebook = ttk.Notebook(config_content)
         self.notebook.pack(fill="x")
         self.google_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
+        self.vinted_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
         self.subito_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
         self.custom_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
         self.notebook.add(self.google_tab, text="Google Maps")
+        self.notebook.add(self.vinted_tab, text="Vinted")
         self.notebook.add(self.subito_tab, text="Subito Jobs")
         self.notebook.add(self.custom_tab, text="Custom Site")
         self._build_google_tab()
+        self._build_vinted_tab()
         self._build_subito_tab()
         self._build_custom_tab()
 
@@ -442,6 +468,151 @@ class ScraperApp:
             text="Separa categorie e citta con virgole. Esempio: ristoranti, dentisti / Roma, Monterotondo.",
             style="Hint.TLabel",
         ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+    def _build_vinted_tab(self) -> None:
+        card = self._card(self.vinted_tab, "Ricerca prodotti Vinted")
+        card.pack(fill="x")
+        self._row(card, 0, "Ricerca o URL Vinted", self.vinted_search_var)
+        self._row(card, 1, "Max risultati (0 = tutti)", self.vinted_max_results_var, 12)
+
+        ttk.Label(card, text="URL che verra aperto", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=(2, 8))
+        ttk.Label(
+            card,
+            textvariable=self.vinted_search_preview_var,
+            style="Hint.TLabel",
+            wraplength=720,
+            justify="left",
+        ).grid(row=2, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(2, 8))
+
+        search_actions = ttk.Frame(card, style="Panel.TFrame")
+        search_actions.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 12))
+        self.vinted_run_button = ttk.Button(
+            search_actions,
+            text="Avvia ricerca Vinted",
+            style="Run.TButton",
+            command=self._start_vinted_search,
+        )
+        self.vinted_run_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            search_actions,
+            text="Apri ricerca nel browser",
+            style="Secondary.TButton",
+            command=self._start_vinted_browser,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        keep_open_controls = ttk.Frame(search_actions, style="Panel.TFrame")
+        keep_open_controls.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            keep_open_controls,
+            text="Tieni browser aperto dopo la ricerca",
+            variable=self.vinted_keep_browser_open_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Entry(keep_open_controls, textvariable=self.vinted_keep_open_seconds_var, width=8).grid(row=0, column=1, sticky="w", padx=(10, 4))
+        ttk.Label(keep_open_controls, text="secondi (0 = non chiudere)", style="Muted.TLabel").grid(row=0, column=2, sticky="w")
+        search_actions.columnconfigure(0, weight=2)
+        search_actions.columnconfigure(1, weight=1)
+
+        ttk.Separator(card, orient="horizontal").grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        ttk.Label(card, text="Archivio database", style="Metric.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._row(card, 6, "Database SQLite", self.vinted_db_path_var)
+        ttk.Button(
+            card,
+            text="Scegli DB",
+            style="Secondary.TButton",
+            command=self._choose_vinted_db_path,
+        ).grid(row=6, column=2, sticky="e", padx=(8, 0), pady=(0, 10))
+        self._row(card, 7, "Filtro ricerca nel DB", self.vinted_db_filter_var, 30)
+        ttk.Checkbutton(
+            card,
+            text='Solo tag "ricercato"',
+            variable=self.vinted_only_ricercato_var,
+        ).grid(row=8, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(0, 8))
+        self._row(card, 9, "Limite righe DB (0 = tutte)", self.vinted_db_limit_var, 12)
+
+        db_actions = ttk.Frame(card, style="Panel.TFrame")
+        db_actions.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(2, 8))
+        ttk.Button(
+            db_actions,
+            text="Mostra database nei risultati",
+            style="Accent.TButton",
+            command=self._load_vinted_database_results,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 8))
+        ttk.Button(
+            db_actions,
+            text="Apri cartella database",
+            style="Secondary.TButton",
+            command=self._open_vinted_db_folder,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=(0, 8))
+        ttk.Button(
+            db_actions,
+            text="Ripristina campi",
+            style="Secondary.TButton",
+            command=self._reset_vinted_form,
+        ).grid(row=1, column=0, columnspan=2, sticky="ew")
+        db_actions.columnconfigure(0, weight=1)
+        db_actions.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            card,
+            textvariable=self.vinted_status_var,
+            style="Metric.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(4, 8))
+        ttk.Label(
+            card,
+            text="I risultati vengono mostrati automaticamente nella tab Risultati, esportati con le impostazioni globali e salvati nel database senza duplicare gli articoli.",
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=12, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        ttk.Separator(card, orient="horizontal").grid(row=13, column=0, columnspan=3, sticky="ew", pady=(14, 10))
+        ttk.Label(card, text="Browser e export Vinted", style="Metric.TLabel").grid(row=14, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Label(card, text="Sessione browser").grid(row=15, column=0, sticky="w", pady=(0, 8))
+        ttk.Combobox(
+            card,
+            textvariable=self.browser_mode_var,
+            values=("sessione_persistente", "chrome_normale", "profilo_personalizzato", "isolated"),
+            state="readonly",
+            width=24,
+        ).grid(row=15, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
+        ttk.Checkbutton(card, text="Connessione lenta", variable=self.slow_mode_var).grid(row=15, column=2, sticky="w", pady=(0, 8))
+
+        ttk.Label(card, text="Chrome User Data").grid(row=16, column=0, sticky="w", pady=(0, 8))
+        self.vinted_browser_user_data_entry = ttk.Entry(card, textvariable=self.browser_user_data_dir_var, width=54)
+        self.vinted_browser_user_data_entry.grid(row=16, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
+        self.vinted_browser_browse_button = ttk.Button(card, text="Sfoglia", style="Secondary.TButton", command=self._choose_browser_user_data_dir)
+        self.vinted_browser_browse_button.grid(row=16, column=2, sticky="e", pady=(0, 8))
+
+        ttk.Label(card, text="Profile Directory").grid(row=17, column=0, sticky="w", pady=(0, 8))
+        self.vinted_browser_profile_dir_entry = ttk.Entry(card, textvariable=self.browser_profile_directory_var, width=18)
+        self.vinted_browser_profile_dir_entry.grid(row=17, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
+        timing_frame = ttk.Frame(card, style="Panel.TFrame")
+        timing_frame.grid(row=17, column=2, sticky="ew", pady=(0, 8))
+        ttk.Label(timing_frame, text="Pausa").grid(row=0, column=0, sticky="w")
+        ttk.Entry(timing_frame, textvariable=self.action_delay_seconds_var, width=6).grid(row=0, column=1, sticky="w", padx=(4, 8))
+        ttk.Label(timing_frame, text="Attesa").grid(row=0, column=2, sticky="w")
+        ttk.Entry(timing_frame, textvariable=self.page_settle_seconds_var, width=6).grid(row=0, column=3, sticky="w", padx=(4, 0))
+
+        ttk.Label(card, text="Export").grid(row=18, column=0, sticky="w", pady=(0, 8))
+        export_frame = ttk.Frame(card, style="Panel.TFrame")
+        export_frame.grid(row=18, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(0, 8))
+        ttk.Combobox(export_frame, textvariable=self.output_format_var, values=("json", "csv", "xlsx", "all"), state="readonly", width=10).grid(row=0, column=0, sticky="w")
+        ttk.Label(export_frame, text="Nome").grid(row=0, column=1, sticky="w", padx=(12, 4))
+        ttk.Entry(export_frame, textvariable=self.filename_var, width=24).grid(row=0, column=2, sticky="ew")
+        export_frame.columnconfigure(2, weight=1)
+
+        ttk.Label(card, text="Cartella output").grid(row=19, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(card, textvariable=self.output_dir_var, width=54).grid(row=19, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
+        ttk.Button(card, text="Sfoglia", style="Secondary.TButton", command=self._choose_output_dir).grid(row=19, column=2, sticky="e", pady=(0, 8))
+        ttk.Label(
+            card,
+            text="Per Vinted usa sessione_persistente se vuoi mantenere login/cookie tra una ricerca e l altra. Il formato export qui sopra e quello usato anche da Avvia ricerca Vinted.",
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=20, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
     def _build_subito_tab(self) -> None:
         card = self._card(self.subito_tab, "Annunci lavoro")
@@ -650,6 +821,13 @@ class ScraperApp:
             sticky="w",
             pady=(10, 0),
         )
+        self.open_browser_button = ttk.Button(
+            card,
+            text="Apri browser",
+            style="Accent.TButton",
+            command=self._start_browser,
+        )
+        self.open_browser_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         card.columnconfigure(0, weight=1)
         card.columnconfigure(1, weight=1)
 
@@ -780,13 +958,14 @@ class ScraperApp:
         lead_card = self._card(detail_body, "Azioni lead")
         self.lead_card = lead_card
         lead_card.pack(fill="x", pady=(12, 0))
-        ttk.Label(
+        self.lead_action_hint_label = ttk.Label(
             lead_card,
             text="Apri la scheda Maps per verificare i dati oppure visita il sito pubblico prima di preparare la demo commerciale.",
             style="Hint.TLabel",
             wraplength=430,
             justify="left",
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        )
+        self.lead_action_hint_label.grid(row=0, column=0, columnspan=2, sticky="w")
         self.open_selected_button = ttk.Button(lead_card, text="Apri Google Maps", style="Accent.TButton", command=self._open_selected_link)
         self.open_selected_button.grid(row=1, column=0, sticky="ew", pady=(12, 0), padx=(0, 6))
         self.open_website_button = ttk.Button(lead_card, text="Apri sito web", style="Secondary.TButton", command=self._open_selected_website)
@@ -856,6 +1035,18 @@ class ScraperApp:
                 ("rating", "Rating", 75, "center"),
                 ("reviews_count", "Recensioni", 90, "center"),
             )
+        elif source == "vinted":
+            column_config = (
+                ("search_term", "Ricerca", 120, "w"),
+                ("tag", "Tag", 95, "center"),
+                ("name", "Nome prodotto", 300, "w"),
+                ("price_value", "Prezzo", 90, "center"),
+                ("item_id", "ID articolo", 110, "center"),
+                ("times_seen", "Rilevato", 80, "center"),
+                ("first_seen_at", "Prima volta", 140, "center"),
+                ("extracted_at", "Ultima volta", 140, "center"),
+                ("link", "Link Vinted", 420, "w"),
+            )
         else:
             column_config = (
                 ("screening_decision", "Candidatura", 105, "center"),
@@ -881,7 +1072,13 @@ class ScraperApp:
     def _handle_source_tab_changed(self) -> None:
         self._update_hint()
         selected = self.notebook.tab(self.notebook.select(), "text")
-        self._configure_result_panels("subito" if selected == "Subito Jobs" else "google_maps")
+        if selected == "Subito Jobs":
+            source = "subito"
+        elif selected == "Vinted":
+            source = "vinted"
+        else:
+            source = "google_maps"
+        self._configure_result_panels(source)
 
     def _configure_result_panels(self, source: str) -> None:
         if not hasattr(self, "lead_card") or not hasattr(self, "contact_card"):
@@ -894,6 +1091,16 @@ class ScraperApp:
             self.contact_card.pack_forget()
             if not self.lead_card.winfo_manager():
                 self.lead_card.pack(fill="x", pady=(12, 0))
+            if source == "vinted":
+                self.lead_card.configure(text="Azioni prodotto")
+                self.lead_action_hint_label.configure(text="Apri l'annuncio Vinted selezionato per verificare foto e dettagli originali.")
+                self.open_selected_button.configure(text="Apri annuncio Vinted")
+            else:
+                self.lead_card.configure(text="Azioni lead")
+                self.lead_action_hint_label.configure(
+                    text="Apri la scheda Maps per verificare i dati oppure visita il sito pubblico prima di preparare la demo commerciale."
+                )
+                self.open_selected_button.configure(text="Apri Google Maps")
 
     def _configure_detail_labels(self, source: str) -> None:
         if not hasattr(self, "detail_card"):
@@ -909,6 +1116,17 @@ class ScraperApp:
                 (7, 0): "Google Maps", (8, 0): "Sito web", (9, 0): "Analisi lead",
             }
             self.detail_card.configure(text="Dettaglio lead")
+        elif source == "vinted":
+            labels = {
+                (1, 0): "Sorgente", (1, 2): "Tag",
+                (2, 0): "Prezzo", (2, 2): "ID articolo",
+                (3, 0): "Estratto", (3, 2): "Valore EUR",
+                (4, 0): "Database", (4, 2): "Valuta",
+                (5, 0): "Nome", (5, 2): "Ricerca",
+                (6, 0): "Prima rilevazione", (6, 2): "Volte rilevato",
+                (7, 0): "Link Vinted", (8, 0): "", (9, 0): "Testo scheda",
+            }
+            self.detail_card.configure(text="Dettaglio prodotto Vinted")
         else:
             labels = {
                 (1, 0): "Sorgente", (1, 2): "Candidatura",
@@ -960,6 +1178,10 @@ class ScraperApp:
             self.hint_var.set(
                 "Inserisci una o piu categorie e una o piu citta. Il sistema raccoglie le attivita, apre le schede Maps, trova sito e contatti pubblici, analizza i siti e ordina i lead in base all opportunita commerciale."
             )
+        elif selected == "Vinted":
+            self.hint_var.set(
+                "Inserisci una parola come macbook oppure un URL catalogo Vinted completo. Nome, prezzo, link e termine ricercato vengono mostrati nei risultati, esportati e salvati nel database SQLite senza duplicare gli articoli."
+            )
         else:
             self.hint_var.set(
                 "Custom Site resta flessibile, ma l output viene comunque mostrato nel popup con tabella, dettaglio e log."
@@ -972,6 +1194,14 @@ class ScraperApp:
         self.browser_user_data_entry.configure(state=custom_state)
         self.browser_browse_button.configure(state=custom_state)
         self.browser_profile_dir_entry.configure(state=profile_state)
+        for widget_name, state in (
+            ("vinted_browser_user_data_entry", custom_state),
+            ("vinted_browser_browse_button", custom_state),
+            ("vinted_browser_profile_dir_entry", profile_state),
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.configure(state=state)
 
     def _update_result_actions(self) -> None:
         row = self._get_selected_row()
@@ -987,6 +1217,68 @@ class ScraperApp:
         self.contact_button.configure(state="normal" if is_subito else "disabled")
         self.contact_selected_button.configure(state="normal" if selected_new_rows else "disabled")
         self.contact_accepted_button.configure(state="normal" if accepted_rows else "disabled")
+
+    def _update_vinted_search_preview(self) -> None:
+        search = self.vinted_search_var.get().strip()
+        if not search:
+            self.vinted_search_preview_var.set("https://www.vinted.it/catalog")
+        elif search.lower().startswith(("http://", "https://")):
+            self.vinted_search_preview_var.set(search)
+        else:
+            self.vinted_search_preview_var.set(f"https://www.vinted.it/catalog?search_text={quote_plus(search)}")
+
+    def _start_vinted_search(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Ricerca Vinted", "Attendi la fine del processo corrente.")
+            return
+        self.vinted_status_var.set("Avvio della ricerca Vinted in corso...")
+        self._start_scrape()
+        if self.process is None or self.current_run_source != "vinted":
+            self.vinted_status_var.set("Ricerca non avviata: controlla i campi evidenziati nel messaggio.")
+        elif self.vinted_keep_browser_open_var.get():
+            seconds = self.vinted_keep_open_seconds_var.get().strip() or "0"
+            if seconds == "0":
+                self.vinted_status_var.set("Ricerca Vinted avviata. Il browser non verra chiuso automaticamente e i risultati si caricano appena termina l estrazione.")
+            else:
+                self.vinted_status_var.set(
+                    f"Ricerca Vinted avviata. Il browser resta aperto per {seconds} secondi; i risultati si caricano alla chiusura o a timer scaduto."
+                )
+
+    def _start_vinted_browser(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Browser Vinted", "Attendi la fine del processo corrente.")
+            return
+        self.vinted_status_var.set("Apertura della ricerca Vinted nel browser...")
+        self._start_browser()
+
+    def _choose_vinted_db_path(self) -> None:
+        current_path = Path(self.vinted_db_path_var.get().strip() or self.script_path.parent / "data" / "scraper.db")
+        initial_dir = current_path.parent if current_path.parent.exists() else self.script_path.parent
+        selected_path = filedialog.asksaveasfilename(
+            initialdir=str(initial_dir),
+            initialfile=current_path.name or "scraper.db",
+            defaultextension=".db",
+            filetypes=(("Database SQLite", "*.db"), ("Tutti i file", "*.*")),
+        )
+        if selected_path:
+            self.vinted_db_path_var.set(selected_path)
+            self.vinted_status_var.set("Database selezionato. Premi Mostra database oppure avvia una ricerca.")
+
+    def _open_vinted_db_folder(self) -> None:
+        db_path = Path(self.vinted_db_path_var.get().strip() or self.script_path.parent / "data" / "scraper.db").expanduser()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        os.startfile(db_path.parent.resolve())
+
+    def _reset_vinted_form(self) -> None:
+        self.vinted_search_var.set("macbook")
+        self.vinted_max_results_var.set("100")
+        self.vinted_db_path_var.set(str((self.script_path.parent / "data" / "scraper.db").resolve()))
+        self.vinted_db_filter_var.set("")
+        self.vinted_db_limit_var.set("500")
+        self.vinted_only_ricercato_var.set(True)
+        self.vinted_keep_browser_open_var.set(True)
+        self.vinted_keep_open_seconds_var.set("0")
+        self.vinted_status_var.set("Campi Vinted ripristinati.")
 
     def _choose_output_dir(self) -> None:
         folder = filedialog.askdirectory(initialdir=self.output_dir_var.get() or str(self.script_path.parent))
@@ -1169,6 +1461,15 @@ class ScraperApp:
         self.current_run_source = command[3]
         self._start_process(command, kind="scrape", load_results=True)
 
+    def _start_browser(self) -> None:
+        try:
+            command = self._build_browser_command()
+        except ValueError as exc:
+            messagebox.showerror("Browser non disponibile", str(exc))
+            return
+        self.bottom_notebook.select(self.log_tab)
+        self._start_process(command, kind="browser", load_results=False)
+
     def _start_contact_action(self) -> None:
         row = self._get_selected_row()
         if self.contact_submit_var.get() and row is not None:
@@ -1252,6 +1553,8 @@ class ScraperApp:
         self.status_var.set("Running")
         self._append_log(f"$ {' '.join(command)}\n")
         self.run_button.configure(state="disabled")
+        self.open_browser_button.configure(state="disabled")
+        self.vinted_run_button.configure(state="disabled")
         if kind == "contact":
             self.contact_button.configure(state="disabled")
         if kind == "scrape":
@@ -1310,6 +1613,30 @@ class ScraperApp:
             cmd.append("--exclude-sponsored" if self.google_exclude_sponsored_var.get() else "--no-exclude-sponsored")
             cmd.append("--include-details" if self.google_include_details_var.get() else "--no-include-details")
             cmd.append("--audit-websites" if self.google_audit_websites_var.get() else "--no-audit-websites")
+        elif selected == "Vinted":
+            search = self.vinted_search_var.get().strip()
+            if not search:
+                raise ValueError("Inserisci una ricerca o un URL Vinted.")
+            max_results = self.vinted_max_results_var.get().strip()
+            if not max_results.isdigit():
+                raise ValueError("Max risultati Vinted deve essere un intero maggiore o uguale a zero.")
+            db_path = self.vinted_db_path_var.get().strip()
+            if not db_path:
+                raise ValueError("Inserisci il percorso del database SQLite.")
+            keep_open_seconds = self.vinted_keep_open_seconds_var.get().strip() or "0"
+            if self.vinted_keep_browser_open_var.get() and not keep_open_seconds.isdigit():
+                raise ValueError("I secondi per tenere aperto il browser Vinted devono essere un intero maggiore o uguale a zero.")
+            cmd += [
+                "vinted",
+                "--search", search,
+                "--max-results", max_results,
+                "--db-path", db_path,
+            ]
+            if self.vinted_keep_browser_open_var.get():
+                if int(keep_open_seconds) == 0:
+                    cmd.append("--keep-browser-open")
+                else:
+                    cmd += ["--keep-open-seconds", keep_open_seconds]
         elif selected == "Subito Jobs":
             if not self.subito_max_results_var.get().strip().isdigit():
                 raise ValueError("Max risultati Subito deve essere un intero positivo.")
@@ -1407,6 +1734,57 @@ class ScraperApp:
         if self.filename_var.get().strip():
             cmd += ["--filename", self.filename_var.get().strip()]
         return cmd
+
+    def _build_browser_command(self) -> list[str]:
+        selected = self.notebook.tab(self.notebook.select(), "text")
+        if selected == "Google Maps":
+            search = self._first_list_value(self.google_search_var.get())
+            city = self._first_list_value(self.google_city_var.get())
+            if search:
+                url = build_google_maps_search_url(
+                    search,
+                    city,
+                    self.google_province_var.get().strip(),
+                    self.google_country_var.get().strip(),
+                )
+            else:
+                url = "https://www.google.com/maps"
+        elif selected == "Vinted":
+            search = self.vinted_search_var.get().strip()
+            if search.lower().startswith(("http://", "https://")):
+                url = search
+            elif search:
+                url = f"https://www.vinted.it/catalog?search_text={quote_plus(search)}"
+            else:
+                url = "https://www.vinted.it/catalog"
+        elif selected == "Subito Jobs":
+            query = self.subito_query_var.get().strip()
+            if query.lower().startswith(("http://", "https://")):
+                url = query
+            else:
+                url = build_subito_search_url(
+                    query_value=query,
+                    region=self.subito_region_var.get().strip() or "lazio",
+                    category=self.subito_category_var.get().strip() or "offerte-lavoro",
+                    city=self._first_list_value(self.subito_city_var.get()),
+                )
+        else:
+            url = self.custom_url_var.get().strip() or "https://www.google.com/"
+
+        command = [
+            sys.executable,
+            str(self.script_path),
+            "browser",
+            "--url",
+            url,
+            "--keep-open-seconds",
+            "0",
+        ]
+        command += self._browser_command_args()
+        return command
+
+    def _first_list_value(self, raw_value: str) -> str:
+        return next((part.strip() for part in str(raw_value or "").replace(";", ",").split(",") if part.strip()), "")
 
     def _build_contact_command(self) -> list[str]:
         row = self._get_selected_row()
@@ -1708,11 +2086,15 @@ class ScraperApp:
                 self.process_should_load_results = False
                 self.status_var.set("Idle" if code == 0 else "Error")
                 self.run_button.configure(state="normal")
+                self.open_browser_button.configure(state="normal")
+                self.vinted_run_button.configure(state="normal")
                 self._update_result_actions()
                 if code == 0 and should_load_results:
                     self._load_results()
                 if completed_kind == "scrape" and self.auto_monitor_enabled:
                     self._schedule_next_auto_run(code=code)
+                elif completed_kind == "scrape" and self.current_run_source == "vinted" and code != 0:
+                    self.vinted_status_var.set("Ricerca Vinted fallita. Controlla il log per il dettaglio.")
                 elif completed_kind == "contact":
                     if code == 0:
                         if self.ui_result_json_path.exists():
@@ -1729,6 +2111,44 @@ class ScraperApp:
         self.log_widget.insert("end", text)
         self.log_widget.see("end")
         self.log_widget.configure(state="disabled")
+
+    def _load_vinted_database_results(self) -> None:
+        db_path = self.vinted_db_path_var.get().strip()
+        if not db_path:
+            messagebox.showerror("Database Vinted", "Inserisci il percorso del database SQLite.")
+            return
+        raw_limit = self.vinted_db_limit_var.get().strip() or "500"
+        if not raw_limit.isdigit():
+            messagebox.showerror("Database Vinted", "Il limite righe deve essere un intero maggiore o uguale a zero.")
+            return
+        self.vinted_status_var.set("Caricamento del database Vinted...")
+        try:
+            rows, meta = load_vinted_rows(
+                db_path=db_path,
+                search_term=self.vinted_db_filter_var.get().strip(),
+                tag_filter="ricercato" if self.vinted_only_ricercato_var.get() else "",
+                limit=int(raw_limit),
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            self.vinted_status_var.set("Impossibile caricare il database Vinted.")
+            messagebox.showerror("Database Vinted", str(exc))
+            return
+
+        generated_at = datetime.now().isoformat(timespec="seconds")
+        payload = {
+            "source": "vinted",
+            "generated_at": generated_at,
+            "row_count": len(rows),
+            "meta": meta,
+            "rows": rows,
+        }
+        self.ui_result_json_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ui_result_json_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self.current_run_source = "vinted"
+        self._load_results()
 
     def _load_results(self) -> None:
         if not self.ui_result_json_path.exists():
@@ -1758,10 +2178,13 @@ class ScraperApp:
             "Valutazione Maps",
             "Numero recensioni",
         }
+        vinted_sort_modes = {"Prezzo Vinted", "Ricerca Vinted", "Nome attivita", "Data estrazione"}
         current_sort = self.result_sort_var.get().strip()
         if source == "google_maps" and current_sort not in lead_sort_modes:
             current_sort = "Score opportunita"
-        elif source != "google_maps" and current_sort in lead_sort_modes:
+        elif source == "vinted" and current_sort not in vinted_sort_modes:
+            current_sort = "Prezzo Vinted"
+        elif source not in {"google_maps", "vinted"} and current_sort in lead_sort_modes | vinted_sort_modes:
             current_sort = "Priorita consigliata"
         self._updating_result_sort_var = True
         self.result_sort_var.set(current_sort)
@@ -1797,6 +2220,44 @@ class ScraperApp:
             if total_errors:
                 meta_parts.append(f"Errori isolati: {total_errors}")
             self.result_meta_var.set(" | ".join(meta_parts))
+            self._render_results_rows(self.result_rows)
+            self._update_result_actions()
+            self.bottom_notebook.select(self.results_tab)
+            return
+        if source == "vinted":
+            self.result_total_var.set(f"{len(rows)} prodotti")
+            if meta.get("loaded_from_db"):
+                self.result_counts_var.set(
+                    f"articoli DB {meta.get('db_total_items', 0)} | "
+                    f"tag DB {meta.get('db_total_search_hits', 0)} | "
+                    f"mostrati {len(rows)}"
+                )
+                if meta.get("db_created") and not rows:
+                    self.vinted_status_var.set("Database creato correttamente. Non contiene ancora prodotti: avvia la prima ricerca.")
+                else:
+                    self.vinted_status_var.set(
+                        f"Database caricato: {len(rows)} righe mostrate su {meta.get('db_filtered_search_hits', len(rows))}."
+                    )
+            else:
+                self.result_counts_var.set(
+                    f"nuovi articoli {meta.get('new_items', 0)} | "
+                    f"aggiornati {meta.get('updated_items', 0)} | "
+                    f"nuovi tag {meta.get('new_search_hits', 0)}"
+                )
+                self.vinted_status_var.set(
+                    f"Ricerca completata: {len(rows)} prodotti, {meta.get('new_items', 0)} nuovi nel database."
+                )
+            self.result_meta_var.set(
+                " | ".join(
+                    (
+                        "Sorgente: Vinted",
+                        f"Ricerca: {meta.get('db_search_filter', '') or meta.get('search_term', 'tutte')}",
+                        f"Tag: {meta.get('db_tag_filter', '') or meta.get('tag', '') or 'tutti'}",
+                        f"Database: {meta.get('db_path', '-')}",
+                        f"Generato: {payload.get('generated_at', '-')}",
+                    )
+                )
+            )
             self._render_results_rows(self.result_rows)
             self._update_result_actions()
             self.bottom_notebook.select(self.results_tab)
@@ -1883,6 +2344,19 @@ class ScraperApp:
                 )
                 priority = str(row.get("lead_priority", "") or "").lower()
                 tag = priority if priority in LEAD_PRIORITY_ORDER else ""
+            elif str(row.get("source", "") or "").strip().lower() == "vinted":
+                values = (
+                    str(row.get("search_term", "") or ""),
+                    str(row.get("tag", "") or "ricercato"),
+                    str(row.get("name", "") or ""),
+                    str(row.get("price", row.get("price_value", "")) or ""),
+                    str(row.get("item_id", "") or ""),
+                    str(row.get("times_seen", 1) or 1),
+                    str(row.get("first_seen_at", row.get("extracted_at", "")) or ""),
+                    self._extracted_display_value(row),
+                    str(row.get("link", "") or ""),
+                )
+                tag = ""
             else:
                 distance = row.get("distance_km", "-")
                 if distance in ("", None):
@@ -1969,6 +2443,18 @@ class ScraperApp:
 
     def _result_sort_key(self, row: dict) -> tuple:
         sort_mode = self.result_sort_var.get().strip()
+        if sort_mode == "Prezzo Vinted":
+            price = row.get("price_value")
+            return (
+                price in (None, ""),
+                self._safe_float(price, default=0),
+                str(row.get("name", "") or "").lower(),
+            )
+        if sort_mode == "Ricerca Vinted":
+            return (
+                str(row.get("search_term", "") or "").lower(),
+                str(row.get("name", "") or "").lower(),
+            )
         if sort_mode == "Score opportunita":
             return (
                 self._safe_float(row.get("opportunity_score"), default=-1),
@@ -2147,6 +2633,25 @@ class ScraperApp:
     def _populate_detail_panel(self, row: dict) -> None:
         source = str(row.get("source", "") or "").strip().lower()
         self._configure_detail_labels(source)
+        if source == "vinted":
+            self.detail_title_var.set(str(row.get("name", "") or "Prodotto senza nome"))
+            self.detail_source_var.set("Vinted")
+            self.detail_screening_var.set(str(row.get("tag", "") or "ricercato"))
+            self.detail_contact_var.set(str(row.get("price", "") or "-"))
+            self.detail_decision_var.set(str(row.get("item_id", "") or "-"))
+            self.detail_date_var.set(self._extracted_display_value(row))
+            price_value = row.get("price_value")
+            self.detail_distance_var.set(str(price_value) if price_value not in (None, "") else "-")
+            self.detail_location_var.set(str(row.get("db_path", "") or "-"))
+            self.detail_company_var.set(str(row.get("currency", "") or "-"))
+            self.detail_sector_var.set(str(row.get("name", "") or "-"))
+            self.detail_role_var.set(str(row.get("search_term", "") or "-"))
+            self.detail_schedule_var.set(str(row.get("first_seen_at", row.get("extracted_at", "")) or "-"))
+            self.detail_price_var.set(str(row.get("times_seen", 1) or 1))
+            self.detail_link_var.set(str(row.get("link", "") or ""))
+            self.detail_website_var.set("")
+            self._set_detail_raw_text(str(row.get("raw_text", "") or ""))
+            return
         if source == "google_maps":
             self.detail_title_var.set(str(row.get("name", "") or "Attivita senza nome"))
             self.detail_source_var.set("Google Maps")

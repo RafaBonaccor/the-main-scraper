@@ -8,6 +8,7 @@ from .runtime_controls import consume_skip_current_item_request, consume_stop_af
 from .sources.custom_site import run_custom_site_scraper
 from .sources.google_maps import run_google_maps_scraper
 from .sources.subito import run_subito_scraper
+from .sources.vinted import run_vinted_scraper
 from .utils import parse_text_list
 
 
@@ -29,6 +30,21 @@ def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
             browser_mode=kwargs.get("browser_mode", "isolated"),
             browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
             browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
+        )
+
+    if source == "vinted":
+        return run_vinted_scraper(
+            search=kwargs["search"],
+            max_results=int(kwargs.get("max_results", 100)),
+            db_path=kwargs.get("db_path", "data/scraper.db"),
+            browser_mode=kwargs.get("browser_mode", "isolated"),
+            browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
+            browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
+            keep_browser_open=bool(kwargs.get("keep_browser_open", False)),
+            keep_open_seconds=int(kwargs.get("keep_open_seconds", 0)),
+            slow_mode=bool(kwargs.get("slow_mode", False)),
+            action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
+            page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
         )
 
     if source == "subito":

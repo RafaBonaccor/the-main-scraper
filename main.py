@@ -8,6 +8,7 @@ ensure_project_venv(__file__)
 
 from scraper_app.contact_history import annotate_rows_with_contact_history, summarize_contact_status
 from scraper_app.contact_runner import run_contact_action
+from scraper_app.browser_launcher import open_browser_session
 from scraper_app.exporters import export_outcome, write_outcome_json
 from scraper_app.models import ExportOptions
 from scraper_app.openai_screening import DEFAULT_REASONING_EFFORT, DEFAULT_SCREENING_MODEL
@@ -20,6 +21,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("gui", help="Open the minimal desktop UI.")
+
+    browser_parser = subparsers.add_parser("browser", help="Open a browser manually using the selected profile.")
+    browser_parser.add_argument("--url", default="https://www.google.com/maps", help="Initial URL to open.")
+    browser_parser.add_argument(
+        "--keep-open-seconds",
+        default=0,
+        type=int,
+        help="Seconds to keep the browser open. Use 0 to wait until it is closed manually.",
+    )
+    _add_browser_arguments(browser_parser)
 
     run_parser = subparsers.add_parser("run", help="Run a scraper from the CLI.")
     contact_parser = subparsers.add_parser("contact", help="Run a contact/browser action for a supported source.")
@@ -54,6 +65,29 @@ def build_parser() -> argparse.ArgumentParser:
     google_parser.add_argument("--website-timeout-seconds", default=10.0, type=float, help="Timeout for each website page audit.")
     _add_browser_arguments(google_parser)
     _add_export_arguments(google_parser)
+
+    vinted_parser = run_subparsers.add_parser("vinted", help="Extract Vinted search results and save them to SQLite.")
+    vinted_parser.add_argument("--search", required=True, help="Vinted search term or full catalog URL.")
+    vinted_parser.add_argument(
+        "--max-results",
+        default=100,
+        type=int,
+        help="Maximum results to keep. Use 0 to scroll until no new items are found.",
+    )
+    vinted_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
+    vinted_parser.add_argument(
+        "--keep-browser-open",
+        action="store_true",
+        help="Leave the Vinted browser open after extraction without waiting for a timer.",
+    )
+    vinted_parser.add_argument(
+        "--keep-open-seconds",
+        default=0,
+        type=int,
+        help="Blocking fallback: seconds to keep Vinted open before closing. Use 0 to close immediately.",
+    )
+    _add_browser_arguments(vinted_parser)
+    _add_export_arguments(vinted_parser)
 
     subito_parser = run_subparsers.add_parser("subito", help="Use the dedicated Subito scraper for listings.")
     subito_parser.add_argument(
@@ -164,6 +198,17 @@ def main() -> int:
     if args.command in (None, "gui"):
         launch_gui(Path(__file__).resolve())
         return 0
+
+    if args.command == "browser":
+        result = open_browser_session(
+            url=args.url,
+            keep_open_seconds=args.keep_open_seconds,
+            browser_mode=args.browser_mode,
+            browser_user_data_dir=args.browser_user_data_dir,
+            browser_profile_directory=args.browser_profile_directory,
+        )
+        print(f"Browser result: {result}")
+        return 0 if result.get("ok") else 1
 
     if args.command == "contact":
         payload = vars(args).copy()

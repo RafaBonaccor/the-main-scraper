@@ -7,6 +7,9 @@ error_logs/
 .bp/
 allegato/
 
+data/*.db
+data/*.db-*
+
 .venv/
 venv/
 
