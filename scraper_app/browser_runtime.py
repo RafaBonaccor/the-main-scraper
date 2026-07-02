@@ -119,6 +119,7 @@ def resolve_browser_profile(config: dict) -> str | None:
         persistent_root = prepare_persistent_profile_root(
             source_user_data_dir=user_data_dir or default_chrome_user_data_dir(),
             profile_directory=str(config.get("browser_profile_directory", "") or "Default"),
+            refresh=bool(config.get("refresh_browser_profile", False)),
         )
         config["_resolved_browser_profile_root"] = persistent_root
         return persistent_root
@@ -176,13 +177,16 @@ def prepare_chrome_normale_profile_copy(source_user_data_dir: str, profile_direc
     return str(target_root)
 
 
-def prepare_persistent_profile_root(source_user_data_dir: str, profile_directory: str) -> str:
+def prepare_persistent_profile_root(source_user_data_dir: str, profile_directory: str, refresh: bool = False) -> str:
     profile_name = (profile_directory or "Default").strip() or "Default"
     target_root = PERSISTENT_PROFILES_DIR / f"p_{_slug(profile_name)}"
     _ensure_runtime_target(target_root)
 
-    if target_root.exists():
+    if target_root.exists() and not refresh:
         return str(target_root)
+
+    if target_root.exists() and refresh:
+        shutil.rmtree(target_root)
 
     target_root.mkdir(parents=True, exist_ok=True)
 

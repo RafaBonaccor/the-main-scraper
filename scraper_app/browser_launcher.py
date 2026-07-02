@@ -15,6 +15,7 @@ def open_browser_session(
     browser_mode: str = "isolated",
     browser_user_data_dir: str = "",
     browser_profile_directory: str = "Default",
+    refresh_browser_profile: bool = False,
 ) -> dict:
     config = {
         "url": str(url or DEFAULT_BROWSER_URL).strip() or DEFAULT_BROWSER_URL,
@@ -22,6 +23,7 @@ def open_browser_session(
         "browser_mode": browser_mode,
         "browser_user_data_dir": browser_user_data_dir,
         "browser_profile_directory": browser_profile_directory,
+        "refresh_browser_profile": bool(refresh_browser_profile),
     }
     return _open_browser_task(config)
 

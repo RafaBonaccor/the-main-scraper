@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Seconds to keep the browser open. Use 0 to wait until it is closed manually.",
     )
+    browser_parser.add_argument(
+        "--refresh-browser-profile",
+        action="store_true",
+        help="Refresh the persistent browser profile from the source Chrome data before opening.",
+    )
     _add_browser_arguments(browser_parser)
 
     run_parser = subparsers.add_parser("run", help="Run a scraper from the CLI.")
@@ -81,6 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Leave the Vinted browser open after extraction without waiting for a timer.",
     )
     vinted_parser.add_argument(
+        "--refresh-browser-profile",
+        action="store_true",
+        help="Refresh the persistent profile from the source Chrome data before scraping Vinted.",
+    )
+    vinted_parser.add_argument(
         "--keep-open-seconds",
         default=0,
         type=int,
@@ -88,6 +98,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_browser_arguments(vinted_parser)
     _add_export_arguments(vinted_parser)
+
+    vinted_details_parser = run_subparsers.add_parser(
+        "vinted_descriptions",
+        help="Extract descriptions for selected Vinted links and update the database.",
+    )
+    vinted_details_parser.add_argument("--links-file", default="", help="UTF-8 text or JSON file containing one or more Vinted listing URLs.")
+    vinted_details_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
+    vinted_details_parser.add_argument(
+        "--keep-browser-open",
+        action="store_true",
+        help="Leave the Vinted browser open after extracting descriptions.",
+    )
+    vinted_details_parser.add_argument(
+        "--refresh-browser-profile",
+        action="store_true",
+        help="Refresh the persistent profile from the source Chrome data before extracting descriptions.",
+    )
+    vinted_details_parser.add_argument(
+        "--keep-open-seconds",
+        default=0,
+        type=int,
+        help="Blocking fallback: seconds to keep Vinted open before closing. Use 0 to close immediately.",
+    )
+    _add_browser_arguments(vinted_details_parser)
+    _add_export_arguments(vinted_details_parser)
 
     subito_parser = run_subparsers.add_parser("subito", help="Use the dedicated Subito scraper for listings.")
     subito_parser.add_argument(
@@ -206,6 +241,7 @@ def main() -> int:
             browser_mode=args.browser_mode,
             browser_user_data_dir=args.browser_user_data_dir,
             browser_profile_directory=args.browser_profile_directory,
+            refresh_browser_profile=args.refresh_browser_profile,
         )
         print(f"Browser result: {result}")
         return 0 if result.get("ok") else 1

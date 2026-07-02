@@ -1,4 +1,6 @@
+import json
 from datetime import datetime
+from pathlib import Path
 
 from .date_filter import apply_age_filter_to_outcome
 from .location_filter import apply_geo_sorting_to_outcome
@@ -8,7 +10,7 @@ from .runtime_controls import consume_skip_current_item_request, consume_stop_af
 from .sources.custom_site import run_custom_site_scraper
 from .sources.google_maps import run_google_maps_scraper
 from .sources.subito import run_subito_scraper
-from .sources.vinted import run_vinted_scraper
+from .sources.vinted import run_vinted_description_extractor, run_vinted_scraper
 from .utils import parse_text_list
 
 
@@ -30,6 +32,7 @@ def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
             browser_mode=kwargs.get("browser_mode", "isolated"),
             browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
             browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
+            refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
         )
 
     if source == "vinted":
@@ -41,6 +44,22 @@ def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
             browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
             browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
             keep_browser_open=bool(kwargs.get("keep_browser_open", False)),
+            refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
+            keep_open_seconds=int(kwargs.get("keep_open_seconds", 0)),
+            slow_mode=bool(kwargs.get("slow_mode", False)),
+            action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
+            page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
+        )
+
+    if source == "vinted_descriptions":
+        return run_vinted_description_extractor(
+            items=_resolve_vinted_items(kwargs),
+            db_path=kwargs.get("db_path", "data/scraper.db"),
+            browser_mode=kwargs.get("browser_mode", "isolated"),
+            browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
+            browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
+            keep_browser_open=bool(kwargs.get("keep_browser_open", False)),
+            refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
             keep_open_seconds=int(kwargs.get("keep_open_seconds", 0)),
             slow_mode=bool(kwargs.get("slow_mode", False)),
             action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
@@ -89,6 +108,18 @@ def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
         )
 
     raise ValueError(f"Unsupported source: {source}")
+
+
+def _resolve_vinted_items(kwargs: dict) -> list[dict | str]:
+    links_file = str(kwargs.get("links_file", "") or "").strip()
+    items = kwargs.get("items", kwargs.get("links", []))
+    if links_file:
+        return _read_items_file(Path(links_file))
+    if isinstance(items, list):
+        return [item for item in items if isinstance(item, dict) or str(item).strip()]
+    if items:
+        return [items]
+    return []
 
 
 def _run_subito_queries(**kwargs) -> ScrapeOutcome:
@@ -317,3 +348,25 @@ def _limit_outcome_rows(outcome: ScrapeOutcome, max_results: int) -> ScrapeOutco
     if "age_filter_counts" in outcome.meta:
         outcome.meta["age_filter_counts"] = trimmed_age_counts
     return outcome
+
+
+def _read_items_file(path: Path) -> list[dict | str]:
+    if not path.exists():
+        raise ValueError(f"Links file non trovato: {path}")
+
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        raise ValueError(f"Links file vuoto: {path}")
+
+    if content.startswith("["):
+        raw_items = json.loads(content)
+        if not isinstance(raw_items, list):
+            raise ValueError(f"Links file non valido: {path}")
+        return [item for item in raw_items if isinstance(item, dict) or str(item).strip()]
+
+    items: list[dict | str] = []
+    for line in content.splitlines():
+        value = line.strip()
+        if value:
+            items.append(value)
+    return items

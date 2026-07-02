@@ -260,6 +260,7 @@ class ScraperApp:
         self.vinted_only_ricercato_var = tk.BooleanVar(value=True)
         self.vinted_keep_browser_open_var = tk.BooleanVar(value=True)
         self.vinted_keep_open_seconds_var = tk.StringVar(value="0")
+        self.vinted_refresh_browser_profile_var = tk.BooleanVar(value=True)
         self.vinted_search_preview_var = tk.StringVar()
         self.vinted_status_var = tk.StringVar(value="Pronto per una nuova ricerca Vinted.")
 
@@ -508,6 +509,19 @@ class ScraperApp:
         ).grid(row=0, column=0, sticky="w")
         ttk.Entry(keep_open_controls, textvariable=self.vinted_keep_open_seconds_var, width=8).grid(row=0, column=1, sticky="w", padx=(10, 4))
         ttk.Label(keep_open_controls, text="secondi (0 = non chiudere)", style="Muted.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Checkbutton(
+            keep_open_controls,
+            text="Ricarica login dal Chrome reale",
+            variable=self.vinted_refresh_browser_profile_var,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.vinted_extract_button = ttk.Button(
+            search_actions,
+            text="Estrai descrizioni selezionati",
+            style="Accent.TButton",
+            command=self._start_vinted_description_extraction_selected,
+        )
+        self.vinted_extract_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.vinted_extract_button.configure(state="disabled")
         search_actions.columnconfigure(0, weight=2)
         search_actions.columnconfigure(1, weight=1)
 
@@ -1040,7 +1054,7 @@ class ScraperApp:
                 ("search_term", "Ricerca", 120, "w"),
                 ("tag", "Tag", 95, "center"),
                 ("name", "Nome prodotto", 300, "w"),
-                ("price_value", "Prezzo", 90, "center"),
+                ("price_value", "Totale", 90, "center"),
                 ("item_id", "ID articolo", 110, "center"),
                 ("times_seen", "Rilevato", 80, "center"),
                 ("first_seen_at", "Prima volta", 140, "center"),
@@ -1119,9 +1133,9 @@ class ScraperApp:
         elif source == "vinted":
             labels = {
                 (1, 0): "Sorgente", (1, 2): "Tag",
-                (2, 0): "Prezzo", (2, 2): "ID articolo",
-                (3, 0): "Estratto", (3, 2): "Valore EUR",
-                (4, 0): "Database", (4, 2): "Valuta",
+                (2, 0): "Prezzo", (2, 2): "Totale",
+                (3, 0): "Estratto", (3, 2): "Spedizione",
+                (4, 0): "Database", (4, 2): "Offerta",
                 (5, 0): "Nome", (5, 2): "Ricerca",
                 (6, 0): "Prima rilevazione", (6, 2): "Volte rilevato",
                 (7, 0): "Link Vinted", (8, 0): "", (9, 0): "Testo scheda",
@@ -1180,7 +1194,7 @@ class ScraperApp:
             )
         elif selected == "Vinted":
             self.hint_var.set(
-                "Inserisci una parola come macbook oppure un URL catalogo Vinted completo. Nome, prezzo, link e termine ricercato vengono mostrati nei risultati, esportati e salvati nel database SQLite senza duplicare gli articoli."
+                "Inserisci una parola come macbook oppure un URL catalogo Vinted completo. Nome, prezzo, link e termine ricercato vengono mostrati nei risultati, esportati e salvati nel database SQLite senza duplicare gli articoli. Se la sessione persistente non vede il login, abilita la ricarica del profilo dal Chrome reale."
             )
         else:
             self.hint_var.set(
@@ -1208,12 +1222,15 @@ class ScraperApp:
         selected_rows = self._get_selected_rows()
         selected_new_rows = [item for item in selected_rows if not self._row_has_submitted_contact(item)]
         accepted_rows = self._get_accepted_subito_rows()
+        selected_vinted_rows = [item for item in selected_rows if str(item.get("source", "") or "").strip().lower() == "vinted"]
         has_row = row is not None and bool(str(row.get("link", "") or "").strip())
         has_website = row is not None and bool(str(row.get("website", "") or "").strip())
         is_subito = has_row and str(row.get("source", "") or "").strip().lower() == "subito"
         self.open_selected_button.configure(state="normal" if has_row else "disabled")
         self.subito_open_selected_button.configure(state="normal" if has_row else "disabled")
         self.open_website_button.configure(state="normal" if has_website else "disabled")
+        if hasattr(self, "vinted_extract_button"):
+            self.vinted_extract_button.configure(state="normal" if selected_vinted_rows else "disabled")
         self.contact_button.configure(state="normal" if is_subito else "disabled")
         self.contact_selected_button.configure(state="normal" if selected_new_rows else "disabled")
         self.contact_accepted_button.configure(state="normal" if accepted_rows else "disabled")
@@ -1251,6 +1268,42 @@ class ScraperApp:
         self.vinted_status_var.set("Apertura della ricerca Vinted nel browser...")
         self._start_browser()
 
+    def _start_vinted_description_extraction_selected(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Descrizioni Vinted", "Attendi la fine del processo corrente.")
+            return
+        rows = [row for row in self._get_selected_rows() if str(row.get("source", "") or "").strip().lower() == "vinted"]
+        if not rows:
+            messagebox.showerror("Descrizioni Vinted", "Seleziona almeno un prodotto Vinted nei risultati.")
+            return
+        if not self._confirm_vinted_description_extraction(rows):
+            return
+        try:
+            command = self._build_vinted_description_command(rows)
+        except ValueError as exc:
+            messagebox.showerror("Descrizioni Vinted", str(exc))
+            return
+        self.vinted_status_var.set(f"Estrazione descrizioni Vinted in corso su {len(rows)} prodotti selezionati...")
+        self.current_run_source = "vinted"
+        self.bottom_notebook.select(self.log_tab)
+        self._start_process(command, kind="scrape", load_results=True)
+
+    def _confirm_vinted_description_extraction(self, rows: list[dict]) -> bool:
+        preview_lines = []
+        for row in rows[:8]:
+            title = str(row.get("name", "") or "Prodotto senza nome").strip()
+            preview_lines.append(f"- {title}")
+        remaining = len(rows) - len(preview_lines)
+        if remaining > 0:
+            preview_lines.append(f"... altri {remaining} prodotti")
+        message = (
+            f"Stai per estrarre la descrizione completa da {len(rows)} prodotti Vinted selezionati.\n\n"
+            "Anteprima:\n"
+            + "\n".join(preview_lines)
+            + "\n\nConfermi?"
+        )
+        return messagebox.askyesno("Conferma estrazione descrizioni", message)
+
     def _choose_vinted_db_path(self) -> None:
         current_path = Path(self.vinted_db_path_var.get().strip() or self.script_path.parent / "data" / "scraper.db")
         initial_dir = current_path.parent if current_path.parent.exists() else self.script_path.parent
@@ -1264,10 +1317,73 @@ class ScraperApp:
             self.vinted_db_path_var.set(selected_path)
             self.vinted_status_var.set("Database selezionato. Premi Mostra database oppure avvia una ricerca.")
 
+    def _build_vinted_description_command(self, rows: list[dict]) -> list[str]:
+        if not rows:
+            raise ValueError("Seleziona almeno un prodotto Vinted.")
+        db_path = self.vinted_db_path_var.get().strip()
+        if not db_path:
+            raise ValueError("Inserisci il percorso del database SQLite.")
+        links_file = self._write_vinted_links_file(rows)
+        cmd = [
+            sys.executable,
+            str(self.script_path),
+            "run",
+            "vinted_descriptions",
+            "--links-file",
+            str(links_file),
+            "--db-path",
+            db_path,
+        ]
+        if self.vinted_keep_browser_open_var.get():
+            keep_open_seconds = self.vinted_keep_open_seconds_var.get().strip() or "0"
+            if not keep_open_seconds.isdigit():
+                raise ValueError("I secondi per tenere aperto il browser Vinted devono essere un intero maggiore o uguale a zero.")
+            if int(keep_open_seconds) == 0:
+                cmd.append("--keep-browser-open")
+            else:
+                cmd += ["--keep-open-seconds", keep_open_seconds]
+        if self.vinted_refresh_browser_profile_var.get():
+            cmd.append("--refresh-browser-profile")
+        cmd += self._browser_command_args()
+        cmd += [
+            "--format",
+            self.output_format_var.get().strip(),
+            "--output-dir",
+            self.output_dir_var.get().strip(),
+            "--ui-result-json",
+            str(self.ui_result_json_path),
+        ]
+        if self.filename_var.get().strip():
+            cmd += ["--filename", self.filename_var.get().strip()]
+        return cmd
+
     def _open_vinted_db_folder(self) -> None:
         db_path = Path(self.vinted_db_path_var.get().strip() or self.script_path.parent / "data" / "scraper.db").expanduser()
         db_path.parent.mkdir(parents=True, exist_ok=True)
         os.startfile(db_path.parent.resolve())
+
+    def _write_vinted_links_file(self, rows: list[dict]) -> Path:
+        output_dir = Path(self.output_dir_var.get()).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        links_file = output_dir / "_ui_vinted_items.json"
+        items: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            link = str(row.get("link", "") or "").strip()
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            items.append(
+                {
+                    "link": link,
+                    "search_term": str(row.get("search_term", "") or ""),
+                    "search_url": str(row.get("search_url", "") or ""),
+                    "tag": str(row.get("tag", "") or "ricercato"),
+                    "name": str(row.get("name", "") or ""),
+                }
+            )
+        links_file.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        return links_file
 
     def _reset_vinted_form(self) -> None:
         self.vinted_search_var.set("macbook")
@@ -1278,6 +1394,7 @@ class ScraperApp:
         self.vinted_only_ricercato_var.set(True)
         self.vinted_keep_browser_open_var.set(True)
         self.vinted_keep_open_seconds_var.set("0")
+        self.vinted_refresh_browser_profile_var.set(True)
         self.vinted_status_var.set("Campi Vinted ripristinati.")
 
     def _choose_output_dir(self) -> None:
@@ -1637,6 +1754,8 @@ class ScraperApp:
                     cmd.append("--keep-browser-open")
                 else:
                     cmd += ["--keep-open-seconds", keep_open_seconds]
+            if self.vinted_refresh_browser_profile_var.get():
+                cmd.append("--refresh-browser-profile")
         elif selected == "Subito Jobs":
             if not self.subito_max_results_var.get().strip().isdigit():
                 raise ValueError("Max risultati Subito deve essere un intero positivo.")
@@ -1780,6 +1899,8 @@ class ScraperApp:
             "--keep-open-seconds",
             "0",
         ]
+        if selected == "Vinted" and self.vinted_refresh_browser_profile_var.get():
+            command.append("--refresh-browser-profile")
         command += self._browser_command_args()
         return command
 
@@ -2349,7 +2470,7 @@ class ScraperApp:
                     str(row.get("search_term", "") or ""),
                     str(row.get("tag", "") or "ricercato"),
                     str(row.get("name", "") or ""),
-                    str(row.get("price", row.get("price_value", "")) or ""),
+                    self._vinted_total_display_value(row),
                     str(row.get("item_id", "") or ""),
                     str(row.get("times_seen", 1) or 1),
                     str(row.get("first_seen_at", row.get("extracted_at", "")) or ""),
@@ -2444,7 +2565,7 @@ class ScraperApp:
     def _result_sort_key(self, row: dict) -> tuple:
         sort_mode = self.result_sort_var.get().strip()
         if sort_mode == "Prezzo Vinted":
-            price = row.get("price_value")
+            price = row.get("total_price_value", row.get("price_value"))
             return (
                 price in (None, ""),
                 self._safe_float(price, default=0),
@@ -2610,6 +2731,18 @@ class ScraperApp:
             return raw_value or "-"
         return parsed.strftime("%Y-%m-%d %H:%M")
 
+    def _vinted_total_display_value(self, row: dict) -> str:
+        total = str(row.get("total_price", "") or "").strip()
+        if total:
+            return total
+        price = row.get("price")
+        if price not in ("", None):
+            return str(price)
+        raw_value = row.get("total_price_value", row.get("price_value"))
+        if raw_value in ("", None):
+            return ""
+        return str(raw_value)
+
     def _safe_int(self, value: object, default: int = 0) -> int:
         try:
             return int(value)
@@ -2638,19 +2771,43 @@ class ScraperApp:
             self.detail_source_var.set("Vinted")
             self.detail_screening_var.set(str(row.get("tag", "") or "ricercato"))
             self.detail_contact_var.set(str(row.get("price", "") or "-"))
-            self.detail_decision_var.set(str(row.get("item_id", "") or "-"))
+            self.detail_decision_var.set(str(row.get("total_price", "") or row.get("price", "") or "-"))
             self.detail_date_var.set(self._extracted_display_value(row))
-            price_value = row.get("price_value")
-            self.detail_distance_var.set(str(price_value) if price_value not in (None, "") else "-")
+            self.detail_distance_var.set(str(row.get("shipping_price", "") or "-"))
             self.detail_location_var.set(str(row.get("db_path", "") or "-"))
-            self.detail_company_var.set(str(row.get("currency", "") or "-"))
+            self.detail_company_var.set("si" if row.get("offer_available") else "no")
             self.detail_sector_var.set(str(row.get("name", "") or "-"))
             self.detail_role_var.set(str(row.get("search_term", "") or "-"))
             self.detail_schedule_var.set(str(row.get("first_seen_at", row.get("extracted_at", "")) or "-"))
             self.detail_price_var.set(str(row.get("times_seen", 1) or 1))
             self.detail_link_var.set(str(row.get("link", "") or ""))
             self.detail_website_var.set("")
-            self._set_detail_raw_text(str(row.get("raw_text", "") or ""))
+            detail_text_parts = []
+            total_value = str(row.get("total_price", "") or "").strip()
+            shipping_value = str(row.get("shipping_price", "") or "").strip()
+            offer_text = str(row.get("offer_text", "") or "").strip()
+            item_id = str(row.get("item_id", "") or "").strip()
+            if item_id:
+                detail_text_parts.append(f"ID articolo: {item_id}")
+            if total_value:
+                detail_text_parts.append(f"Totale stimato: {total_value}")
+            if shipping_value:
+                detail_text_parts.append(f"Spedizione: {shipping_value}")
+            if offer_text:
+                detail_text_parts.append(f"Pulsante offerta: {offer_text}")
+            description = str(row.get("description", "") or "").strip()
+            if description:
+                if detail_text_parts:
+                    detail_text_parts.append("")
+                detail_text_parts.append("Descrizione estratta:")
+                detail_text_parts.append(description)
+            raw_text = str(row.get("raw_text", "") or "").strip()
+            if raw_text:
+                if detail_text_parts:
+                    detail_text_parts.append("")
+                detail_text_parts.append("Testo scheda:")
+                detail_text_parts.append(raw_text)
+            self._set_detail_raw_text("\n".join(detail_text_parts))
             return
         if source == "google_maps":
             self.detail_title_var.set(str(row.get("name", "") or "Attivita senza nome"))
