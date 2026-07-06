@@ -36,14 +36,14 @@ from .utils import build_google_maps_search_url, build_subito_search_url
 from .vinted_database import load_vinted_rows
 
 
-APP_BG = "#f3efe6"
-PANEL_BG = "#fbf8f2"
-ACCENT = "#1f4d45"
-ACCENT_SOFT = "#dfe9e4"
-BUTTON_BG = "#c96f42"
+APP_BG = "#f4f6f8"
+PANEL_BG = "#ffffff"
+ACCENT = "#0f172a"
+ACCENT_SOFT = "#dbe4ee"
+BUTTON_BG = "#2563eb"
 BUTTON_FG = "#ffffff"
-TEXT = "#1f2523"
-MUTED = "#5f6c67"
+TEXT = "#111827"
+MUTED = "#667085"
 DECISION_ORDER = {"accepted": 0, "maybe": 1, "rejected": 2}
 CONTACT_STATUS_LABELS = {
     "new": "nuovo",
@@ -339,7 +339,7 @@ class ScraperApp:
         self.current_result_source = "google_maps"
 
         self.root.title("The Main Scraper")
-        self.root.geometry("1320x920")
+        self.root.geometry("1360x920")
         self.root.minsize(1040, 780)
         self.root.configure(bg=APP_BG)
 
@@ -365,37 +365,39 @@ class ScraperApp:
         style.configure(".", background=APP_BG, foreground=TEXT, font=("Segoe UI", 10))
         style.configure("App.TFrame", background=APP_BG)
         style.configure("Panel.TFrame", background=PANEL_BG)
-        style.configure("Card.TLabelframe", background=PANEL_BG, bordercolor=ACCENT_SOFT, relief="solid")
-        style.configure("Card.TLabelframe.Label", background=PANEL_BG, foreground=ACCENT, font=("Segoe UI", 10, "bold"))
-        style.configure("Header.TLabel", background=APP_BG, foreground=ACCENT, font=("Georgia", 22, "bold"))
+        style.configure("Card.TLabelframe", background=PANEL_BG, bordercolor=ACCENT_SOFT, borderwidth=1, relief="solid")
+        style.configure("Card.TLabelframe.Label", background=PANEL_BG, foreground=ACCENT, font=("Segoe UI Semibold", 10))
+        style.configure("Header.TLabel", background=APP_BG, foreground=ACCENT, font=("Segoe UI Semibold", 21))
         style.configure("Subtitle.TLabel", background=APP_BG, foreground=MUTED, font=("Segoe UI", 10))
         style.configure("Hint.TLabel", background=PANEL_BG, foreground=MUTED, font=("Segoe UI", 9))
-        style.configure("Status.TLabel", background=ACCENT_SOFT, foreground=ACCENT, font=("Segoe UI", 10, "bold"), padding=(10, 6))
-        style.configure("Run.TButton", background=BUTTON_BG, foreground=BUTTON_FG, padding=(16, 12), font=("Segoe UI", 10, "bold"))
-        style.map("Run.TButton", background=[("active", "#b66237")])
-        style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff", padding=(14, 10), font=("Segoe UI", 10, "bold"))
-        style.map("Accent.TButton", background=[("active", "#173b35")])
-        style.configure("Secondary.TButton", padding=(12, 9))
+        style.configure("Status.TLabel", background="#e7f0ff", foreground="#1d4ed8", font=("Segoe UI Semibold", 10), padding=(12, 7))
+        style.configure("Run.TButton", background=BUTTON_BG, foreground=BUTTON_FG, padding=(16, 11), font=("Segoe UI Semibold", 10))
+        style.map("Run.TButton", background=[("active", "#1d4ed8"), ("pressed", "#1e40af")])
+        style.configure("Accent.TButton", background="#0f766e", foreground="#ffffff", padding=(14, 10), font=("Segoe UI Semibold", 10))
+        style.map("Accent.TButton", background=[("active", "#115e59"), ("pressed", "#134e4a")])
+        style.configure("Secondary.TButton", background="#eef2f7", foreground=TEXT, padding=(12, 9), font=("Segoe UI", 10))
+        style.map("Secondary.TButton", background=[("active", "#e2e8f0"), ("pressed", "#cbd5e1")])
         style.configure("TNotebook", background=APP_BG, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(16, 10), background="#e7e1d6", foreground=TEXT)
+        style.configure("TNotebook.Tab", padding=(18, 10), background="#e9eef5", foreground=TEXT, font=("Segoe UI Semibold", 10))
         style.map("TNotebook.Tab", background=[("selected", PANEL_BG)], foreground=[("selected", ACCENT)])
-        style.configure("Treeview", rowheight=28, background="#ffffff", fieldbackground="#ffffff")
-        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
-        style.configure("Metric.TLabel", background=PANEL_BG, foreground=ACCENT, font=("Segoe UI", 11, "bold"))
+        style.configure("Treeview", rowheight=30, background="#ffffff", fieldbackground="#ffffff", bordercolor=ACCENT_SOFT)
+        style.configure("Treeview.Heading", background="#eef2f7", foreground=ACCENT, font=("Segoe UI Semibold", 9))
+        style.map("Treeview.Heading", background=[("active", "#e2e8f0")])
+        style.configure("Metric.TLabel", background=PANEL_BG, foreground=ACCENT, font=("Segoe UI Semibold", 11))
         style.configure("Muted.TLabel", background=PANEL_BG, foreground=MUTED, font=("Segoe UI", 9))
 
     def _build(self) -> None:
-        container = ttk.Frame(self.root, style="App.TFrame", padding=18)
+        container = ttk.Frame(self.root, style="App.TFrame", padding=20)
         container.pack(fill="both", expand=True)
         header = ttk.Frame(container, style="App.TFrame")
         header.pack(fill="x")
         left = ttk.Frame(header, style="App.TFrame")
         left.pack(side="left", fill="x", expand=True)
         ttk.Label(left, text="The Main Scraper", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(left, text="Google Maps, Vinted e ricerca lavoro su Subito.it.", style="Subtitle.TLabel").pack(anchor="w", pady=(4, 0))
+        ttk.Label(left, text="Google Maps, Vinted e Subito in una sola interfaccia.", style="Subtitle.TLabel").pack(anchor="w", pady=(4, 0))
         ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").pack(side="right", anchor="ne")
 
-        config_shell = ttk.Frame(container, style="Panel.TFrame", height=390)
+        config_shell = ttk.Frame(container, style="Panel.TFrame", height=410)
         config_shell.pack(fill="x", pady=(14, 0))
         config_shell.pack_propagate(False)
 
@@ -404,9 +406,9 @@ class ScraperApp:
         config_content = self.config_scroll.body
         config_content.configure(style="App.TFrame")
 
-        hint = ttk.Frame(config_content, style="Panel.TFrame", padding=14)
+        hint = ttk.Frame(config_content, style="Panel.TFrame", padding=12)
         hint.pack(fill="x", pady=(0, 12))
-        tk.Label(hint, textvariable=self.hint_var, bg=PANEL_BG, fg=TEXT, wraplength=1120, justify="left").pack(anchor="w")
+        tk.Label(hint, textvariable=self.hint_var, bg=PANEL_BG, fg=TEXT, wraplength=1120, justify="left", font=("Segoe UI", 10)).pack(anchor="w")
 
         self.notebook = ttk.Notebook(config_content)
         self.notebook.pack(fill="x")
@@ -425,9 +427,15 @@ class ScraperApp:
 
         controls = ttk.Frame(config_content, style="App.TFrame")
         controls.pack(fill="x", pady=(12, 0))
-        self._build_browser_card(controls)
-        self._build_export_card(controls)
-        self._build_action_card(controls)
+        browser_shell = ttk.Frame(controls, style="App.TFrame")
+        export_shell = ttk.Frame(controls, style="App.TFrame")
+        action_shell = ttk.Frame(controls, style="App.TFrame")
+        browser_shell.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        export_shell.pack(side="left", fill="both", expand=True, padx=8)
+        action_shell.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self._build_browser_card(browser_shell)
+        self._build_export_card(export_shell)
+        self._build_action_card(action_shell)
 
         bottom = ttk.Notebook(container)
         bottom.pack(fill="both", expand=True, pady=(12, 0))
@@ -790,16 +798,16 @@ class ScraperApp:
         ttk.Entry(card, textvariable=self.page_settle_seconds_var, width=10).grid(row=5, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
         ttk.Label(
             card,
-            text="sessione_persistente usa un profilo Chrome dedicato del progetto. chrome_normale crea uno snapshot leggero del profilo reale, mentre profilo_personalizzato usa una cartella User Data scelta da te. La modalita lenta aggiunge pause e piu tempo di assestamento sulle connessioni instabili.",
+            text="Usa sessione_persistente per mantenere login e cookie. La modalita lenta aggiunge pause piu generose.",
             style="Hint.TLabel",
-            wraplength=760,
+            wraplength=360,
             justify="left",
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
         card.columnconfigure(1, weight=1)
 
     def _build_export_card(self, parent: ttk.Frame) -> None:
         card = self._card(parent, "Export")
-        card.pack(fill="x", pady=(12, 0))
+        card.pack(fill="x")
         ttk.Label(card, text="Formato").grid(row=0, column=0, sticky="w", pady=(0, 10))
         ttk.Combobox(card, textvariable=self.output_format_var, values=("json", "csv", "xlsx", "all"), state="readonly", width=12).grid(row=0, column=1, sticky="w", padx=(10, 18), pady=(0, 10))
         ttk.Label(card, text="Nome file").grid(row=0, column=2, sticky="w", pady=(0, 10))
@@ -811,7 +819,7 @@ class ScraperApp:
 
     def _build_action_card(self, parent: ttk.Frame) -> None:
         card = self._card(parent, "Azioni")
-        card.pack(fill="x", pady=(12, 0))
+        card.pack(fill="x")
         self.run_button = ttk.Button(card, text="Avvia scraping", style="Run.TButton", command=self._start_scrape)
         self.run_button.grid(row=0, column=0, columnspan=2, sticky="ew")
         ttk.Button(card, text="Apri output", style="Secondary.TButton", command=self._open_output_dir).grid(row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6))
@@ -870,7 +878,7 @@ class ScraperApp:
         split.add(table_shell, weight=3)
         split.add(detail_shell, weight=2)
 
-        card = self._card(table_shell, "Lead estratti")
+        card = self._card(table_shell, "Tabella risultati")
         card.pack(fill="both", expand=True)
         columns = ("lead_priority", "opportunity_score", "name", "category", "city", "phone", "email", "website_status", "rating", "reviews_count")
         self.results_tree = ttk.Treeview(card, columns=columns, show="headings", selectmode="extended")
@@ -922,7 +930,7 @@ class ScraperApp:
         detail_scroll.pack(fill="both", expand=True)
         detail_body = detail_scroll.body
 
-        detail_card = self._card(detail_body, "Dettaglio lead")
+        detail_card = self._card(detail_body, "Dettaglio selezione")
         self.detail_card = detail_card
         detail_card.pack(fill="x")
         tk.Label(
@@ -957,9 +965,10 @@ class ScraperApp:
             wrap="word",
             height=10,
             state="disabled",
-            bg="#ffffff",
+            bg="#f8fafc",
             fg=TEXT,
-            relief="flat",
+            relief="solid",
+            borderwidth=1,
             padx=10,
             pady=10,
             font=("Segoe UI", 10),
@@ -1005,7 +1014,7 @@ class ScraperApp:
             contact_card,
             wrap="word",
             height=4,
-            bg="#ffffff",
+            bg="#f8fafc",
             fg=TEXT,
             relief="solid",
             borderwidth=1,
@@ -1165,11 +1174,11 @@ class ScraperApp:
         self.log_widget.pack(fill="both", expand=True)
 
     def _card(self, parent: ttk.Frame, title: str) -> ttk.LabelFrame:
-        return ttk.LabelFrame(parent, text=title, style="Card.TLabelframe", padding=14)
+        return ttk.LabelFrame(parent, text=title, style="Card.TLabelframe", padding=16)
 
     def _row(self, parent: ttk.LabelFrame, row: int, label: str, variable: tk.StringVar, width: int = 78) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(0, 10))
-        ttk.Entry(parent, textvariable=variable, width=width).grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=(0, 10))
+        ttk.Entry(parent, textvariable=variable, width=width).grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=(0, 10))
         parent.columnconfigure(1, weight=1)
 
     def _detail_row(self, parent: ttk.LabelFrame, row: int, label: str, variable: tk.StringVar, column_offset: int = 0) -> None:
@@ -1186,19 +1195,19 @@ class ScraperApp:
         selected = self.notebook.tab(self.notebook.select(), "text")
         if selected == "Subito Jobs":
             self.hint_var.set(
-                "Subito Jobs mostra gli annunci nella tab Risultati con dettaglio completo. sessione_persistente tiene un profilo Chrome dedicato con login riusabile, puoi combinare keyword libere e profili lavoro salvati, cercare su piu citta o zone separate da virgola, filtrare gli annunci delle ultime N ore oppure di oggi, ieri o di N giorni fa, aprire ogni annuncio per prendere la descrizione completa, attivare lo screening OpenAI per smistare candida / valuta / no, e avviare un monitor automatico che rilancia la stessa ricerca ogni X ore finche la GUI resta aperta."
+                "Subito Jobs: scegli keyword, citta e filtri data. I risultati possono essere smistati, letti nel dettaglio e usati per il monitor automatico."
             )
         elif selected == "Google Maps":
             self.hint_var.set(
-                "Inserisci una o piu categorie e una o piu citta. Il sistema raccoglie le attivita, apre le schede Maps, trova sito e contatti pubblici, analizza i siti e ordina i lead in base all opportunita commerciale."
+                "Google Maps: inserisci categorie e citta. Il sistema apre le schede, trova sito e contatti pubblici e ordina i lead."
             )
         elif selected == "Vinted":
             self.hint_var.set(
-                "Inserisci una parola come macbook oppure un URL catalogo Vinted completo. Nome, prezzo, link e termine ricercato vengono mostrati nei risultati, esportati e salvati nel database SQLite senza duplicare gli articoli. Se la sessione persistente non vede il login, abilita la ricarica del profilo dal Chrome reale."
+                "Vinted: cerca dal catalogo, seleziona gli articoli e poi aggiorna descrizione, spedizione e totale dal dettaglio annuncio."
             )
         else:
             self.hint_var.set(
-                "Custom Site resta flessibile, ma l output viene comunque mostrato nel popup con tabella, dettaglio e log."
+                "Custom Site: usa selettori CSS personalizzati e visualizza l'output nella tabella risultati."
             )
 
     def _update_browser_mode(self) -> None:
