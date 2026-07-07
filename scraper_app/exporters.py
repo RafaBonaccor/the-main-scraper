@@ -40,6 +40,8 @@ def export_outcome(outcome: ScrapeOutcome, options: ExportOptions) -> list[Path]
 
 def _normalize_formats(raw_format: str) -> list[str]:
     normalized = (raw_format or "json").strip().lower()
+    if normalized == "none":
+        return []
     if normalized == "all":
         return ["json", "csv", "xlsx"]
     return [normalized]
