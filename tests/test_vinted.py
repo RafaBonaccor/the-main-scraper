@@ -9,6 +9,7 @@ from scraper_app.sources.vinted import (
     _card_payload_to_row,
     _extract_vinted_description_from_body_text,
     _extract_vinted_shipping_price_text,
+    _prioritize_vinted_rows,
     _vinted_timing_config,
     build_vinted_search_url,
     extract_vinted_search_term,
@@ -43,6 +44,34 @@ class VintedTests(unittest.TestCase):
         self.assertEqual(450.0, row["total_price_value"])
         self.assertEqual("https://www.vinted.it/items/123456-macbook-pro", row["link"])
         self.assertEqual("ricercato", row["tag"])
+        self.assertFalse(row["has_ricercato_badge"])
+
+    def test_card_payload_marks_ricercato_badge(self) -> None:
+        row = _card_payload_to_row(
+            {
+                "link": "https://www.vinted.it/items/9391411280-macbook-pro",
+                "title": "Apple MacBook Pro 14",
+                "price": "999,00 â‚¬",
+                "secondary_badge_text": "Ricercato",
+                "raw_text": "Ricercato Apple MacBook Pro 14 999,00 â‚¬",
+            },
+            search_term="macbook",
+            search_url="https://www.vinted.it/catalog?search_text=macbook",
+        )
+
+        self.assertTrue(row["has_ricercato_badge"])
+        self.assertEqual("Ricercato", row["secondary_badge_text"])
+
+    def test_prioritize_vinted_rows_moves_ricercato_badge_to_top(self) -> None:
+        rows = [
+            {"item_id": "1", "name": "Later", "has_ricercato_badge": False},
+            {"item_id": "2", "name": "Wanted", "has_ricercato_badge": True},
+            {"item_id": "3", "name": "Also later", "has_ricercato_badge": False},
+        ]
+
+        ordered = _prioritize_vinted_rows(rows)
+
+        self.assertEqual(["2", "1", "3"], [row["item_id"] for row in ordered])
 
     def test_price_parser_supports_italian_format(self) -> None:
         self.assertEqual(1299.99, parse_vinted_price("1.299,99 â‚¬"))

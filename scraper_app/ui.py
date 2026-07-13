@@ -15,6 +15,7 @@ from .browser_runtime import (
     browser_mode_requires_custom_dir,
     browser_mode_uses_profile,
     default_chrome_user_data_dir,
+    inspect_persistent_profile,
     normalize_browser_mode,
 )
 from .contact_history import annotate_rows_with_contact_history, summarize_contact_status
@@ -260,9 +261,12 @@ class ScraperApp:
         self.vinted_only_ricercato_var = tk.BooleanVar(value=True)
         self.vinted_keep_browser_open_var = tk.BooleanVar(value=True)
         self.vinted_keep_open_seconds_var = tk.StringVar(value="0")
-        self.vinted_refresh_browser_profile_var = tk.BooleanVar(value=True)
+        self.vinted_refresh_browser_profile_var = tk.BooleanVar(value=False)
         self.vinted_search_preview_var = tk.StringVar()
         self.vinted_status_var = tk.StringVar(value="Pronto per una nuova ricerca Vinted.")
+        self.vinted_profile_session_var = tk.StringVar(value="Controllo in corso...")
+        self.vinted_profile_cookies_var = tk.StringVar(value="-")
+        self.vinted_profile_last_import_var = tk.StringVar(value="-")
 
         self.subito_query_var = tk.StringVar()
         self.subito_region_var = tk.StringVar(value="lazio")
@@ -350,9 +354,14 @@ class ScraperApp:
         self._update_hint()
         self._update_browser_mode()
         self._update_result_actions()
+        self._update_vinted_profile_status()
         self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._handle_source_tab_changed())
         self.browser_mode_var.trace_add("write", lambda *_: self._update_browser_mode())
         self.browser_mode_var.trace_add("write", lambda *_: self._update_result_actions())
+        self.browser_mode_var.trace_add("write", lambda *_: self._update_vinted_profile_status())
+        self.browser_user_data_dir_var.trace_add("write", lambda *_: self._update_vinted_profile_status())
+        self.browser_profile_directory_var.trace_add("write", lambda *_: self._update_vinted_profile_status())
+        self.vinted_refresh_browser_profile_var.trace_add("write", lambda *_: self._update_vinted_profile_status())
         self.subito_custom_job_keywords_var.trace_add("write", lambda *_: self._update_subito_job_keywords_preview())
         self.result_sort_var.trace_add("write", lambda *_: self._handle_result_sort_change())
         self.vinted_search_var.trace_add("write", lambda *_: self._update_vinted_search_preview())
@@ -448,7 +457,11 @@ class ScraperApp:
         self._build_log_tab()
 
     def _build_google_tab(self) -> None:
-        card = self._card(self.google_tab, "Ricerca lead locali")
+        self.google_scroll = VerticalScrolledFrame(self.google_tab, background=APP_BG)
+        self.google_scroll.pack(fill="both", expand=True)
+        self.google_scroll.body.configure(style="Panel.TFrame")
+
+        card = self._card(self.google_scroll.body, "Ricerca lead locali")
         card.pack(fill="x")
         self._row(card, 0, "Categorie o URL", self.google_search_var)
         self._row(card, 1, "Citta o zone", self.google_city_var, 30)
@@ -479,7 +492,11 @@ class ScraperApp:
         ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def _build_vinted_tab(self) -> None:
-        card = self._card(self.vinted_tab, "Ricerca prodotti Vinted")
+        self.vinted_scroll = VerticalScrolledFrame(self.vinted_tab, background=APP_BG)
+        self.vinted_scroll.pack(fill="both", expand=True)
+        self.vinted_scroll.body.configure(style="Panel.TFrame")
+
+        card = self._card(self.vinted_scroll.body, "Ricerca prodotti Vinted")
         card.pack(fill="x")
         self._row(card, 0, "Ricerca o URL Vinted", self.vinted_search_var)
         self._row(card, 1, "Max risultati (0 = tutti)", self.vinted_max_results_var, 12)
@@ -617,27 +634,64 @@ class ScraperApp:
         ttk.Label(timing_frame, text="Attesa").grid(row=0, column=2, sticky="w")
         ttk.Entry(timing_frame, textvariable=self.page_settle_seconds_var, width=6).grid(row=0, column=3, sticky="w", padx=(4, 0))
 
-        ttk.Label(card, text="Export").grid(row=18, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(card, text="Stato sessione").grid(row=18, column=0, sticky="nw", pady=(0, 8))
+        profile_status_frame = ttk.Frame(card, style="Panel.TFrame")
+        profile_status_frame.grid(row=18, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(0, 8))
+        profile_status_frame.columnconfigure(1, weight=1)
+        ttk.Label(profile_status_frame, text="Sessione").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            profile_status_frame,
+            textvariable=self.vinted_profile_session_var,
+            style="Metric.TLabel",
+            wraplength=520,
+            justify="left",
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(profile_status_frame, text="Cookie").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(
+            profile_status_frame,
+            textvariable=self.vinted_profile_cookies_var,
+            wraplength=520,
+            justify="left",
+        ).grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(4, 0))
+        ttk.Label(profile_status_frame, text="Ultima importazione").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(
+            profile_status_frame,
+            textvariable=self.vinted_profile_last_import_var,
+            wraplength=520,
+            justify="left",
+        ).grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(4, 0))
+        ttk.Button(
+            profile_status_frame,
+            text="Aggiorna stato",
+            style="Secondary.TButton",
+            command=self._update_vinted_profile_status,
+        ).grid(row=0, column=2, rowspan=3, sticky="ne", padx=(12, 0))
+
+        ttk.Label(card, text="Export").grid(row=19, column=0, sticky="w", pady=(0, 8))
         export_frame = ttk.Frame(card, style="Panel.TFrame")
-        export_frame.grid(row=18, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(0, 8))
+        export_frame.grid(row=19, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(0, 8))
         ttk.Combobox(export_frame, textvariable=self.output_format_var, values=("json", "csv", "xlsx", "all"), state="readonly", width=10).grid(row=0, column=0, sticky="w")
         ttk.Label(export_frame, text="Nome").grid(row=0, column=1, sticky="w", padx=(12, 4))
         ttk.Entry(export_frame, textvariable=self.filename_var, width=24).grid(row=0, column=2, sticky="ew")
         export_frame.columnconfigure(2, weight=1)
 
-        ttk.Label(card, text="Cartella output").grid(row=19, column=0, sticky="w", pady=(0, 8))
-        ttk.Entry(card, textvariable=self.output_dir_var, width=54).grid(row=19, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
-        ttk.Button(card, text="Sfoglia", style="Secondary.TButton", command=self._choose_output_dir).grid(row=19, column=2, sticky="e", pady=(0, 8))
+        ttk.Label(card, text="Cartella output").grid(row=20, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(card, textvariable=self.output_dir_var, width=54).grid(row=20, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
+        ttk.Button(card, text="Sfoglia", style="Secondary.TButton", command=self._choose_output_dir).grid(row=20, column=2, sticky="e", pady=(0, 8))
         ttk.Label(
             card,
-            text="Per Vinted usa sessione_persistente se vuoi mantenere login/cookie tra una ricerca e l altra. Il formato export qui sopra e quello usato anche da Avvia ricerca Vinted.",
+            text="Per Vinted usa sessione_persistente se vuoi mantenere login/cookie tra una ricerca e l altra. Attiva 'Ricarica login dal Chrome reale' solo quando vuoi importare di nuovo il profilo del browser principale; nei run normali lascialo spento per non sovrascrivere la sessione persistente dello scraper. Il formato export qui sopra e quello usato anche da Avvia ricerca Vinted.",
             style="Hint.TLabel",
             wraplength=760,
             justify="left",
-        ).grid(row=20, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ).grid(row=21, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
     def _build_subito_tab(self) -> None:
-        card = self._card(self.subito_tab, "Annunci lavoro")
+        self.subito_scroll = VerticalScrolledFrame(self.subito_tab, background=APP_BG)
+        self.subito_scroll.pack(fill="both", expand=True)
+        self.subito_scroll.body.configure(style="Panel.TFrame")
+
+        card = self._card(self.subito_scroll.body, "Annunci lavoro")
         card.pack(fill="x")
         self._row(card, 0, "Keyword o URL", self.subito_query_var)
         ttk.Label(card, text="Profili lavoro").grid(row=1, column=0, sticky="nw", pady=(0, 10))
@@ -762,7 +816,11 @@ class ScraperApp:
         ).grid(row=17, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
     def _build_custom_tab(self) -> None:
-        card = self._card(self.custom_tab, "Configurazione avanzata")
+        self.custom_scroll = VerticalScrolledFrame(self.custom_tab, background=APP_BG)
+        self.custom_scroll.pack(fill="both", expand=True)
+        self.custom_scroll.body.configure(style="Panel.TFrame")
+
+        card = self._card(self.custom_scroll.body, "Configurazione avanzata")
         card.pack(fill="x")
         self._row(card, 0, "URL del sito", self.custom_url_var)
         self._row(card, 1, "Selector item", self.custom_item_selector_var)
@@ -1225,6 +1283,49 @@ class ScraperApp:
             widget = getattr(self, widget_name, None)
             if widget is not None:
                 widget.configure(state=state)
+        self._update_vinted_profile_status()
+
+    def _update_vinted_profile_status(self) -> None:
+        mode = normalize_browser_mode(self.browser_mode_var.get())
+        if mode != "sessione_persistente":
+            self.vinted_profile_session_var.set(f"Non in uso: modalita {mode}")
+            self.vinted_profile_cookies_var.set("Nessun controllo: la sessione persistente e disattivata.")
+            self.vinted_profile_last_import_var.set("-")
+            return
+
+        profile_directory = self.browser_profile_directory_var.get().strip() or "Default"
+        source_dir_raw = self.browser_user_data_dir_var.get().strip()
+        source_dir = Path(source_dir_raw).expanduser() if source_dir_raw else None
+        source_exists = bool(source_dir and source_dir.exists())
+        profile_info = inspect_persistent_profile(profile_directory)
+        cookies_present = bool(profile_info["cookies_present"])
+        has_snapshot = bool(profile_info["tracked_file_count"])
+        last_import = self._format_status_timestamp(str(profile_info["last_updated_at"] or ""))
+        profile_root = str(profile_info["root_path"] or "")
+
+        if cookies_present:
+            session_label = "Probabile attiva"
+        elif has_snapshot:
+            session_label = "Profilo presente ma sessione non confermata"
+        else:
+            session_label = "Non inizializzata"
+
+        if self.vinted_refresh_browser_profile_var.get():
+            session_label += " | refresh attivo al prossimo run"
+
+        source_label = "Chrome rilevato" if source_exists else "Chrome sorgente non trovato"
+        self.vinted_profile_session_var.set(f"{session_label} | profilo {profile_directory}")
+        self.vinted_profile_cookies_var.set(f"{'Presenti' if cookies_present else 'Assenti'} | {source_label} | {profile_root}")
+        self.vinted_profile_last_import_var.set(last_import)
+
+    def _format_status_timestamp(self, raw_value: str) -> str:
+        if not raw_value:
+            return "Mai"
+        try:
+            dt = datetime.fromisoformat(raw_value)
+        except ValueError:
+            return raw_value
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
     def _update_result_actions(self) -> None:
         row = self._get_selected_row()
@@ -1403,8 +1504,9 @@ class ScraperApp:
         self.vinted_only_ricercato_var.set(True)
         self.vinted_keep_browser_open_var.set(True)
         self.vinted_keep_open_seconds_var.set("0")
-        self.vinted_refresh_browser_profile_var.set(True)
+        self.vinted_refresh_browser_profile_var.set(False)
         self.vinted_status_var.set("Campi Vinted ripristinati.")
+        self._update_vinted_profile_status()
 
     def _choose_output_dir(self) -> None:
         folder = filedialog.askdirectory(initialdir=self.output_dir_var.get() or str(self.script_path.parent))
@@ -2215,6 +2317,7 @@ class ScraperApp:
                 self.process_kind = ""
                 self.process_should_load_results = False
                 self.status_var.set("Idle" if code == 0 else "Error")
+                self._update_vinted_profile_status()
                 self.run_button.configure(state="normal")
                 self.open_browser_button.configure(state="normal")
                 self.vinted_run_button.configure(state="normal")

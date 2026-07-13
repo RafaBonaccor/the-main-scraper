@@ -2,10 +2,16 @@ import os
 import re
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 
 DEFAULT_WINDOWS_CHROME_USER_DATA_DIR = Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data"
+DEFAULT_MACOS_CHROME_USER_DATA_DIR = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+DEFAULT_LINUX_CHROME_USER_DATA_DIRS = (
+    Path.home() / ".config" / "google-chrome",
+    Path.home() / ".config" / "chromium",
+)
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_PROFILES_DIR = Path(tempfile.gettempdir()) / "the_main_scraper_profiles"
 PERSISTENT_PROFILES_DIR = WORKSPACE_ROOT / ".bp"
@@ -79,6 +85,11 @@ PROFILE_SKIP_FILE_NAMES = {
 def default_chrome_user_data_dir() -> str:
     if DEFAULT_WINDOWS_CHROME_USER_DATA_DIR.exists():
         return str(DEFAULT_WINDOWS_CHROME_USER_DATA_DIR)
+    if DEFAULT_MACOS_CHROME_USER_DATA_DIR.exists():
+        return str(DEFAULT_MACOS_CHROME_USER_DATA_DIR)
+    for candidate in DEFAULT_LINUX_CHROME_USER_DATA_DIRS:
+        if candidate.exists():
+            return str(candidate)
     return ""
 
 
@@ -179,18 +190,20 @@ def prepare_chrome_normale_profile_copy(source_user_data_dir: str, profile_direc
 
 def prepare_persistent_profile_root(source_user_data_dir: str, profile_directory: str, refresh: bool = False) -> str:
     profile_name = (profile_directory or "Default").strip() or "Default"
-    target_root = PERSISTENT_PROFILES_DIR / f"p_{_slug(profile_name)}"
+    target_root = persistent_profile_root(profile_name)
     _ensure_runtime_target(target_root)
+    source_root = Path(source_user_data_dir).expanduser()
 
     if target_root.exists() and not refresh:
+        return str(target_root)
+
+    if target_root.exists() and refresh and not source_root.exists():
         return str(target_root)
 
     if target_root.exists() and refresh:
         shutil.rmtree(target_root)
 
     target_root.mkdir(parents=True, exist_ok=True)
-
-    source_root = Path(source_user_data_dir).expanduser()
     if source_root.exists():
         for root_file_name in ("Local State", "First Run"):
             source_file = source_root / root_file_name
@@ -202,6 +215,42 @@ def prepare_persistent_profile_root(source_user_data_dir: str, profile_directory
             _copy_profile_snapshot_best_effort(source_profile_dir, target_root / profile_name)
 
     return str(target_root)
+
+
+def persistent_profile_root(profile_directory: str) -> Path:
+    profile_name = (profile_directory or "Default").strip() or "Default"
+    return PERSISTENT_PROFILES_DIR / f"p_{_slug(profile_name)}"
+
+
+def inspect_persistent_profile(profile_directory: str) -> dict[str, str | bool | int]:
+    profile_name = (profile_directory or "Default").strip() or "Default"
+    target_root = persistent_profile_root(profile_name)
+    profile_root = target_root / profile_name
+    tracked_files = {
+        "local_state": target_root / "Local State",
+        "preferences": profile_root / "Preferences",
+        "cookies": profile_root / "Cookies",
+        "login_data": profile_root / "Login Data",
+        "web_data": profile_root / "Web Data",
+    }
+    existing_files = [path for path in tracked_files.values() if path.exists()]
+    last_updated_at = ""
+    if existing_files:
+        last_updated_at = datetime.fromtimestamp(
+            max(path.stat().st_mtime for path in existing_files)
+        ).isoformat(timespec="seconds")
+    return {
+        "profile_name": profile_name,
+        "root_path": str(target_root),
+        "profile_path": str(profile_root),
+        "root_exists": target_root.exists(),
+        "profile_exists": profile_root.exists(),
+        "cookies_present": tracked_files["cookies"].exists() and tracked_files["cookies"].stat().st_size > 0,
+        "login_data_present": tracked_files["login_data"].exists() and tracked_files["login_data"].stat().st_size > 0,
+        "web_data_present": tracked_files["web_data"].exists() and tracked_files["web_data"].stat().st_size > 0,
+        "tracked_file_count": len(existing_files),
+        "last_updated_at": last_updated_at,
+    }
 
 
 def _copy_profile_snapshot_best_effort(source_dir: Path, target_dir: Path) -> None:

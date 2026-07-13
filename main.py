@@ -512,6 +512,8 @@ def _normalize_row(source: str, row: dict) -> dict:
             "link": str(row.get("link", "") or ""),
             "search_term": str(row.get("search_term", "") or ""),
             "tag": str(row.get("tag", "") or ""),
+            "secondary_badge_text": str(row.get("secondary_badge_text", "") or ""),
+            "has_ricercato_badge": bool(row.get("has_ricercato_badge", False)),
             "price_text": str(row.get("price", "") or ""),
             "price_value": _safe_float_or_none(row.get("price_value")),
             "shipping_text": str(row.get("shipping_price", "") or ""),

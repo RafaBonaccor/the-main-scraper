@@ -20,6 +20,7 @@ SHIPPING_PATTERN = re.compile(
     r"(?:spedizione(?:\s+da)?|consegna)(?:[^0-9]{0,20})(\d[\d.\s]*(?:,\d{1,2})?\s*(?:â‚¬|€)?)",
     re.IGNORECASE,
 )
+RICERCATO_BADGE_PATTERN = re.compile(r"\bricercato\b", re.IGNORECASE)
 
 
 def run_vinted_scraper(
@@ -160,7 +161,7 @@ return {before, after: window.scrollY, height: document.documentElement.scrollHe
             stalled_scrolls = 0
             last_count = current_count
 
-    rows = list(rows_by_link.values())
+    rows = _prioritize_vinted_rows(rows_by_link.values())
     if max_results > 0:
         rows = rows[:max_results]
     keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
@@ -283,12 +284,15 @@ return links.map((link) => {
   const title = root.querySelector('[data-testid*="description-title"], [data-testid*="item-title"]');
   const price = root.querySelector('[data-testid*="price-text"], [data-testid*="item-price"]');
   const image = root.querySelector('img[alt]');
+  const secondaryBadge = root.querySelector('[data-testid*="secondary-badge--content"], [data-testid*="secondary-badge"]');
+  const secondaryBadgeText = clean(secondaryBadge ? (secondaryBadge.innerText || secondaryBadge.textContent) : '');
   return {
     link: link.href || link.getAttribute('href') || '',
     title: clean(title ? (title.innerText || title.textContent) : ''),
     price: clean(price ? (price.innerText || price.textContent) : ''),
     image_alt: clean(image ? image.getAttribute('alt') : ''),
     aria_label: clean(link.getAttribute('aria-label')),
+    secondary_badge_text: secondaryBadgeText,
     raw_text: clean(root.innerText || root.textContent),
   };
 });
@@ -522,6 +526,8 @@ def _card_payload_to_row(payload: dict, search_term: str, search_url: str) -> di
     price = normalize_whitespace(str(payload.get("price", "") or "")) or _find_price(raw_text)
     price_value = parse_vinted_price(price)
     item_id_match = ITEM_ID_PATTERN.search(urlsplit(link).path)
+    secondary_badge_text = normalize_whitespace(str(payload.get("secondary_badge_text", "") or ""))
+    has_ricercato_badge = bool(RICERCATO_BADGE_PATTERN.search(secondary_badge_text))
 
     return {
         "source": "vinted",
@@ -540,9 +546,24 @@ def _card_payload_to_row(payload: dict, search_term: str, search_url: str) -> di
         "offer_text": "",
         "currency": "EUR" if "€" in price or "â‚¬" in price else "",
         "link": link,
+        "secondary_badge_text": secondary_badge_text,
+        "has_ricercato_badge": has_ricercato_badge,
         "raw_text": raw_text,
         "extracted_at": datetime.now().isoformat(timespec="seconds"),
     }
+
+
+def _prioritize_vinted_rows(rows) -> list[dict]:
+    return [
+        row
+        for _, row in sorted(
+            enumerate(rows),
+            key=lambda item: (
+                0 if item[1].get("has_ricercato_badge") else 1,
+                item[0],
+            ),
+        )
+    ]
 
 
 def build_vinted_search_url(search: str) -> str:

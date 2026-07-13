@@ -114,6 +114,8 @@ Ogni riga normalizzata contiene almeno:
 - `title`
 - `link`
 - `search_term`
+- `secondary_badge_text`
+- `has_ricercato_badge`
 - `price_text`
 - `price_value`
 - `shipping_text`

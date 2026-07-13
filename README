@@ -133,6 +133,9 @@ python main.py run google_maps --search "ristoranti" --city "Roma" --max-results
 python main.py run vinted --search macbook --max-results 50 --browser-mode sessione_persistente --format all --output-dir output
 ```
 
+I risultati Vinted con badge visibile `Ricercato` vengono portati in testa
+all'estrazione prima del taglio `max-results`.
+
 Versione machine-to-machine:
 
 ```powershell
@@ -178,6 +181,7 @@ I comandi e la GUI condividono la stessa logica browser.
 - usa un profilo Chrome dedicato del progetto
 - e la modalita consigliata per Vinted e Subito
 - mantiene login e cookie tra una sessione e l'altra
+- nella GUI Vinted espone anche uno stato locale del profilo con sessione probabile, cookie e ultima importazione rilevata
 
 ### `chrome_normale`
 
@@ -220,10 +224,12 @@ Flusso tipico:
 
 1. apri tab `Vinted`
 2. inserisci keyword o URL catalogo
-3. avvia la ricerca
-4. seleziona gli articoli nella tab `Risultati`
-5. premi `Estrai descrizioni selezionati`
-6. il tool entra nel dettaglio annuncio e aggiorna:
+3. lascia `sessione_persistente` se vuoi riusare il login
+4. controlla il riquadro `Stato sessione`; attiva `Ricarica login dal Chrome reale` solo quando vuoi reimportare il profilo
+5. avvia la ricerca
+6. seleziona gli articoli nella tab `Risultati`
+7. premi `Estrai descrizioni selezionati`
+8. il tool entra nel dettaglio annuncio e aggiorna:
    - descrizione
    - prezzo con protezione acquisti
    - spedizione
