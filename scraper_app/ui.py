@@ -1226,7 +1226,7 @@ class ScraperApp:
                 (3, 0): "Prezzo", (3, 2): "Totale",
                 (4, 0): "Estratto", (4, 2): "Spedizione",
                 (5, 0): "Nome", (5, 2): "Ricerca",
-                (6, 0): "Prima rilevazione", (6, 2): "Volte rilevato",
+                (6, 0): "Caricato", (6, 2): "Volte rilevato",
                 (7, 0): "Link Vinted", (8, 0): "Database", (9, 0): "Testo scheda",
             }
             self.detail_card.configure(text="Dettaglio prodotto Vinted")
@@ -3171,7 +3171,7 @@ class ScraperApp:
             self.detail_company_var.set(str(row.get("shipping_price", "") or "-"))
             self.detail_sector_var.set(str(row.get("name", "") or "-"))
             self.detail_role_var.set(str(row.get("search_term", "") or "-"))
-            self.detail_schedule_var.set(str(row.get("first_seen_at", row.get("extracted_at", "")) or "-"))
+            self.detail_schedule_var.set(str(row.get("published_at", "") or "-"))
             self.detail_price_var.set(str(row.get("times_seen", 1) or 1))
             self.detail_link_var.set(str(row.get("link", "") or ""))
             self.detail_website_var.set(str(row.get("db_path", "") or "-"))
@@ -3180,12 +3180,15 @@ class ScraperApp:
             shipping_value = str(row.get("shipping_price", "") or "").strip()
             offer_text = str(row.get("offer_text", "") or "").strip()
             item_id = str(row.get("item_id", "") or "").strip()
+            published_at = str(row.get("published_at", "") or "").strip()
             if evaluation_label and evaluation_label != "-":
                 detail_text_parts.append(f"Valutazione: {evaluation_label}")
             if favorite_display != "-":
                 detail_text_parts.append(f"Preferiti: {favorite_display}")
             if str(row.get("tag", "") or "").strip():
                 detail_text_parts.append(f"Tag: {str(row.get('tag', '') or '').strip()}")
+            if published_at:
+                detail_text_parts.append(f"Caricato: {published_at}")
             if item_id:
                 detail_text_parts.append(f"ID articolo: {item_id}")
             if total_value:
@@ -3196,6 +3199,9 @@ class ScraperApp:
                 detail_text_parts.append(f"Pulsante offerta: {offer_text}")
             else:
                 detail_text_parts.append(f"Offerta disponibile: {offer_display}")
+            first_seen_at = str(row.get("first_seen_at", row.get("extracted_at", "")) or "").strip()
+            if first_seen_at:
+                detail_text_parts.append(f"Prima rilevazione DB: {first_seen_at}")
             description = str(row.get("description", "") or "").strip()
             if description:
                 if detail_text_parts:

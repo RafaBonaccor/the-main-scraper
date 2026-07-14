@@ -42,11 +42,11 @@ def save_vinted_rows(rows: list[dict], db_path: str | Path = DEFAULT_VINTED_DB_P
             connection.execute(
                 """
                 INSERT INTO vinted_items (
-                    link, item_id, name, description, price_text, price_value,
+                    link, item_id, name, description, published_at, price_text, price_value,
                     shipping_price_text, shipping_price_value, total_price_text, total_price_value,
                     offer_available, offer_text, favorite_count, evaluation_label, currency,
                     raw_text, first_seen_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(link) DO UPDATE SET
                     item_id = excluded.item_id,
                     name = excluded.name,
@@ -54,6 +54,11 @@ def save_vinted_rows(rows: list[dict], db_path: str | Path = DEFAULT_VINTED_DB_P
                         WHEN excluded.description IS NOT NULL AND excluded.description <> ''
                             THEN excluded.description
                         ELSE vinted_items.description
+                    END,
+                    published_at = CASE
+                        WHEN excluded.published_at IS NOT NULL AND excluded.published_at <> ''
+                            THEN excluded.published_at
+                        ELSE vinted_items.published_at
                     END,
                     price_text = excluded.price_text,
                     price_value = excluded.price_value,
@@ -90,6 +95,7 @@ def save_vinted_rows(rows: list[dict], db_path: str | Path = DEFAULT_VINTED_DB_P
                     str(row.get("item_id", "") or ""),
                     str(row.get("name", "") or ""),
                     str(row.get("description", "") or ""),
+                    str(row.get("published_at", "") or ""),
                     str(row.get("price", "") or ""),
                     row.get("price_value"),
                     str(row.get("shipping_price", "") or ""),
@@ -190,6 +196,7 @@ def load_vinted_rows(
                     i.item_id,
                     i.name,
                     i.description,
+                    i.published_at,
                     i.price_text,
                     i.price_value,
                     i.shipping_price_text,
@@ -222,6 +229,7 @@ def load_vinted_rows(
             "item_id": record["item_id"],
             "name": record["name"],
             "description": record["description"],
+            "published_at": record["published_at"],
             "price": record["price_text"],
             "price_value": record["price_value"],
             "shipping_price": record["shipping_price_text"],
@@ -266,6 +274,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             item_id TEXT NOT NULL DEFAULT '',
             name TEXT NOT NULL DEFAULT '',
             description TEXT NOT NULL DEFAULT '',
+            published_at TEXT NOT NULL DEFAULT '',
             price_text TEXT NOT NULL DEFAULT '',
             price_value REAL,
             shipping_price_text TEXT NOT NULL DEFAULT '',
@@ -304,6 +313,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
     _ensure_vinted_search_hits_tag_column(connection)
     _ensure_vinted_items_description_column(connection)
+    _ensure_vinted_items_published_at_column(connection)
     _ensure_vinted_items_offer_columns(connection)
     _ensure_vinted_items_favorite_columns(connection)
     connection.execute(
@@ -330,6 +340,17 @@ def _ensure_vinted_items_description_column(connection: sqlite3.Connection) -> N
     if "description" not in columns:
         connection.execute(
             "ALTER TABLE vinted_items ADD COLUMN description TEXT NOT NULL DEFAULT ''"
+        )
+
+
+def _ensure_vinted_items_published_at_column(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(vinted_items)").fetchall()
+    }
+    if "published_at" not in columns:
+        connection.execute(
+            "ALTER TABLE vinted_items ADD COLUMN published_at TEXT NOT NULL DEFAULT ''"
         )
 
 

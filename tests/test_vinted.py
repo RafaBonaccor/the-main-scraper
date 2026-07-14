@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scraper_app.sources.vinted import (
     _build_vinted_total,
@@ -12,6 +12,8 @@ from scraper_app.sources.vinted import (
     _card_payload_to_row,
     _detach_vinted_browser_if_requested,
     _extract_vinted_description_from_body_text,
+    _extract_vinted_primary_price,
+    _read_vinted_published_text,
     _extract_vinted_shipping_price_text,
     _keep_browser_open,
     _prioritize_vinted_rows,
@@ -218,6 +220,10 @@ class VintedTests(unittest.TestCase):
         self.assertEqual("", classify_vinted_evaluation(15, False))
         self.assertEqual("da valutare", classify_vinted_evaluation(16, False))
         self.assertEqual("da valutare assolutamente", classify_vinted_evaluation(16, True))
+        self.assertEqual("da valutare assolutamente", classify_vinted_evaluation(16, True, "1 settimana fa"))
+        self.assertEqual("da valutare", classify_vinted_evaluation(16, True, "8 giorni fa"))
+        self.assertEqual("da valutare", classify_vinted_evaluation(16, True, "2 settimane fa"))
+        self.assertEqual("da valutare", classify_vinted_evaluation(16, True, "1 mese fa"))
 
     def test_vinted_timing_config_applies_slow_mode_floor(self) -> None:
         self.assertEqual((2.5, 4.0), _vinted_timing_config(True, 0.5, 1.0))
@@ -253,6 +259,24 @@ class VintedTests(unittest.TestCase):
         self.assertEqual("5,49 €", _extract_vinted_shipping_price_text("Spedizione da 5,49 € con corriere"))
         self.assertEqual(("455,49 EUR", 455.49), _build_vinted_total("450,00 €", "5,49 €"))
         self.assertEqual(("450,00 €", 450.0), _build_vinted_total("450,00 €", ""))
+
+    def test_primary_price_prefers_value_immediately_before_incl(self) -> None:
+        page_text = (
+            "Magliettina vintage 3,00 € 4,90 € incl. Protezione acquisti dettagli spedizione"
+        )
+        self.assertEqual("4,90 €", _extract_vinted_primary_price(page_text, "Magliettina vintage"))
+
+    def test_primary_price_prefers_value_before_include_protezione_acquisti(self) -> None:
+        page_text = (
+            "MacBook Air 1.199,00 € 1.254,70 € Include la Protezione acquisti e assistenza"
+        )
+        self.assertEqual("1.254,70 €", _extract_vinted_primary_price(page_text, "MacBook Air"))
+
+    def test_read_vinted_published_text_from_page_text(self) -> None:
+        page_text = "Titolo annuncio Caricato 3 ore fa Marca Apple"
+        driver = Mock()
+        driver.run_js.return_value = ""
+        self.assertEqual("3 ore fa", _read_vinted_published_text(driver, page_text))
 
     def test_description_parser_uses_text_after_descrizione_heading(self) -> None:
         body_text = "\n".join(
@@ -290,6 +314,7 @@ class VintedTests(unittest.TestCase):
                 "evaluation_label": "da valutare",
                 "currency": "EUR",
                 "description": "Testo descrizione",
+                "published_at": "3 ore fa",
                 "raw_text": "MacBook 300,00 â‚¬",
                 "extracted_at": "2026-07-01T10:00:00",
                 "search_url": "https://www.vinted.it/catalog?search_text=macbook",
@@ -331,6 +356,7 @@ class VintedTests(unittest.TestCase):
             self.assertEqual("MacBook", macbook_row["name"])
             self.assertEqual("", macbook_row["tag"])
             self.assertEqual("Testo descrizione", macbook_row["description"])
+            self.assertEqual("3 ore fa", macbook_row["published_at"])
             self.assertEqual("5,49 â‚¬", macbook_row["shipping_price"])
             self.assertEqual(305.49, macbook_row["total_price_value"])
             self.assertTrue(macbook_row["offer_available"])

@@ -194,6 +194,8 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
     rows = _prioritize_vinted_rows(rows_by_link.values())
     if max_results > 0:
         rows = rows[:max_results]
+    enrichment_meta = _enrich_vinted_priority_rows(driver, rows, config)
+    rows = _prioritize_vinted_rows(rows)
     keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
     keep_browser_open = bool(config.get("keep_browser_open", False))
     meta = {
@@ -215,6 +217,8 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         "pages_visited": pages_visited,
         "pages_visited_count": len(pages_visited),
         "row_count": len(rows),
+        "priority_rows_enriched": enrichment_meta["enriched_count"],
+        "priority_rows_demoted_by_age": enrichment_meta["demoted_count"],
     }
     _persist_vinted_live_results(
         rows=rows,
@@ -263,42 +267,16 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
         last_access_status = read_vinted_access_status(driver)
         emit_vinted_access_signal(last_access_status)
         last_access_status = _wait_for_vinted_login_if_needed(driver, last_access_status)
-
-        page_text = _read_vinted_detail_text(driver)
-        title = _read_vinted_title(driver)
-        if not title:
-            title = item_name
-        if not title:
-            title = _fallback_title({"image_alt": "", "aria_label": ""}, current_link, page_text)
-        description = _extract_vinted_description_from_body_text(page_text)
-        price_text = _extract_vinted_primary_price(page_text, title) or _read_vinted_price(driver) or _find_price(page_text)
-        shipping_price = _read_vinted_shipping_price(driver, page_text)
-        shipping_price_value = parse_vinted_price(shipping_price)
-        offer_text = _read_vinted_offer_text(driver)
-        total_price, total_price_value = _build_vinted_total(price_text, shipping_price)
-        row = {
-            "source": "vinted",
-            "tag": tag,
-            "search_term": search_term or extract_vinted_search_term(search_url),
-            "search_url": search_url,
-            "item_id": ITEM_ID_PATTERN.search(urlsplit(current_link).path).group(1)
-            if ITEM_ID_PATTERN.search(urlsplit(current_link).path)
-            else "",
-            "name": normalize_whitespace(title) or current_link,
-            "description": description,
-            "price": normalize_whitespace(price_text),
-            "price_value": parse_vinted_price(price_text),
-            "shipping_price": shipping_price,
-            "shipping_price_value": shipping_price_value,
-            "total_price": total_price,
-            "total_price_value": total_price_value,
-            "offer_available": bool(offer_text),
-            "offer_text": offer_text,
-            "currency": "EUR" if "€" in price_text or "â‚¬" in price_text else "",
-            "link": current_link,
-            "raw_text": page_text,
-            "extracted_at": datetime.now().isoformat(timespec="seconds"),
-        }
+        base_row = item if isinstance(item, dict) else {}
+        row = _build_vinted_detail_row(
+            driver=driver,
+            current_link=current_link,
+            search_term=search_term,
+            search_url=search_url,
+            tag=tag,
+            item_name=item_name,
+            base_row=base_row,
+        )
         rows.append(row)
 
     meta = {
@@ -449,6 +427,35 @@ return '';
     return normalize_whitespace(str(payload or ""))
 
 
+def _read_vinted_published_text(driver: Driver, page_text: str = "") -> str:
+    payload = driver.run_js(
+        """
+const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+const nodes = [...document.querySelectorAll('span, div, p, li')];
+for (const node of nodes) {
+  const text = clean(node.innerText || node.textContent || '');
+  if (!text) continue;
+  if (/^(\\d+\\s+\\w+\\s+fa)$/i.test(text)) return text;
+  if (/^Caricato\\s+/i.test(text)) return clean(text.replace(/^Caricato\\s+/i, ''));
+}
+return '';
+        """
+    )
+    extracted = normalize_whitespace(str(payload or ""))
+    if extracted:
+        return extracted
+    text = normalize_whitespace(str(page_text or ""))
+    if not text:
+        return ""
+    prefixed_match = re.search(r"Caricato\s+(\d+\s+\w+\s+fa)", text, re.IGNORECASE)
+    if prefixed_match:
+        return normalize_whitespace(prefixed_match.group(1))
+    relative_match = re.search(r"\b(\d+\s+\w+\s+fa)\b", text, re.IGNORECASE)
+    if relative_match:
+        return normalize_whitespace(relative_match.group(1))
+    return ""
+
+
 def _vinted_timing_config(
     slow_mode: bool,
     action_delay_seconds: float,
@@ -481,6 +488,109 @@ def _normalize_vinted_items(raw_items: list[dict | str]) -> list[dict | str]:
         seen.add(link)
         items.append(link)
     return items
+
+
+def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict) -> dict[str, int]:
+    targets = [row for row in rows if _should_extract_vinted_priority_row(row)]
+    if not targets:
+        return {"enriched_count": 0, "demoted_count": 0}
+    demoted_count = 0
+    for row in targets:
+        current_link = normalize_vinted_item_url(str(row.get("link", "") or ""))
+        if not current_link:
+            continue
+        driver.get(current_link, wait=Wait.LONG, timeout=30)
+        time.sleep(float(config.get("page_settle_seconds", 3.0) or 0))
+        cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
+        if cookie_action:
+            time.sleep(float(config.get("action_delay_seconds", 1.5) or 0))
+        access_status = read_vinted_access_status(driver)
+        emit_vinted_access_signal(access_status)
+        _wait_for_vinted_login_if_needed(driver, access_status)
+        previous_label = str(row.get("evaluation_label", "") or "").strip().lower()
+        enriched_row = _build_vinted_detail_row(
+            driver=driver,
+            current_link=current_link,
+            search_term=str(row.get("search_term", "") or ""),
+            search_url=str(row.get("search_url", "") or ""),
+            tag=str(row.get("tag", "") or ""),
+            item_name=str(row.get("name", "") or ""),
+            base_row=row,
+        )
+        row.update(enriched_row)
+        current_label = str(row.get("evaluation_label", "") or "").strip().lower()
+        if previous_label == "da valutare assolutamente" and current_label == "da valutare":
+            demoted_count += 1
+    return {"enriched_count": len(targets), "demoted_count": demoted_count}
+
+
+def _should_extract_vinted_priority_row(row: dict) -> bool:
+    return str(row.get("evaluation_label", "") or "").strip().lower() == "da valutare assolutamente"
+
+
+def _build_vinted_detail_row(
+    driver: Driver,
+    current_link: str,
+    search_term: str,
+    search_url: str,
+    tag: str,
+    item_name: str,
+    base_row: dict | None = None,
+) -> dict:
+    existing_row = dict(base_row or {})
+    page_text = _read_vinted_detail_text(driver)
+    title = _read_vinted_title(driver)
+    if not title:
+        title = item_name
+    if not title:
+        title = str(existing_row.get("name", "") or "")
+    if not title:
+        title = _fallback_title({"image_alt": "", "aria_label": ""}, current_link, page_text)
+    description = _extract_vinted_description_from_body_text(page_text)
+    published_at = _read_vinted_published_text(driver, page_text)
+    price_text = _extract_vinted_primary_price(page_text, title) or _read_vinted_price(driver) or _find_price(page_text)
+    shipping_price = _read_vinted_shipping_price(driver, page_text)
+    shipping_price_value = parse_vinted_price(shipping_price)
+    offer_text = _read_vinted_offer_text(driver)
+    total_price, total_price_value = _build_vinted_total(price_text, shipping_price)
+    favorite_count = parse_vinted_favorite_count(existing_row.get("favorite_count"))
+    secondary_badge_text = normalize_whitespace(str(existing_row.get("secondary_badge_text", "") or ""))
+    has_ricercato_badge = bool(existing_row.get("has_ricercato_badge")) or bool(
+        RICERCATO_BADGE_PATTERN.search(secondary_badge_text)
+    ) or str(tag or "").strip().lower() == "ricercato"
+    evaluation_label = classify_vinted_evaluation(
+        favorite_count=favorite_count,
+        has_ricercato_badge=has_ricercato_badge,
+        published_at=published_at,
+    )
+    item_id_match = ITEM_ID_PATTERN.search(urlsplit(current_link).path)
+    normalized_search_term = search_term or extract_vinted_search_term(search_url)
+    return {
+        "source": "vinted",
+        "tag": "ricercato" if has_ricercato_badge else tag,
+        "search_term": normalized_search_term,
+        "search_url": search_url or build_vinted_search_url(normalized_search_term),
+        "item_id": item_id_match.group(1) if item_id_match else "",
+        "name": normalize_whitespace(title) or current_link,
+        "description": description,
+        "published_at": published_at,
+        "price": normalize_whitespace(price_text),
+        "price_value": parse_vinted_price(price_text),
+        "shipping_price": shipping_price,
+        "shipping_price_value": shipping_price_value,
+        "total_price": total_price,
+        "total_price_value": total_price_value,
+        "offer_available": bool(offer_text),
+        "offer_text": offer_text,
+        "currency": "EUR" if "€" in price_text or "â‚¬" in price_text else "",
+        "link": current_link,
+        "favorite_count": favorite_count,
+        "evaluation_label": evaluation_label,
+        "secondary_badge_text": secondary_badge_text,
+        "has_ricercato_badge": has_ricercato_badge,
+        "raw_text": page_text,
+        "extracted_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 def _extract_vinted_description_from_body_text(body_text: str) -> str:
@@ -874,12 +984,38 @@ def parse_vinted_favorite_count(value: object) -> int | None:
     return parsed if parsed >= 0 else None
 
 
-def classify_vinted_evaluation(favorite_count: int | None, has_ricercato_badge: bool) -> str:
+def classify_vinted_evaluation(
+    favorite_count: int | None,
+    has_ricercato_badge: bool,
+    published_at: str = "",
+) -> str:
     if favorite_count is None or favorite_count <= FAVORITE_COUNT_REVIEW_THRESHOLD:
         return ""
-    if has_ricercato_badge:
+    if has_ricercato_badge and not _is_vinted_older_than_one_week(published_at):
         return "da valutare assolutamente"
     return "da valutare"
+
+
+def _is_vinted_older_than_one_week(published_at: str) -> bool:
+    text = normalize_whitespace(str(published_at or "")).lower()
+    if not text:
+        return False
+    if text == "ieri":
+        return False
+    match = re.match(r"^(\d+)\s+([^\s]+)\s+fa$", text)
+    if not match:
+        return False
+    amount = int(match.group(1))
+    unit = match.group(2).strip().lower()
+    if unit.startswith("minut") or unit.startswith("second") or unit.startswith("or"):
+        return False
+    if unit.startswith("giorn"):
+        return amount > 7
+    if unit.startswith("settiman"):
+        return amount > 1
+    if unit.startswith("mes") or unit.startswith("ann"):
+        return True
+    return False
 
 
 def _vinted_priority_rank(row: dict) -> int:
@@ -927,28 +1063,40 @@ def _extract_vinted_primary_price(page_text: str, title: str) -> str:
     text = str(page_text or "")
     title_text = normalize_whitespace(str(title or ""))
     if title_text:
-        around_title = re.compile(
-            re.escape(title_text)
-            + r".{0,220}?(\d[\d.\s]*(?:,\d{1,2})?\s*(?:â‚¬|€))\s+(\d[\d.\s]*(?:,\d{1,2})?\s*(?:â‚¬|€)).{0,120}?Include la Protezione acquisti",
+        title_window_match = re.search(
+            re.escape(title_text) + r"(.{0,320})",
+            text,
             re.IGNORECASE | re.DOTALL,
         )
-        match = around_title.search(text)
-        if match:
-            return _pick_higher_vinted_price(
-                normalize_whitespace(match.group(1)),
-                normalize_whitespace(match.group(2)),
-            )
-    protection_match = re.search(
-        r"(\d[\d.\s]*(?:,\d{1,2})?\s*(?:â‚¬|€))\s+(\d[\d.\s]*(?:,\d{1,2})?\s*(?:â‚¬|€))\s+Include la Protezione acquisti",
-        text,
+        if title_window_match:
+            price_before_incl = _extract_vinted_price_before_incl(title_window_match.group(1))
+            if price_before_incl:
+                return price_before_incl
+    price_before_incl = _extract_vinted_price_before_incl(text)
+    if price_before_incl:
+        return price_before_incl
+    return ""
+
+
+def _extract_vinted_price_before_incl(text: str) -> str:
+    text_value = str(text or "")
+    if not text_value:
+        return ""
+    match = re.search(
+        r"((?:\d[\d.\s]*(?:,\d{1,2})?\s*(?:â‚¬|€)\s*){1,4})(?:incl\.?|include(?:\s+la\s+protezione\s+acquisti)?)",
+        text_value,
         re.IGNORECASE,
     )
-    if protection_match:
-        return _pick_higher_vinted_price(
-            normalize_whitespace(protection_match.group(1)),
-            normalize_whitespace(protection_match.group(2)),
-        )
-    return ""
+    if not match:
+        return ""
+    prices = re.findall(
+        r"\d[\d.\s]*(?:,\d{1,2})?\s*(?:â‚¬|€)",
+        match.group(1),
+        re.IGNORECASE,
+    )
+    if not prices:
+        return ""
+    return normalize_whitespace(prices[-1])
 
 
 def _pick_higher_vinted_price(first_price: str, second_price: str) -> str:

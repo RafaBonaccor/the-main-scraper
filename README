@@ -35,12 +35,15 @@ Per uso con orchestratori AI, leggi anche [AGENTS.md](/abs/path/C:/Users/utente/
 - cerca prodotti per keyword o URL catalogo
 - salva i risultati in SQLite senza duplicati
 - permette di selezionare righe e poi entrare nel dettaglio annuncio
+- durante una run, gli annunci marcati `da valutare assolutamente` vengono aperti automaticamente nel dettaglio
 - estrae:
   - descrizione
+  - data relativa di caricamento
   - prezzo annuncio
   - spedizione
   - prezzo totale
 - sul dettaglio usa il prezzo con `Protezione acquisti`, non il prezzo base
+- se un annuncio `da valutare assolutamente` risulta più vecchio di una settimana, viene riclassificato in `da valutare`
 
 ## Struttura rapida
 
