@@ -32,7 +32,7 @@ def save_vinted_rows(rows: list[dict], db_path: str | Path = DEFAULT_VINTED_DB_P
             if not link:
                 continue
             search_term = str(row.get("search_term", "") or "").strip()
-            tag = str(row.get("tag", "") or "ricercato").strip() or "ricercato"
+            tag = str(row.get("tag", "") or "").strip()
             observed_at = str(row.get("extracted_at", "") or datetime.now().isoformat(timespec="seconds"))
 
             item_exists = connection.execute(
@@ -44,9 +44,9 @@ def save_vinted_rows(rows: list[dict], db_path: str | Path = DEFAULT_VINTED_DB_P
                 INSERT INTO vinted_items (
                     link, item_id, name, description, price_text, price_value,
                     shipping_price_text, shipping_price_value, total_price_text, total_price_value,
-                    offer_available, offer_text, currency,
+                    offer_available, offer_text, favorite_count, evaluation_label, currency,
                     raw_text, first_seen_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(link) DO UPDATE SET
                     item_id = excluded.item_id,
                     name = excluded.name,
@@ -75,6 +75,12 @@ def save_vinted_rows(rows: list[dict], db_path: str | Path = DEFAULT_VINTED_DB_P
                             THEN excluded.offer_text
                         ELSE vinted_items.offer_text
                     END,
+                    favorite_count = COALESCE(excluded.favorite_count, vinted_items.favorite_count),
+                    evaluation_label = CASE
+                        WHEN excluded.evaluation_label IS NOT NULL AND excluded.evaluation_label <> ''
+                            THEN excluded.evaluation_label
+                        ELSE vinted_items.evaluation_label
+                    END,
                     currency = excluded.currency,
                     raw_text = excluded.raw_text,
                     last_seen_at = excluded.last_seen_at
@@ -92,6 +98,8 @@ def save_vinted_rows(rows: list[dict], db_path: str | Path = DEFAULT_VINTED_DB_P
                     row.get("total_price_value"),
                     1 if row.get("offer_available") else 0,
                     str(row.get("offer_text", "") or ""),
+                    row.get("favorite_count"),
+                    str(row.get("evaluation_label", "") or ""),
                     str(row.get("currency", "") or ""),
                     str(row.get("raw_text", "") or ""),
                     observed_at,
@@ -190,6 +198,8 @@ def load_vinted_rows(
                     i.total_price_value,
                     i.offer_available,
                     i.offer_text,
+                    i.favorite_count,
+                    i.evaluation_label,
                     i.currency,
                     i.raw_text
                 FROM vinted_search_hits h
@@ -207,7 +217,7 @@ def load_vinted_rows(
         {
             "source": "vinted",
             "search_term": record["search_term"],
-            "tag": record["tag"] or "ricercato",
+            "tag": record["tag"] or "",
             "search_url": record["search_url"],
             "item_id": record["item_id"],
             "name": record["name"],
@@ -220,6 +230,8 @@ def load_vinted_rows(
             "total_price_value": record["total_price_value"],
             "offer_available": bool(record["offer_available"]),
             "offer_text": record["offer_text"],
+            "favorite_count": record["favorite_count"],
+            "evaluation_label": record["evaluation_label"] or "",
             "currency": record["currency"],
             "link": record["link"],
             "raw_text": record["raw_text"],
@@ -262,6 +274,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             total_price_value REAL,
             offer_available INTEGER NOT NULL DEFAULT 0,
             offer_text TEXT NOT NULL DEFAULT '',
+            favorite_count INTEGER,
+            evaluation_label TEXT NOT NULL DEFAULT '',
             currency TEXT NOT NULL DEFAULT '',
             raw_text TEXT NOT NULL DEFAULT '',
             first_seen_at TEXT NOT NULL,
@@ -291,6 +305,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     _ensure_vinted_search_hits_tag_column(connection)
     _ensure_vinted_items_description_column(connection)
     _ensure_vinted_items_offer_columns(connection)
+    _ensure_vinted_items_favorite_columns(connection)
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_vinted_search_hits_tag ON vinted_search_hits(tag)"
     )
@@ -330,6 +345,21 @@ def _ensure_vinted_items_offer_columns(connection: sqlite3.Connection) -> None:
         ("total_price_value", "REAL"),
         ("offer_available", "INTEGER NOT NULL DEFAULT 0"),
         ("offer_text", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, sql_type in additions:
+        if name in columns:
+            continue
+        connection.execute(f"ALTER TABLE vinted_items ADD COLUMN {name} {sql_type}")
+
+
+def _ensure_vinted_items_favorite_columns(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(vinted_items)").fetchall()
+    }
+    additions = (
+        ("favorite_count", "INTEGER"),
+        ("evaluation_label", "TEXT NOT NULL DEFAULT ''"),
     )
     for name, sql_type in additions:
         if name in columns:

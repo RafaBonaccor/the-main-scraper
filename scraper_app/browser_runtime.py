@@ -113,7 +113,7 @@ def browser_mode_requires_custom_dir(raw_mode: str) -> bool:
 
 
 def resolve_browser_profile(config: dict) -> str | None:
-    browser_mode = normalize_browser_mode(str(config.get("browser_mode", "isolated") or "isolated"))
+    browser_mode = normalize_browser_mode(str(config.get("browser_mode", "chrome_normale") or "chrome_normale"))
     if browser_mode == "isolated":
         return None
 
@@ -151,7 +151,7 @@ def resolve_browser_profile(config: dict) -> str | None:
 
 
 def resolve_browser_arguments(config: dict) -> list[str]:
-    browser_mode = normalize_browser_mode(str(config.get("browser_mode", "isolated") or "isolated"))
+    browser_mode = normalize_browser_mode(str(config.get("browser_mode", "chrome_normale") or "chrome_normale"))
     if browser_mode == "isolated":
         return []
 

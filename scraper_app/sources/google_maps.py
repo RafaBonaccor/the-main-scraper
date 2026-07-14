@@ -43,7 +43,7 @@ def run_google_maps_scraper(
     slow_mode: bool = False,
     action_delay_seconds: float = 1.5,
     page_settle_seconds: float = 3.0,
-    browser_mode: str = "isolated",
+    browser_mode: str = "chrome_normale",
     browser_user_data_dir: str = "",
     browser_profile_directory: str = "Default",
 ) -> ScrapeOutcome:

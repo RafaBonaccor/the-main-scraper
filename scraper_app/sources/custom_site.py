@@ -13,7 +13,7 @@ def run_custom_site_scraper(
     phone_selector: str = "",
     link_selector: str = "",
     cookie_reject_texts: str = "",
-    browser_mode: str = "isolated",
+    browser_mode: str = "chrome_normale",
     browser_user_data_dir: str = "",
     browser_profile_directory: str = "Default",
 ) -> ScrapeOutcome:

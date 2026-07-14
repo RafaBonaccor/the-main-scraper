@@ -186,6 +186,7 @@ I comandi e la GUI condividono la stessa logica browser.
 ### `chrome_normale`
 
 - crea una copia leggera del profilo Chrome reale
+- e ora il default standard della GUI e dei comandi generali
 - utile quando vuoi riusare il tuo Chrome normale senza lavorare direttamente sul profilo attivo
 
 ### `profilo_personalizzato`
@@ -222,12 +223,12 @@ python main.py status --stdout-json
 
 Flusso tipico:
 
-1. apri tab `Vinted`
+1. scorri fino alla sezione `Vinted`
 2. inserisci keyword o URL catalogo
 3. lascia `sessione_persistente` se vuoi riusare il login
 4. controlla il riquadro `Stato sessione`; attiva `Ricarica login dal Chrome reale` solo quando vuoi reimportare il profilo
 5. avvia la ricerca
-6. seleziona gli articoli nella tab `Risultati`
+6. seleziona gli articoli nella sezione `Risultati`
 7. premi `Estrai descrizioni selezionati`
 8. il tool entra nel dettaglio annuncio e aggiorna:
    - descrizione
@@ -236,6 +237,10 @@ Flusso tipico:
    - totale
 
 I dati vengono salvati nel DB e mostrati nei risultati.
+
+La tabella `Risultati` supporta scrollbar verticale/orizzontale e scroll da mouse o trackpad. Con `Shift` + scroll puoi scorrere anche orizzontalmente quando le colonne sono molte.
+
+Se attivi l'opzione per lasciare aperto il browser Vinted con valore `0`, il run resta in attesa finche non chiudi manualmente la finestra. Se invece imposti un numero di secondi, il browser resta aperto fino alla scadenza del timer o finche la finestra non viene chiusa.
 
 ### Subito
 

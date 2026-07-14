@@ -21,6 +21,10 @@ def request_stop_after_current_item() -> None:
     _update_control(stop_after_current=True)
 
 
+def request_vinted_login_confirmed() -> None:
+    _update_control(vinted_login_confirmed=True)
+
+
 def consume_skip_current_item_request() -> bool:
     state = _read_control()
     if not state.get("skip_current", False):
@@ -35,6 +39,15 @@ def consume_stop_after_current_item_request() -> bool:
     if not state.get("stop_after_current", False):
         return False
     state["stop_after_current"] = False
+    _write_control(state)
+    return True
+
+
+def consume_vinted_login_confirmed_request() -> bool:
+    state = _read_control()
+    if not state.get("vinted_login_confirmed", False):
+        return False
+    state["vinted_login_confirmed"] = False
     _write_control(state)
     return True
 

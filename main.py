@@ -93,7 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     vinted_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
     vinted_parser.add_argument(
         "--keep-browser-open",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Leave the Vinted browser open after extraction without waiting for a timer.",
     )
     vinted_parser.add_argument(
@@ -119,7 +120,8 @@ def build_parser() -> argparse.ArgumentParser:
     vinted_details_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
     vinted_details_parser.add_argument(
         "--keep-browser-open",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Leave the Vinted browser open after extracting descriptions.",
     )
     vinted_details_parser.add_argument(
@@ -246,7 +248,7 @@ def _add_browser_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--browser-mode",
         choices=("isolated", "chrome_normale", "profilo_personalizzato", "sessione_persistente", "saved_profile", "custom_profile", "persistent_profile", "persistent_session"),
-        default="isolated",
+        default="chrome_normale",
     )
     parser.add_argument("--browser-user-data-dir", default="")
     parser.add_argument("--browser-profile-directory", default="Default")

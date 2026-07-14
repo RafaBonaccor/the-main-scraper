@@ -1,19 +1,35 @@
+import json
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, quote_plus, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote_plus, urlencode, urlsplit, urlunsplit
 
 from botasaurus.browser import Driver, Wait, browser
 
 from ..browser_helpers import DEFAULT_COOKIE_REJECT_TEXTS, click_first_matching_text, current_page_url
-from ..browser_runtime import resolve_browser_arguments, resolve_browser_profile
+from ..chrome_reuse import preferred_host_fragment_for_url, try_reuse_running_chrome
+from ..browser_runtime import (
+    PROFILE_SKIP_DIR_NAMES,
+    PROFILE_SKIP_FILE_NAMES,
+    resolve_browser_arguments,
+    resolve_browser_profile,
+)
+from ..exporters import write_outcome_json
 from ..models import ScrapeOutcome
+from ..runtime_controls import consume_stop_after_current_item_request, consume_vinted_login_confirmed_request
 from ..utils import normalize_whitespace
+from ..vinted_browser_session import get_active_vinted_browser_session, register_vinted_browser_session
 from ..vinted_database import DEFAULT_VINTED_DB_PATH, save_vinted_rows
+from ..vinted_access import emit_vinted_access_signal, read_vinted_access_status
 
 
 VINTED_BASE_URL = "https://www.vinted.it"
+MAIN_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "main.py"
 ITEM_ID_PATTERN = re.compile(r"/items/(\d+)")
 PRICE_PATTERN = re.compile(r"(?:â‚¬\s*)?(\d[\d.\s]*(?:,\d{1,2})?)(?:\s*â‚¬)?")
 SHIPPING_PATTERN = re.compile(
@@ -21,16 +37,19 @@ SHIPPING_PATTERN = re.compile(
     re.IGNORECASE,
 )
 RICERCATO_BADGE_PATTERN = re.compile(r"\bricercato\b", re.IGNORECASE)
+FAVORITE_COUNT_PATTERN = re.compile(r"\d+")
+FAVORITE_COUNT_REVIEW_THRESHOLD = 15
 
 
 def run_vinted_scraper(
     search: str,
     max_results: int = 100,
     db_path: str = str(DEFAULT_VINTED_DB_PATH),
-    browser_mode: str = "isolated",
+    ui_result_json: str = "",
+    browser_mode: str = "chrome_normale",
     browser_user_data_dir: str = "",
     browser_profile_directory: str = "Default",
-    keep_browser_open: bool = False,
+    keep_browser_open: bool = True,
     refresh_browser_profile: bool = False,
     keep_open_seconds: int = 0,
     slow_mode: bool = False,
@@ -49,6 +68,8 @@ def run_vinted_scraper(
         "search_term": search_term,
         "search_url": search_url,
         "max_results": max(int(max_results), 0),
+        "db_path": db_path,
+        "ui_result_json": ui_result_json,
         "browser_mode": browser_mode,
         "browser_user_data_dir": browser_user_data_dir,
         "browser_profile_directory": browser_profile_directory,
@@ -60,21 +81,23 @@ def run_vinted_scraper(
         "page_settle_seconds": page_settle,
     }
     payload = _scrape_vinted_task(config, reuse_driver=bool(keep_browser_open))
-    db_meta = save_vinted_rows(payload["rows"], db_path=db_path)
-    for row in payload["rows"]:
-        row["db_path"] = db_meta["db_path"]
-        row["db_saved"] = True
-    payload["meta"].update(db_meta)
+    if not payload["meta"].get("db_saved_live"):
+        db_meta = save_vinted_rows(payload["rows"], db_path=db_path)
+        for row in payload["rows"]:
+            row["db_path"] = db_meta["db_path"]
+            row["db_saved"] = True
+        payload["meta"].update(db_meta)
     return ScrapeOutcome(source="vinted", rows=payload["rows"], meta=payload["meta"])
 
 
 def run_vinted_description_extractor(
     items: list[dict | str],
     db_path: str = str(DEFAULT_VINTED_DB_PATH),
-    browser_mode: str = "isolated",
+    ui_result_json: str = "",
+    browser_mode: str = "chrome_normale",
     browser_user_data_dir: str = "",
     browser_profile_directory: str = "Default",
-    keep_browser_open: bool = False,
+    keep_browser_open: bool = True,
     refresh_browser_profile: bool = False,
     keep_open_seconds: int = 0,
     slow_mode: bool = False,
@@ -89,6 +112,8 @@ def run_vinted_description_extractor(
     )
     config = {
         "items": normalized_items,
+        "db_path": db_path,
+        "ui_result_json": ui_result_json,
         "browser_mode": browser_mode,
         "browser_user_data_dir": browser_user_data_dir,
         "browser_profile_directory": browser_profile_directory,
@@ -100,11 +125,12 @@ def run_vinted_description_extractor(
         "page_settle_seconds": page_settle,
     }
     payload = _scrape_vinted_descriptions_task(config, reuse_driver=bool(keep_browser_open))
-    db_meta = save_vinted_rows(payload["rows"], db_path=db_path)
-    for row in payload["rows"]:
-        row["db_path"] = db_meta["db_path"]
-        row["db_saved"] = True
-    payload["meta"].update(db_meta)
+    if not payload["meta"].get("db_saved_live"):
+        db_meta = save_vinted_rows(payload["rows"], db_path=db_path)
+        for row in payload["rows"]:
+            row["db_path"] = db_meta["db_path"]
+            row["db_saved"] = True
+        payload["meta"].update(db_meta)
     return ScrapeOutcome(source="vinted", rows=payload["rows"], meta=payload["meta"])
 
 
@@ -120,14 +146,23 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
     cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
     if cookie_action:
         time.sleep(float(config.get("action_delay_seconds", 1.5) or 0))
+    access_status = read_vinted_access_status(driver)
+    emit_vinted_access_signal(access_status)
+    access_status = _wait_for_vinted_login_if_needed(driver, access_status)
 
     driver.select('a[href*="/items/"]', wait=Wait.VERY_LONG)
     rows_by_link: dict[str, dict] = {}
     max_results = int(config.get("max_results", 100) or 0)
-    stalled_scrolls = 0
-    last_count = 0
+    pages_visited: list[int] = []
+    seen_pages: set[int] = set()
 
     while True:
+        current_page = extract_vinted_page_number(current_page_url(driver) or search_url)
+        if current_page in seen_pages:
+            break
+        seen_pages.add(current_page)
+        pages_visited.append(current_page)
+
         for payload in _read_vinted_cards(driver):
             row = _card_payload_to_row(
                 payload,
@@ -141,49 +176,56 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         if max_results > 0 and len(rows_by_link) >= max_results:
             break
 
-        scroll_state = driver.run_js(
-            """
-const before = window.scrollY;
-window.scrollTo(0, document.documentElement.scrollHeight);
-return {before, after: window.scrollY, height: document.documentElement.scrollHeight};
-            """
-        )
-        if not scroll_state:
+        next_page = current_page + 1
+        next_page_url = _read_vinted_next_page_url(driver, next_page)
+        if not next_page_url:
             break
-        time.sleep(float(config.get("action_delay_seconds", 1.5) or 0))
-
-        current_count = len(rows_by_link)
-        if current_count == last_count:
-            stalled_scrolls += 1
-            if stalled_scrolls >= 4:
-                break
-        else:
-            stalled_scrolls = 0
-            last_count = current_count
+        driver.get(next_page_url, wait=Wait.LONG, timeout=30)
+        time.sleep(float(config.get("page_settle_seconds", 3.0) or 0))
+        page_cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
+        if page_cookie_action:
+            time.sleep(float(config.get("action_delay_seconds", 1.5) or 0))
+            cookie_action = page_cookie_action
+        access_status = read_vinted_access_status(driver)
+        emit_vinted_access_signal(access_status)
+        access_status = _wait_for_vinted_login_if_needed(driver, access_status)
+        driver.select('a[href*="/items/"]', wait=Wait.VERY_LONG)
 
     rows = _prioritize_vinted_rows(rows_by_link.values())
     if max_results > 0:
         rows = rows[:max_results]
     keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
     keep_browser_open = bool(config.get("keep_browser_open", False))
-    if keep_open_seconds > 0 and not keep_browser_open:
-        _keep_browser_open(driver, keep_open_seconds)
+    meta = {
+        "search": config["search"],
+        "search_term": config["search_term"],
+        "tag": "",
+        "search_url": search_url,
+        "max_results": max_results,
+        "keep_browser_open": keep_browser_open,
+        "keep_open_seconds": keep_open_seconds,
+        "slow_mode": bool(config.get("slow_mode", False)),
+        "action_delay_seconds": float(config.get("action_delay_seconds", 1.5) or 0),
+        "page_settle_seconds": float(config.get("page_settle_seconds", 3.0) or 0),
+        "cookie_banner_action": cookie_action or "",
+        "vinted_access_marker_present": bool(access_status.get("marker_present")),
+        "vinted_access_expected_alt": str(access_status.get("expected_alt", "") or ""),
+        "vinted_access_current_url": str(access_status.get("current_url", "") or ""),
+        "vinted_access_checked_at": str(access_status.get("checked_at", "") or ""),
+        "pages_visited": pages_visited,
+        "pages_visited_count": len(pages_visited),
+        "row_count": len(rows),
+    }
+    _persist_vinted_live_results(
+        rows=rows,
+        meta=meta,
+        db_path=str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH),
+        ui_result_json=str(config.get("ui_result_json", "") or ""),
+    )
+    _detach_vinted_browser_if_requested(driver, config)
     return {
         "rows": rows,
-        "meta": {
-            "search": config["search"],
-            "search_term": config["search_term"],
-            "tag": "ricercato",
-            "search_url": search_url,
-            "max_results": max_results,
-            "keep_browser_open": keep_browser_open,
-            "keep_open_seconds": keep_open_seconds,
-            "slow_mode": bool(config.get("slow_mode", False)),
-            "action_delay_seconds": float(config.get("action_delay_seconds", 1.5) or 0),
-            "page_settle_seconds": float(config.get("page_settle_seconds", 3.0) or 0),
-            "cookie_banner_action": cookie_action or "",
-            "row_count": len(rows),
-        },
+        "meta": meta,
     }
 
 
@@ -196,19 +238,20 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
     rows: list[dict] = []
     keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
     keep_browser_open = bool(config.get("keep_browser_open", False))
+    last_access_status: dict[str, object] = {}
 
     for item in config.get("items", []):
         if isinstance(item, dict):
             current_link = normalize_vinted_item_url(str(item.get("link", "") or ""))
             search_term = str(item.get("search_term", "") or "").strip()
             search_url = str(item.get("search_url", "") or "").strip() or build_vinted_search_url(search_term)
-            tag = str(item.get("tag", "") or "ricercato").strip() or "ricercato"
+            tag = str(item.get("tag", "") or "").strip()
             item_name = str(item.get("name", "") or "").strip()
         else:
             current_link = normalize_vinted_item_url(str(item or ""))
             search_term = ""
             search_url = build_vinted_search_url("")
-            tag = "ricercato"
+            tag = ""
             item_name = ""
         if not current_link:
             continue
@@ -217,6 +260,9 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
         cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
         if cookie_action:
             time.sleep(float(config.get("action_delay_seconds", 1.5) or 0))
+        last_access_status = read_vinted_access_status(driver)
+        emit_vinted_access_signal(last_access_status)
+        last_access_status = _wait_for_vinted_login_if_needed(driver, last_access_status)
 
         page_text = _read_vinted_detail_text(driver)
         title = _read_vinted_title(driver)
@@ -255,19 +301,29 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
         }
         rows.append(row)
 
-    if keep_open_seconds > 0 and not keep_browser_open:
-        _keep_browser_open(driver, keep_open_seconds)
+    meta = {
+        "tag": "",
+        "items_count": len(rows),
+        "keep_browser_open": keep_browser_open,
+        "keep_open_seconds": keep_open_seconds,
+        "slow_mode": bool(config.get("slow_mode", False)),
+        "action_delay_seconds": float(config.get("action_delay_seconds", 1.5) or 0),
+        "page_settle_seconds": float(config.get("page_settle_seconds", 3.0) or 0),
+        "vinted_access_marker_present": bool(last_access_status.get("marker_present")),
+        "vinted_access_expected_alt": str(last_access_status.get("expected_alt", "") or ""),
+        "vinted_access_current_url": str(last_access_status.get("current_url", "") or ""),
+        "vinted_access_checked_at": str(last_access_status.get("checked_at", "") or ""),
+    }
+    _persist_vinted_live_results(
+        rows=rows,
+        meta=meta,
+        db_path=str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH),
+        ui_result_json=str(config.get("ui_result_json", "") or ""),
+    )
+    _detach_vinted_browser_if_requested(driver, config)
     return {
         "rows": rows,
-        "meta": {
-            "tag": "ricercato",
-            "items_count": len(rows),
-            "keep_browser_open": keep_browser_open,
-            "keep_open_seconds": keep_open_seconds,
-            "slow_mode": bool(config.get("slow_mode", False)),
-            "action_delay_seconds": float(config.get("action_delay_seconds", 1.5) or 0),
-            "page_settle_seconds": float(config.get("page_settle_seconds", 3.0) or 0),
-        },
+        "meta": meta,
     }
 
 
@@ -285,6 +341,7 @@ return links.map((link) => {
   const price = root.querySelector('[data-testid*="price-text"], [data-testid*="item-price"]');
   const image = root.querySelector('img[alt]');
   const secondaryBadge = root.querySelector('[data-testid*="secondary-badge--content"], [data-testid*="secondary-badge"]');
+  const favouriteCount = root.querySelector('[data-testid="favourite-count-text"]');
   const secondaryBadgeText = clean(secondaryBadge ? (secondaryBadge.innerText || secondaryBadge.textContent) : '');
   return {
     link: link.href || link.getAttribute('href') || '',
@@ -292,6 +349,7 @@ return links.map((link) => {
     price: clean(price ? (price.innerText || price.textContent) : ''),
     image_alt: clean(image ? image.getAttribute('alt') : ''),
     aria_label: clean(link.getAttribute('aria-label')),
+    favorite_count_text: clean(favouriteCount ? (favouriteCount.innerText || favouriteCount.textContent) : ''),
     secondary_badge_text: secondaryBadgeText,
     raw_text: clean(root.innerText || root.textContent),
   };
@@ -503,11 +561,137 @@ def _nonnegative_float(value: object, default: float) -> float:
     return max(parsed, 0.0)
 
 
+def _hold_vinted_browser_if_requested(driver: Driver, keep_browser_open: bool, keep_open_seconds: int) -> None:
+    if keep_browser_open:
+        _keep_browser_open(driver, 0)
+        return
+    if keep_open_seconds > 0:
+        _keep_browser_open(driver, keep_open_seconds)
+
+
+def _wait_for_vinted_login_if_needed(driver: Driver, access_status: dict[str, object]) -> dict[str, object]:
+    if bool(access_status.get("marker_present")):
+        return access_status
+    emit_vinted_login_required_signal(access_status)
+    while True:
+        if consume_stop_after_current_item_request():
+            raise RuntimeError("Attesa login Vinted interrotta su richiesta dell'utente.")
+        if consume_vinted_login_confirmed_request():
+            refreshed_status = read_vinted_access_status(driver)
+            emit_vinted_access_signal(refreshed_status)
+            if bool(refreshed_status.get("marker_present")):
+                return refreshed_status
+            emit_vinted_login_required_signal(refreshed_status)
+        time.sleep(1)
+
+
+def emit_vinted_login_required_signal(access_status: dict[str, object]) -> None:
+    print(f"__VINTED_LOGIN_REQUIRED__:{json.dumps(access_status, ensure_ascii=False)}", flush=True)
+
+
+def _detach_vinted_browser_if_requested(driver: Driver, config: dict) -> None:
+    keep_browser_open = bool(config.get("keep_browser_open", False))
+    keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
+    if not keep_browser_open and keep_open_seconds <= 0:
+        return
+    active_session = get_active_vinted_browser_session()
+    if active_session is not None:
+        print(
+            "Browser Vinted gia aperto: riuso la sessione esistente senza aprirne un altro.",
+            flush=True,
+        )
+        return
+    target_url = str(current_page_url(driver) or config.get("search_url", "") or VINTED_BASE_URL).strip() or VINTED_BASE_URL
+    reused_chrome = try_reuse_running_chrome(
+        target_url,
+        preferred_host_fragment=preferred_host_fragment_for_url(target_url),
+    )
+    if reused_chrome.get("reused"):
+        print(
+            "Chrome gia aperto: riuso il browser esistente per lasciare Vinted disponibile.",
+            flush=True,
+        )
+        return
+    command = _build_detached_vinted_browser_command(target_url, config, keep_open_seconds)
+    launched_process = subprocess.Popen(
+        command,
+        cwd=str(MAIN_SCRIPT_PATH.parent),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    register_vinted_browser_session(launched_process.pid, target_url, source="detached")
+    if keep_browser_open:
+        print("Browser Vinted sganciato in un processo separato e lasciato aperto.", flush=True)
+    else:
+        print(
+            f"Browser Vinted sganciato in un processo separato per {keep_open_seconds} secondi.",
+            flush=True,
+        )
+
+
+def _build_detached_vinted_browser_command(target_url: str, config: dict, keep_open_seconds: int) -> list[str]:
+    detached_mode, detached_root, detached_profile_directory = _build_detached_vinted_browser_profile(config)
+    command = [
+        sys.executable,
+        str(MAIN_SCRIPT_PATH),
+        "browser",
+        "--url",
+        str(target_url or VINTED_BASE_URL),
+        "--keep-open-seconds",
+        "0" if bool(config.get("keep_browser_open", False)) else str(max(int(keep_open_seconds or 0), 0)),
+        "--browser-mode",
+        detached_mode,
+        "--browser-user-data-dir",
+        detached_root,
+        "--browser-profile-directory",
+        detached_profile_directory,
+    ]
+    return command
+
+
+def _build_detached_vinted_browser_profile(config: dict) -> tuple[str, str, str]:
+    resolved_root = str(config.get("_resolved_browser_profile_root", "") or "").strip()
+    profile_directory = str(config.get("browser_profile_directory", "") or "Default").strip() or "Default"
+    if resolved_root and Path(resolved_root).exists():
+        detached_root = _clone_browser_profile_root(Path(resolved_root))
+        return "profilo_personalizzato", detached_root, profile_directory
+    return (
+        str(config.get("browser_mode", "chrome_normale") or "chrome_normale"),
+        str(config.get("browser_user_data_dir", "") or ""),
+        profile_directory,
+    )
+
+
+def _clone_browser_profile_root(source_root: Path) -> str:
+    target_root = Path(tempfile.mkdtemp(prefix="tms_vinted_hold_"))
+    for child in source_root.iterdir():
+        if child.name in PROFILE_SKIP_DIR_NAMES:
+            continue
+        if child.name in PROFILE_SKIP_FILE_NAMES:
+            continue
+        target_child = target_root / child.name
+        if child.is_dir():
+            shutil.copytree(
+                child,
+                target_child,
+                ignore=shutil.ignore_patterns(*PROFILE_SKIP_DIR_NAMES, *PROFILE_SKIP_FILE_NAMES, "*.tmp", "*.log"),
+                dirs_exist_ok=True,
+            )
+        else:
+            shutil.copy2(child, target_child)
+    return str(target_root)
+
+
 def _keep_browser_open(driver: Driver, seconds: int) -> None:
+    wait_forever = max(int(seconds), 0) == 0
     deadline = time.monotonic() + max(int(seconds), 0)
-    print(f"Browser Vinted lasciato aperto per {seconds} secondi.")
+    if wait_forever:
+        print("Browser Vinted lasciato aperto finche non lo chiudi manualmente.", flush=True)
+    else:
+        print(f"Browser Vinted lasciato aperto per {seconds} secondi.", flush=True)
     missing_checks = 0
-    while time.monotonic() < deadline:
+    while wait_forever or time.monotonic() < deadline:
         time.sleep(1)
         if current_page_url(driver):
             missing_checks = 0
@@ -515,6 +699,19 @@ def _keep_browser_open(driver: Driver, seconds: int) -> None:
         missing_checks += 1
         if missing_checks >= 3:
             break
+
+
+def _persist_vinted_live_results(rows: list[dict], meta: dict, db_path: str, ui_result_json: str) -> None:
+    db_meta = save_vinted_rows(rows, db_path=db_path)
+    for row in rows:
+        row["db_path"] = db_meta["db_path"]
+        row["db_saved"] = True
+    meta.update(db_meta)
+    meta["db_saved_live"] = True
+    if ui_result_json:
+        ui_result_path = Path(ui_result_json).expanduser()
+        ui_result_path.parent.mkdir(parents=True, exist_ok=True)
+        write_outcome_json(ui_result_path, ScrapeOutcome(source="vinted", rows=rows, meta=meta))
 
 
 def _card_payload_to_row(payload: dict, search_term: str, search_url: str) -> dict:
@@ -528,11 +725,16 @@ def _card_payload_to_row(payload: dict, search_term: str, search_url: str) -> di
     item_id_match = ITEM_ID_PATTERN.search(urlsplit(link).path)
     secondary_badge_text = normalize_whitespace(str(payload.get("secondary_badge_text", "") or ""))
     has_ricercato_badge = bool(RICERCATO_BADGE_PATTERN.search(secondary_badge_text))
+    favorite_count = parse_vinted_favorite_count(payload.get("favorite_count_text"))
+    evaluation_label = classify_vinted_evaluation(
+        favorite_count=favorite_count,
+        has_ricercato_badge=has_ricercato_badge,
+    )
 
     return {
         "source": "vinted",
         "search_term": search_term,
-        "tag": "ricercato",
+        "tag": "ricercato" if has_ricercato_badge else "",
         "search_url": search_url,
         "item_id": item_id_match.group(1) if item_id_match else "",
         "name": title,
@@ -546,6 +748,8 @@ def _card_payload_to_row(payload: dict, search_term: str, search_url: str) -> di
         "offer_text": "",
         "currency": "EUR" if "€" in price or "â‚¬" in price else "",
         "link": link,
+        "favorite_count": favorite_count,
+        "evaluation_label": evaluation_label,
         "secondary_badge_text": secondary_badge_text,
         "has_ricercato_badge": has_ricercato_badge,
         "raw_text": raw_text,
@@ -559,7 +763,8 @@ def _prioritize_vinted_rows(rows) -> list[dict]:
         for _, row in sorted(
             enumerate(rows),
             key=lambda item: (
-                0 if item[1].get("has_ricercato_badge") else 1,
+                _vinted_priority_rank(item[1]),
+                -(parse_vinted_favorite_count(item[1].get("favorite_count")) or 0),
                 item[0],
             ),
         )
@@ -578,11 +783,66 @@ def extract_vinted_search_term(url: str) -> str:
     return str(values[0] if values else "").strip()
 
 
+def extract_vinted_page_number(url: str) -> int:
+    values = parse_qs(urlsplit(str(url or "")).query).get("page", [])
+    try:
+        page_number = int(values[0]) if values else 1
+    except (TypeError, ValueError):
+        return 1
+    return page_number if page_number > 0 else 1
+
+
+def build_vinted_page_url(url: str, page_number: int) -> str:
+    normalized_page = max(int(page_number or 1), 1)
+    parsed = urlsplit(str(url or "").strip() or f"{VINTED_BASE_URL}/catalog")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if normalized_page <= 1:
+        query.pop("page", None)
+    else:
+        query["page"] = [str(normalized_page)]
+    return urlunsplit(
+        (
+            parsed.scheme or "https",
+            parsed.netloc or urlsplit(VINTED_BASE_URL).netloc,
+            parsed.path or "/catalog",
+            urlencode(query, doseq=True),
+            "",
+        )
+    )
+
+
 def normalize_vinted_item_url(url: str) -> str:
     parsed = urlsplit(str(url or "").strip())
     if not parsed.netloc:
         parsed = urlsplit(f"{VINTED_BASE_URL}/{str(url or '').lstrip('/')}")
     return urlunsplit((parsed.scheme or "https", parsed.netloc, parsed.path, "", ""))
+
+
+def _read_vinted_next_page_url(driver: Driver, next_page_number: int) -> str:
+    payload = driver.run_js(
+        f"""
+const pageNumber = {max(int(next_page_number or 1), 1)};
+window.scrollTo(0, document.documentElement.scrollHeight);
+const selector = `[data-testid="catalog-pagination--page-${{pageNumber}}"]`;
+const node = document.querySelector(selector)
+  || [...document.querySelectorAll('a[href*="/catalog"]')].find((link) => {{
+    try {{
+      const target = new URL(link.href || link.getAttribute('href') || '', window.location.href);
+      return target.searchParams.get('page') === String(pageNumber);
+    }} catch (_error) {{
+      return false;
+    }}
+  }});
+return node ? (node.href || node.getAttribute('href') || '') : '';
+        """
+    )
+    next_url = str(payload or "").strip()
+    if not next_url:
+        return ""
+    parsed = urlsplit(next_url)
+    if parsed.netloc:
+        return urlunsplit((parsed.scheme or "https", parsed.netloc, parsed.path, parsed.query, ""))
+    return build_vinted_page_url(f"{VINTED_BASE_URL}{next_url if next_url.startswith('/') else '/' + next_url}", next_page_number)
 
 
 def parse_vinted_price(value: str) -> float | None:
@@ -596,6 +856,41 @@ def parse_vinted_price(value: str) -> float | None:
         return float(numeric)
     except ValueError:
         return None
+
+
+def parse_vinted_favorite_count(value: object) -> int | None:
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    text = normalize_whitespace(str(value or ""))
+    if not text:
+        return None
+    match = FAVORITE_COUNT_PATTERN.search(text.replace(".", "").replace(" ", ""))
+    if not match:
+        return None
+    try:
+        parsed = int(match.group(0))
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def classify_vinted_evaluation(favorite_count: int | None, has_ricercato_badge: bool) -> str:
+    if favorite_count is None or favorite_count <= FAVORITE_COUNT_REVIEW_THRESHOLD:
+        return ""
+    if has_ricercato_badge:
+        return "da valutare assolutamente"
+    return "da valutare"
+
+
+def _vinted_priority_rank(row: dict) -> int:
+    evaluation_label = str(row.get("evaluation_label", "") or "").strip().lower()
+    if evaluation_label == "da valutare assolutamente":
+        return 0
+    if evaluation_label == "da valutare":
+        return 1
+    if row.get("has_ricercato_badge"):
+        return 2
+    return 3
 
 
 def _extract_vinted_shipping_price_text(value: str) -> str:
