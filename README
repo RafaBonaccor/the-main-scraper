@@ -33,6 +33,9 @@ Per uso con orchestratori AI, leggi anche [AGENTS.md](/abs/path/C:/Users/utente/
 ### Vinted
 
 - cerca prodotti per keyword o URL catalogo
+- supporta piu ricerche nella stessa run, ognuna con:
+  - numero massimo articoli
+  - prezzo massimo
 - salva i risultati in SQLite senza duplicati
 - permette di selezionare righe e poi entrare nel dettaglio annuncio
 - durante una run, gli annunci marcati `da valutare assolutamente` vengono aperti automaticamente nel dettaglio
@@ -238,6 +241,7 @@ Flusso tipico:
    - prezzo con protezione acquisti
    - spedizione
    - totale
+9. se ti servono gli URL delle righe selezionate, usa `Esporta link selezionati` nella tab risultati; puoi salvarli in `.json` o `.txt`
 
 I dati vengono salvati nel DB e mostrati nei risultati.
 

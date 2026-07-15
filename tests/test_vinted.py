@@ -13,10 +13,12 @@ from scraper_app.sources.vinted import (
     _detach_vinted_browser_if_requested,
     _extract_vinted_description_from_body_text,
     _extract_vinted_primary_price,
+    _normalize_vinted_max_price,
     _read_vinted_published_text,
     _extract_vinted_shipping_price_text,
     _keep_browser_open,
     _prioritize_vinted_rows,
+    _vinted_row_matches_max_price,
     _wait_for_vinted_login_if_needed,
     _vinted_timing_config,
     build_vinted_page_url,
@@ -212,6 +214,13 @@ class VintedTests(unittest.TestCase):
     def test_price_parser_supports_italian_format(self) -> None:
         self.assertEqual(1299.99, parse_vinted_price("1.299,99 â‚¬"))
         self.assertEqual(25.0, parse_vinted_price("25 â‚¬"))
+
+    def test_vinted_max_price_helpers(self) -> None:
+        self.assertEqual(25.0, _normalize_vinted_max_price("25"))
+        self.assertEqual(25.5, _normalize_vinted_max_price("25,50 €"))
+        self.assertIsNone(_normalize_vinted_max_price(""))
+        self.assertTrue(_vinted_row_matches_max_price({"price_value": 24.0, "total_price_value": 24.0}, 25.0))
+        self.assertFalse(_vinted_row_matches_max_price({"price_value": 26.0, "total_price_value": 26.0}, 25.0))
 
     def test_favorite_count_and_evaluation_helpers(self) -> None:
         self.assertEqual(34, parse_vinted_favorite_count("34"))

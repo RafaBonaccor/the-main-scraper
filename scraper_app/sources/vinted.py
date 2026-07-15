@@ -44,6 +44,7 @@ FAVORITE_COUNT_REVIEW_THRESHOLD = 15
 def run_vinted_scraper(
     search: str,
     max_results: int = 100,
+    max_price: float | None = None,
     db_path: str = str(DEFAULT_VINTED_DB_PATH),
     ui_result_json: str = "",
     browser_mode: str = "chrome_normale",
@@ -68,6 +69,7 @@ def run_vinted_scraper(
         "search_term": search_term,
         "search_url": search_url,
         "max_results": max(int(max_results), 0),
+        "max_price": max_price if max_price is None else max(float(max_price), 0.0),
         "db_path": db_path,
         "ui_result_json": ui_result_json,
         "browser_mode": browser_mode,
@@ -153,6 +155,8 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
     driver.select('a[href*="/items/"]', wait=Wait.VERY_LONG)
     rows_by_link: dict[str, dict] = {}
     max_results = int(config.get("max_results", 100) or 0)
+    max_price = _normalize_vinted_max_price(config.get("max_price"))
+    filtered_out_by_price = 0
     pages_visited: list[int] = []
     seen_pages: set[int] = set()
 
@@ -170,6 +174,9 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
                 search_url=search_url,
             )
             if not row["link"]:
+                continue
+            if not _vinted_row_matches_max_price(row, max_price):
+                filtered_out_by_price += 1
                 continue
             rows_by_link[row["link"]] = row
 
@@ -195,15 +202,18 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
     if max_results > 0:
         rows = rows[:max_results]
     enrichment_meta = _enrich_vinted_priority_rows(driver, rows, config)
+    rows = [row for row in rows if _vinted_row_matches_max_price(row, max_price)]
     rows = _prioritize_vinted_rows(rows)
     keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
     keep_browser_open = bool(config.get("keep_browser_open", False))
     meta = {
         "search": config["search"],
         "search_term": config["search_term"],
+        "search_count": 1,
         "tag": "",
         "search_url": search_url,
         "max_results": max_results,
+        "max_price": max_price,
         "keep_browser_open": keep_browser_open,
         "keep_open_seconds": keep_open_seconds,
         "slow_mode": bool(config.get("slow_mode", False)),
@@ -216,6 +226,7 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         "vinted_access_checked_at": str(access_status.get("checked_at", "") or ""),
         "pages_visited": pages_visited,
         "pages_visited_count": len(pages_visited),
+        "filtered_out_by_price": filtered_out_by_price,
         "row_count": len(rows),
         "priority_rows_enriched": enrichment_meta["enriched_count"],
         "priority_rows_demoted_by_age": enrichment_meta["demoted_count"],
@@ -966,6 +977,38 @@ def parse_vinted_price(value: str) -> float | None:
         return float(numeric)
     except ValueError:
         return None
+
+
+def _normalize_vinted_max_price(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    text = normalize_whitespace(str(value or ""))
+    if not text:
+        return None
+    normalized = text.replace("€", "").replace("â‚¬", "").replace(" ", "")
+    if "," in normalized:
+        normalized = normalized.replace(".", "").replace(",", ".")
+    try:
+        parsed = float(normalized)
+    except ValueError:
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def _vinted_row_matches_max_price(row: dict, max_price: float | None) -> bool:
+    normalized_max_price = _normalize_vinted_max_price(max_price)
+    if normalized_max_price is None:
+        return True
+    price_value = row.get("total_price_value")
+    if price_value in ("", None):
+        price_value = row.get("price_value")
+    try:
+        numeric_price = float(price_value)
+    except (TypeError, ValueError):
+        return True
+    return numeric_price <= normalized_max_price
 
 
 def parse_vinted_favorite_count(value: object) -> int | None:

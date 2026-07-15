@@ -36,21 +36,7 @@ def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
         )
 
     if source == "vinted":
-        return run_vinted_scraper(
-            search=kwargs["search"],
-            max_results=int(kwargs.get("max_results", 100)),
-            db_path=kwargs.get("db_path", "data/scraper.db"),
-            ui_result_json=kwargs.get("ui_result_json", ""),
-            browser_mode=kwargs.get("browser_mode", "chrome_normale"),
-            browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
-            browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
-            keep_browser_open=bool(kwargs.get("keep_browser_open", True)),
-            refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
-            keep_open_seconds=int(kwargs.get("keep_open_seconds", 0)),
-            slow_mode=bool(kwargs.get("slow_mode", False)),
-            action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
-            page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
-        )
+        return _run_vinted_queries(**kwargs)
 
     if source == "vinted_descriptions":
         return run_vinted_description_extractor(
@@ -122,6 +108,200 @@ def _resolve_vinted_items(kwargs: dict) -> list[dict | str]:
     if items:
         return [items]
     return []
+
+
+def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
+    search_specs = _resolve_vinted_search_specs(kwargs)
+    if not search_specs:
+        raise ValueError("Inserisci una ricerca Vinted o un searches-file valido.")
+
+    if len(search_specs) == 1:
+        spec = search_specs[0]
+        return run_vinted_scraper(
+            search=spec["search"],
+            max_results=int(spec.get("max_results", 100)),
+            max_price=spec.get("max_price"),
+            db_path=kwargs.get("db_path", "data/scraper.db"),
+            ui_result_json=kwargs.get("ui_result_json", ""),
+            browser_mode=kwargs.get("browser_mode", "chrome_normale"),
+            browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
+            browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
+            keep_browser_open=bool(kwargs.get("keep_browser_open", True)),
+            refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
+            keep_open_seconds=int(kwargs.get("keep_open_seconds", 0)),
+            slow_mode=bool(kwargs.get("slow_mode", False)),
+            action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
+            page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
+        )
+
+    rows: list[dict] = []
+    search_urls: list[str] = []
+    pages_visited: list[int] = []
+    search_errors: list[dict[str, str]] = []
+    new_items = 0
+    updated_items = 0
+    new_search_hits = 0
+    updated_search_hits = 0
+    filtered_out_by_price = 0
+    priority_rows_enriched = 0
+    priority_rows_demoted_by_age = 0
+    last_meta: dict = {}
+
+    for index, spec in enumerate(search_specs):
+        if consume_stop_after_current_item_request():
+            break
+        is_last = index == len(search_specs) - 1
+        try:
+            outcome = run_vinted_scraper(
+                search=spec["search"],
+                max_results=int(spec.get("max_results", 100)),
+                max_price=spec.get("max_price"),
+                db_path=kwargs.get("db_path", "data/scraper.db"),
+                ui_result_json="",
+                browser_mode=kwargs.get("browser_mode", "chrome_normale"),
+                browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
+                browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
+                keep_browser_open=bool(kwargs.get("keep_browser_open", True)) if is_last else False,
+                refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
+                keep_open_seconds=int(kwargs.get("keep_open_seconds", 0)) if is_last else 0,
+                slow_mode=bool(kwargs.get("slow_mode", False)),
+                action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
+                page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
+            )
+        except Exception as exc:
+            search_errors.append(
+                {
+                    "search": str(spec.get("search", "") or ""),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+        last_meta = dict(outcome.meta)
+        search_url = str(outcome.meta.get("search_url", "") or "")
+        if search_url:
+            search_urls.append(search_url)
+        pages_visited.extend(list(outcome.meta.get("pages_visited", []) or []))
+        new_items += int(outcome.meta.get("new_items", 0) or 0)
+        updated_items += int(outcome.meta.get("updated_items", 0) or 0)
+        new_search_hits += int(outcome.meta.get("new_search_hits", 0) or 0)
+        updated_search_hits += int(outcome.meta.get("updated_search_hits", 0) or 0)
+        filtered_out_by_price += int(outcome.meta.get("filtered_out_by_price", 0) or 0)
+        priority_rows_enriched += int(outcome.meta.get("priority_rows_enriched", 0) or 0)
+        priority_rows_demoted_by_age += int(outcome.meta.get("priority_rows_demoted_by_age", 0) or 0)
+        for row in outcome.rows:
+            annotated_row = dict(row)
+            annotated_row["batch_search_index"] = index + 1
+            annotated_row["batch_search_count"] = len(search_specs)
+            annotated_row["extracted_order"] = len(rows) + 1
+            rows.append(annotated_row)
+
+    if not rows and search_errors:
+        error_preview = "; ".join(f"{item['search']}: {item['error']}" for item in search_errors[:3])
+        raise RuntimeError(f"Nessuna ricerca Vinted completata. {error_preview}")
+
+    search_labels = [str(spec.get("search", "") or "") for spec in search_specs]
+    return ScrapeOutcome(
+        source="vinted",
+        rows=rows,
+        meta={
+            "search_term": f"{len(search_specs)} ricerche batch",
+            "search_terms": search_labels,
+            "search_count": len(search_specs),
+            "search_specs": search_specs,
+            "multi_search": True,
+            "db_path": kwargs.get("db_path", "data/scraper.db"),
+            "search_url": search_urls[0] if search_urls else "",
+            "search_urls": search_urls,
+            "pages_visited": pages_visited,
+            "pages_visited_count": len(pages_visited),
+            "row_count": len(rows),
+            "new_items": new_items,
+            "updated_items": updated_items,
+            "new_search_hits": new_search_hits,
+            "updated_search_hits": updated_search_hits,
+            "filtered_out_by_price": filtered_out_by_price,
+            "priority_rows_enriched": priority_rows_enriched,
+            "priority_rows_demoted_by_age": priority_rows_demoted_by_age,
+            "search_errors": search_errors,
+            "keep_browser_open": bool(kwargs.get("keep_browser_open", True)),
+            "keep_open_seconds": int(kwargs.get("keep_open_seconds", 0)),
+            "slow_mode": bool(kwargs.get("slow_mode", False)),
+            "action_delay_seconds": float(kwargs.get("action_delay_seconds", 1.5)),
+            "page_settle_seconds": float(kwargs.get("page_settle_seconds", 3.0)),
+            "vinted_access_marker_present": bool(last_meta.get("vinted_access_marker_present", False)),
+            "vinted_access_expected_alt": str(last_meta.get("vinted_access_expected_alt", "") or ""),
+            "vinted_access_current_url": str(last_meta.get("vinted_access_current_url", "") or ""),
+            "vinted_access_checked_at": str(last_meta.get("vinted_access_checked_at", "") or ""),
+            "db_saved_live": False,
+        },
+    )
+
+
+def _resolve_vinted_search_specs(kwargs: dict) -> list[dict]:
+    searches_file = str(kwargs.get("searches_file", "") or "").strip()
+    raw_searches = kwargs.get("searches", [])
+    if searches_file:
+        return _read_vinted_search_specs_file(
+            Path(searches_file),
+            default_max_results=int(kwargs.get("max_results", 100)),
+            default_max_price=_parse_optional_nonnegative_float(kwargs.get("max_price")),
+        )
+    if isinstance(raw_searches, list) and raw_searches:
+        return _normalize_vinted_search_specs(
+            raw_searches,
+            default_max_results=int(kwargs.get("max_results", 100)),
+            default_max_price=_parse_optional_nonnegative_float(kwargs.get("max_price")),
+        )
+    search = str(kwargs.get("search", "") or "").strip()
+    if not search:
+        return []
+    return [
+        {
+            "search": search,
+            "max_results": max(int(kwargs.get("max_results", 100)), 0),
+            "max_price": _parse_optional_nonnegative_float(kwargs.get("max_price")),
+        }
+    ]
+
+
+def _read_vinted_search_specs_file(path: Path, default_max_results: int, default_max_price: float | None) -> list[dict]:
+    if not path.exists():
+        raise ValueError(f"Searches file non trovato: {path}")
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        raise ValueError(f"Searches file vuoto: {path}")
+    raw_items = json.loads(content)
+    if not isinstance(raw_items, list):
+        raise ValueError(f"Searches file non valido: {path}")
+    return _normalize_vinted_search_specs(raw_items, default_max_results=default_max_results, default_max_price=default_max_price)
+
+
+def _normalize_vinted_search_specs(raw_items: list[object], default_max_results: int, default_max_price: float | None) -> list[dict]:
+    specs: list[dict] = []
+    for raw_item in raw_items:
+        if isinstance(raw_item, dict):
+            search = str(raw_item.get("search", raw_item.get("query", "")) or "").strip()
+            max_results = raw_item.get("max_results", default_max_results)
+            max_price = raw_item.get("max_price", default_max_price)
+        else:
+            search = str(raw_item or "").strip()
+            max_results = default_max_results
+            max_price = default_max_price
+        if not search:
+            continue
+        try:
+            normalized_max_results = max(int(max_results), 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Max risultati Vinted non valido per la ricerca '{search}'.") from exc
+        normalized_max_price = _parse_optional_nonnegative_float(max_price)
+        specs.append(
+            {
+                "search": search,
+                "max_results": normalized_max_results,
+                "max_price": normalized_max_price,
+            }
+        )
+    return specs
 
 
 def _run_subito_queries(**kwargs) -> ScrapeOutcome:
@@ -314,6 +494,23 @@ def _parse_optional_nonnegative_int(value: object) -> int | None:
         return None
     try:
         parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def _parse_optional_nonnegative_float(value: object) -> float | None:
+    if value in (None, "", False):
+        return None
+    text = str(value).strip().replace("€", "").replace(" ", "")
+    if not text:
+        return None
+    if "," in text:
+        text = text.replace(".", "").replace(",", ".")
+    try:
+        parsed = float(text)
     except (TypeError, ValueError):
         return None
     if parsed < 0:

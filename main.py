@@ -83,12 +83,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_export_arguments(google_parser)
 
     vinted_parser = run_subparsers.add_parser("vinted", help="Extract Vinted search results and save them to SQLite.")
-    vinted_parser.add_argument("--search", required=True, help="Vinted search term or full catalog URL.")
+    vinted_parser.add_argument("--search", default="", help="Vinted search term or full catalog URL.")
+    vinted_parser.add_argument(
+        "--searches-file",
+        default="",
+        help="JSON file containing one or more Vinted searches with per-search max-results and max-price.",
+    )
     vinted_parser.add_argument(
         "--max-results",
         default=100,
         type=int,
         help="Maximum results to keep. Use 0 to scroll until no new items are found.",
+    )
+    vinted_parser.add_argument(
+        "--max-price",
+        default="",
+        help="Maximum item price to keep for this Vinted search. Leave empty for no price cap.",
     )
     vinted_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
     vinted_parser.add_argument(
