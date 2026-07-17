@@ -236,23 +236,30 @@ Flusso tipico:
 
 1. scorri fino alla sezione `Vinted`
 2. inserisci keyword o URL catalogo
-3. se vuoi riusare una query, usa `Salva termine`; la GUI salva i valori in `output/_saved_search_terms.json`
-4. puoi ricaricare una query con `Usa selezionato` oppure cancellarla con `Elimina selezionati`
-5. lascia `sessione_persistente` se vuoi riusare il login
-6. controlla il riquadro `Stato sessione`; attiva `Ricarica login dal Chrome reale` solo quando vuoi reimportare il profilo
-7. avvia la ricerca
-8. seleziona gli articoli nella sezione `Risultati`
-9. premi `Estrai descrizioni selezionati`
-10. il tool entra nel dettaglio annuncio e aggiorna:
+3. se vuoi lavorare direttamente per categoria, usa `Categoria rapida`:
+   - `Accessori donna` → `https://www.vinted.it/catalog/1187-accessories`
+   - `Accessori uomo` → `https://www.vinted.it/catalog/82-accessories`
+   - `Gioielli donna` → `https://www.vinted.it/catalog/21-jewellery`
+   - `Scarpe donna` → `https://www.vinted.it/catalog/16-shoes`
+   - `Scarpe uomo` → `https://www.vinted.it/catalog/1231-shoes`
+   se lasci la keyword vuota, la run apre la categoria pura; se invece scrivi una keyword, la GUI costruisce automaticamente l'URL categoria + `search_text`
+4. se vuoi riusare una query, usa `Salva termine`; la GUI salva i valori in `output/_saved_search_terms.json`
+5. puoi ricaricare una query con `Usa selezionato` oppure cancellarla con `Elimina selezionati`
+6. lascia `sessione_persistente` se vuoi riusare il login
+7. controlla il riquadro `Stato sessione`; attiva `Ricarica login dal Chrome reale` solo quando vuoi reimportare il profilo
+8. avvia la ricerca
+9. seleziona gli articoli nella sezione `Risultati`
+10. premi `Estrai descrizioni selezionati`
+11. il tool entra nel dettaglio annuncio e aggiorna:
    - descrizione
    - prezzo con protezione acquisti
    - spedizione
    - totale
-11. se ti servono gli URL delle righe selezionate, usa `Esporta link selezionati` nella tab risultati; puoi salvarli in `.json` o `.txt`
-12. dopo la run puoi selezionare uno o più annunci Vinted nei risultati, impostare `Sconto offerta (%)` e usare `Fai offerta -X%`; il tool apre ogni annuncio, clicca `Fai un'offerta`, usa il prezzo annuncio già presente in tabella come base, calcola `prezzo - percentuale scelta`, inserisce il valore e preme `Offri`
-13. le offerte inviate vengono salvate nel DB Vinted: se selezioni di nuovo lo stesso annuncio, la GUI lo esclude automaticamente e il backend non lo reinvia
-14. nell'area `Archivio database` puoi scegliere una `Ricerca salvata`, filtrarla per data/query/titolo/note, aggiornarne l'elenco e ricaricare in tabella una run specifica
-15. puoi anche rinominare la ricerca salvata, aggiungere note archivio o eliminarla senza cancellare gli articoli dal database generale
+12. se ti servono gli URL delle righe selezionate, usa `Esporta link selezionati` nella tab risultati; puoi salvarli in `.json` o `.txt`
+13. dopo la run puoi selezionare uno o più annunci Vinted nei risultati, impostare `Sconto offerta (%)` e usare `Fai offerta -X%`; il tool apre ogni annuncio, clicca `Fai un'offerta`, usa il prezzo annuncio già presente in tabella come base, calcola `prezzo - percentuale scelta`, inserisce il valore e preme `Offri`
+14. le offerte inviate vengono salvate nel DB Vinted: se selezioni di nuovo lo stesso annuncio, la GUI lo esclude automaticamente e il backend non lo reinvia
+15. nell'area `Archivio database` puoi scegliere una `Ricerca salvata`, filtrarla per data/query/titolo/note, aggiornarne l'elenco e ricaricare in tabella una run specifica
+16. puoi anche rinominare la ricerca salvata, aggiungere note archivio o eliminarla senza cancellare gli articoli dal database generale
 
 I dati vengono salvati nel DB e mostrati nei risultati.
 
@@ -264,6 +271,10 @@ La tabella `Risultati` supporta scrollbar verticale/orizzontale e scroll da mous
 I pulsanti `Apri annuncio`, `Apri Google Maps`, `Apri sito web`, `Apri allegato`
 e le aperture cartelle/output usano ora il launcher nativo del sistema:
 funzionano quindi sia su macOS sia su Windows.
+Durante la ricerca Vinted la paginazione prova prima a cliccare il link reale
+`catalog-pagination--page-N` mostrato dalla pagina, cosi mantiene i parametri
+dinamici generati da Vinted (`search_id`, `time`, ecc.); se il click non
+produce la transizione, il tool usa come fallback l'`href` della stessa pagina.
 
 Se attivi l'opzione per lasciare aperto il browser Vinted con valore `0`, il run resta in attesa finche non chiudi manualmente la finestra. Se invece imposti un numero di secondi, il browser resta aperto fino alla scadenza del timer o finche la finestra non viene chiusa.
 

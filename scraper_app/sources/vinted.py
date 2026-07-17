@@ -30,7 +30,7 @@ from ..vinted_database import (
     load_vinted_known_item_keys,
     save_vinted_rows,
 )
-from ..vinted_access import emit_vinted_access_signal, read_vinted_access_status
+from ..vinted_access import emit_vinted_access_signal, read_vinted_access_status, wait_for_vinted_access_status
 
 
 VINTED_BASE_URL = "https://www.vinted.it"
@@ -152,11 +152,17 @@ def run_vinted_description_extractor(
 def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
     search_url = config["search_url"]
     driver.get(search_url, wait=Wait.LONG, timeout=30)
-    time.sleep(float(config.get("page_settle_seconds", 3.0) or 0))
+    _wait_for_vinted_catalog_page_ready(
+        driver,
+        max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+    )
     cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
     if cookie_action:
-        time.sleep(float(config.get("action_delay_seconds", 1.5) or 0))
-    access_status = read_vinted_access_status(driver)
+        time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
+    access_status = wait_for_vinted_access_status(
+        driver,
+        max_wait_seconds=min(max(float(config.get("page_settle_seconds", 3.0) or 0), 0.0), 0.8),
+    )
     emit_vinted_access_signal(access_status)
     access_status = _wait_for_vinted_login_if_needed(
         driver,
@@ -208,16 +214,25 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
             break
 
         next_page = current_page + 1
-        next_page_url = _read_vinted_next_page_url(driver, next_page)
+        next_page_url = _open_vinted_next_page(
+            driver,
+            next_page,
+            page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+        )
         if not next_page_url:
             break
-        driver.get(next_page_url, wait=Wait.LONG, timeout=30)
-        time.sleep(float(config.get("page_settle_seconds", 3.0) or 0))
+        _wait_for_vinted_catalog_page_ready(
+            driver,
+            max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+        )
         page_cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
         if page_cookie_action:
-            time.sleep(float(config.get("action_delay_seconds", 1.5) or 0))
+            time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
             cookie_action = page_cookie_action
-        access_status = read_vinted_access_status(driver)
+        access_status = wait_for_vinted_access_status(
+            driver,
+            max_wait_seconds=min(max(float(config.get("page_settle_seconds", 3.0) or 0), 0.0), 0.8),
+        )
         emit_vinted_access_signal(access_status)
         access_status = _wait_for_vinted_login_if_needed(
             driver,
@@ -309,8 +324,11 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
         )
         cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
         if cookie_action:
-            time.sleep(float(config.get("action_delay_seconds", 1.5) or 0))
-        last_access_status = read_vinted_access_status(driver)
+            time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
+        last_access_status = wait_for_vinted_access_status(
+            driver,
+            max_wait_seconds=min(max(float(config.get("page_settle_seconds", 3.0) or 0), 0.0), 0.8),
+        )
         emit_vinted_access_signal(last_access_status)
         last_access_status = _wait_for_vinted_login_if_needed(
             driver,
@@ -558,8 +576,11 @@ def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict)
         )
         cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
         if cookie_action:
-            time.sleep(float(config.get("action_delay_seconds", 1.5) or 0))
-        access_status = read_vinted_access_status(driver)
+            time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
+        access_status = wait_for_vinted_access_status(
+            driver,
+            max_wait_seconds=min(max(float(config.get("page_settle_seconds", 3.0) or 0), 0.0), 0.8),
+        )
         emit_vinted_access_signal(access_status)
         _wait_for_vinted_login_if_needed(
             driver,
@@ -765,6 +786,25 @@ def _wait_for_vinted_detail_page_ready(
     return _is_vinted_detail_page_ready(driver)
 
 
+def _wait_for_vinted_catalog_page_ready(
+    driver: Driver,
+    max_wait_seconds: float,
+    poll_interval_seconds: float = 0.2,
+) -> bool:
+    max_wait = _nonnegative_float(max_wait_seconds, 0.0)
+    if max_wait <= 0:
+        return _is_vinted_catalog_page_ready(driver)
+    poll_interval = max(_nonnegative_float(poll_interval_seconds, 0.2), 0.05)
+    deadline = time.monotonic() + max_wait
+    while True:
+        if _is_vinted_catalog_page_ready(driver):
+            return True
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.05)))
+    return _is_vinted_catalog_page_ready(driver)
+
+
 def _is_vinted_detail_page_ready(driver: Driver) -> bool:
     payload = driver.run_js(
         """
@@ -802,6 +842,27 @@ return {
     return False
 
 
+def _is_vinted_catalog_page_ready(driver: Driver) -> bool:
+    payload = driver.run_js(
+        """
+const itemLinks = document.querySelectorAll('a[href*="/items/"]').length;
+const paginationNodes = document.querySelectorAll('[data-testid^="catalog-pagination--page-"]').length;
+const bodyText = (document.body ? (document.body.innerText || document.body.textContent || '') : '').trim();
+const readyState = document.readyState || '';
+return {
+  readyState,
+  itemLinks,
+  paginationNodes,
+  bodyLength: bodyText.length,
+  ready: (readyState === 'interactive' || readyState === 'complete') && (itemLinks > 0 || paginationNodes > 0 || bodyText.length > 160),
+};
+        """
+    )
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("ready", False))
+
+
 def _hold_vinted_browser_if_requested(driver: Driver, keep_browser_open: bool, keep_open_seconds: int) -> None:
     if keep_browser_open:
         _keep_browser_open(driver, 0)
@@ -833,16 +894,22 @@ def _wait_for_vinted_login_if_needed(
                         max_wait_seconds=float(page_settle_seconds or 0),
                     )
                 else:
-                    time.sleep(float(page_settle_seconds or 0))
+                    _wait_for_vinted_catalog_page_ready(
+                        driver,
+                        max_wait_seconds=float(page_settle_seconds or 0),
+                    )
                 cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
                 if cookie_action:
-                    time.sleep(float(action_delay_seconds or 0))
-            refreshed_status = read_vinted_access_status(driver)
+                    time.sleep(min(float(action_delay_seconds or 0), 0.35))
+            refreshed_status = wait_for_vinted_access_status(
+                driver,
+                max_wait_seconds=min(max(float(page_settle_seconds or 0), 0.0), 1.0),
+            )
             emit_vinted_access_signal(refreshed_status)
             if bool(refreshed_status.get("marker_present")):
                 return refreshed_status
             emit_vinted_login_required_signal(refreshed_status)
-        time.sleep(1)
+        time.sleep(0.25)
 
 
 def emit_vinted_login_required_signal(access_status: dict[str, object]) -> None:
@@ -1093,7 +1160,21 @@ def normalize_vinted_item_url(url: str) -> str:
     return urlunsplit((parsed.scheme or "https", parsed.netloc, parsed.path, "", ""))
 
 
-def _read_vinted_next_page_url(driver: Driver, next_page_number: int) -> str:
+def _normalize_vinted_catalog_url(url: str, page_number: int | None = None) -> str:
+    next_url = str(url or "").strip()
+    if not next_url:
+        return ""
+    parsed = urlsplit(next_url)
+    if parsed.netloc:
+        normalized_url = urlunsplit((parsed.scheme or "https", parsed.netloc, parsed.path, parsed.query, ""))
+    else:
+        normalized_url = f"{VINTED_BASE_URL}{next_url if next_url.startswith('/') else '/' + next_url}"
+    if page_number is None:
+        return normalized_url
+    return build_vinted_page_url(normalized_url, page_number)
+
+
+def _read_vinted_next_page_target(driver: Driver, next_page_number: int) -> dict[str, object]:
     payload = driver.run_js(
         f"""
 const pageNumber = {max(int(next_page_number or 1), 1)};
@@ -1108,16 +1189,69 @@ const node = document.querySelector(selector)
       return false;
     }}
   }});
-return node ? (node.href || node.getAttribute('href') || '') : '';
+if (!node) {{
+  return {{ href: '', clicked: false }};
+}}
+const href = node.href || node.getAttribute('href') || '';
+let clicked = false;
+try {{
+  node.click();
+  clicked = true;
+}} catch (_error) {{
+  clicked = false;
+}}
+return {{ href, clicked }};
         """
     )
-    next_url = str(payload or "").strip()
-    if not next_url:
+    if not isinstance(payload, dict):
+        return {"href": "", "clicked": False}
+    return {
+        "href": _normalize_vinted_catalog_url(str(payload.get("href", "") or ""), next_page_number),
+        "clicked": bool(payload.get("clicked")),
+    }
+
+
+def _is_vinted_catalog_page_active(driver: Driver, page_number: int) -> bool:
+    target_page_number = max(int(page_number or 1), 1)
+    current_url = str(current_page_url(driver) or "").strip()
+    if current_url and extract_vinted_page_number(current_url) == target_page_number:
+        return True
+    payload = driver.run_js(
+        f"""
+const selector = `[data-testid="catalog-pagination--page-{target_page_number}"]`;
+const node = document.querySelector(selector);
+if (!node) {{
+  return false;
+}}
+return String(node.getAttribute('aria-current') || '').toLowerCase() === 'true';
+        """
+    )
+    return bool(payload)
+
+
+def _wait_for_vinted_catalog_page(driver: Driver, page_number: int, max_wait_seconds: float) -> bool:
+    deadline = time.monotonic() + max(max_wait_seconds, 0.0)
+    while True:
+        if _is_vinted_catalog_page_active(driver, page_number):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
+def _open_vinted_next_page(driver: Driver, next_page_number: int, page_settle_seconds: float = 3.0) -> str:
+    target = _read_vinted_next_page_target(driver, next_page_number)
+    next_page_url = str(target.get("href", "") or "").strip()
+    clicked = bool(target.get("clicked"))
+    if not next_page_url:
         return ""
-    parsed = urlsplit(next_url)
-    if parsed.netloc:
-        return urlunsplit((parsed.scheme or "https", parsed.netloc, parsed.path, parsed.query, ""))
-    return build_vinted_page_url(f"{VINTED_BASE_URL}{next_url if next_url.startswith('/') else '/' + next_url}", next_page_number)
+
+    if clicked and _wait_for_vinted_catalog_page(driver, next_page_number, max(page_settle_seconds, 2.0) + 4.0):
+        return str(current_page_url(driver) or next_page_url)
+
+    driver.get(next_page_url, wait=Wait.LONG, timeout=30)
+    _wait_for_vinted_catalog_page(driver, next_page_number, max(page_settle_seconds, 2.0) + 4.0)
+    return str(current_page_url(driver) or next_page_url)
 
 
 def parse_vinted_price(value: str) -> float | None:

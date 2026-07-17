@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from scraper_app.sources.vinted import (
     _build_vinted_total,
@@ -18,8 +18,10 @@ from scraper_app.sources.vinted import (
     _read_vinted_published_text,
     _extract_vinted_shipping_price_text,
     _keep_browser_open,
+    _open_vinted_next_page,
     _wait_for_vinted_detail_page_ready,
     _prioritize_vinted_rows,
+    _read_vinted_next_page_target,
     _vinted_row_matches_known_item_keys,
     _vinted_row_matches_max_price,
     _wait_for_vinted_login_if_needed,
@@ -63,6 +65,48 @@ class VintedTests(unittest.TestCase):
             build_vinted_page_url(base_url, 2),
         )
         self.assertEqual(base_url, build_vinted_page_url(f"{base_url}&page=4", 1))
+
+    def test_read_vinted_next_page_target_clicks_real_pagination_link(self) -> None:
+        driver = Mock()
+        driver.run_js.return_value = {
+            "href": "/catalog?search_id=1119058183&page=2&time=1784304226",
+            "clicked": True,
+        }
+
+        target = _read_vinted_next_page_target(driver, 2)
+
+        self.assertEqual(
+            "https://www.vinted.it/catalog?search_id=1119058183&page=2&time=1784304226",
+            target["href"],
+        )
+        self.assertTrue(target["clicked"])
+
+    @patch("scraper_app.sources.vinted._wait_for_vinted_catalog_page")
+    @patch("scraper_app.sources.vinted.current_page_url")
+    def test_open_vinted_next_page_falls_back_to_driver_get_when_click_does_not_transition(
+        self,
+        mocked_current_url,
+        mocked_wait_for_page,
+    ) -> None:
+        mocked_wait_for_page.side_effect = [False, True]
+        mocked_current_url.return_value = "https://www.vinted.it/catalog?search_id=1119058183&page=2&time=1784304226"
+        driver = Mock()
+        driver.run_js.return_value = {
+            "href": "/catalog?search_id=1119058183&page=2&time=1784304226",
+            "clicked": True,
+        }
+
+        next_page_url = _open_vinted_next_page(driver, 2, page_settle_seconds=3.0)
+
+        driver.get.assert_called_once_with(
+            "https://www.vinted.it/catalog?search_id=1119058183&page=2&time=1784304226",
+            wait=ANY,
+            timeout=30,
+        )
+        self.assertEqual(
+            "https://www.vinted.it/catalog?search_id=1119058183&page=2&time=1784304226",
+            next_page_url,
+        )
 
     def test_detached_vinted_browser_command_uses_custom_profile_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -137,14 +181,14 @@ class VintedTests(unittest.TestCase):
     @patch("scraper_app.sources.vinted.click_first_matching_text")
     @patch("scraper_app.sources.vinted.emit_vinted_login_required_signal")
     @patch("scraper_app.sources.vinted.emit_vinted_access_signal")
-    @patch("scraper_app.sources.vinted.read_vinted_access_status")
+    @patch("scraper_app.sources.vinted.wait_for_vinted_access_status")
     @patch("scraper_app.sources.vinted.consume_stop_after_current_item_request", return_value=False)
     @patch("scraper_app.sources.vinted.consume_vinted_login_confirmed_request")
     def test_wait_for_vinted_login_rechecks_after_user_confirmation(
         self,
         mocked_confirmed,
         _mocked_stop,
-        mocked_read_status,
+        mocked_wait_for_status,
         _mocked_emit_access,
         mocked_emit_required,
         mocked_cookie_click,
@@ -152,7 +196,7 @@ class VintedTests(unittest.TestCase):
     ) -> None:
         mocked_confirmed.side_effect = [False, True]
         mocked_cookie_click.return_value = ""
-        mocked_read_status.return_value = {
+        mocked_wait_for_status.return_value = {
             "marker_present": True,
             "expected_alt": "bonaccarla",
             "current_url": "https://www.vinted.it/catalog",
@@ -178,21 +222,21 @@ class VintedTests(unittest.TestCase):
     @patch("scraper_app.sources.vinted.click_first_matching_text", return_value="")
     @patch("scraper_app.sources.vinted.emit_vinted_login_required_signal")
     @patch("scraper_app.sources.vinted.emit_vinted_access_signal")
-    @patch("scraper_app.sources.vinted.read_vinted_access_status")
+    @patch("scraper_app.sources.vinted.wait_for_vinted_access_status")
     @patch("scraper_app.sources.vinted.consume_stop_after_current_item_request", return_value=False)
     @patch("scraper_app.sources.vinted.consume_vinted_login_confirmed_request")
     def test_wait_for_vinted_login_reopens_target_url_after_confirmation(
         self,
         mocked_confirmed,
         _mocked_stop,
-        mocked_read_status,
+        mocked_wait_for_status,
         _mocked_emit_access,
         _mocked_emit_required,
         _mocked_cookie_click,
         _mocked_sleep,
     ) -> None:
         mocked_confirmed.side_effect = [True]
-        mocked_read_status.return_value = {
+        mocked_wait_for_status.return_value = {
             "marker_present": True,
             "expected_alt": "bonaccarla",
             "current_url": "https://www.vinted.it/items/123",

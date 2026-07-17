@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime
 
 from botasaurus.browser import Driver
@@ -36,6 +37,28 @@ return {{
     }
 
 
+def wait_for_vinted_access_status(
+    driver: Driver,
+    max_wait_seconds: float = 0.8,
+    poll_interval_seconds: float = 0.2,
+) -> dict[str, object]:
+    status = read_vinted_access_status(driver)
+    if bool(status.get("marker_present")):
+        return status
+
+    max_wait = max(float(max_wait_seconds or 0), 0.0)
+    if max_wait <= 0:
+        return status
+
+    poll_interval = max(float(poll_interval_seconds or 0), 0.05)
+    deadline = time.monotonic() + max_wait
+    while time.monotonic() < deadline:
+        time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.05)))
+        status = read_vinted_access_status(driver)
+        if bool(status.get("marker_present")):
+            return status
+    return status
+
+
 def emit_vinted_access_signal(status: dict[str, object]) -> None:
     print(f"__VINTED_ACCESS__:{json.dumps(status, ensure_ascii=False)}", flush=True)
-

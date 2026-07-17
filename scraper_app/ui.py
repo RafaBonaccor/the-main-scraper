@@ -126,6 +126,15 @@ RESULT_SORT_COLUMN_MAP = {
     "company": "Azienda",
     "schedule": "Orario",
 }
+VINTED_CATEGORY_PRESETS = (
+    ("Nessuna categoria rapida", ""),
+    ("Accessori donna", "https://www.vinted.it/catalog/1187-accessories"),
+    ("Accessori uomo", "https://www.vinted.it/catalog/82-accessories"),
+    ("Gioielli donna", "https://www.vinted.it/catalog/21-jewellery"),
+    ("Scarpe donna", "https://www.vinted.it/catalog/16-shoes"),
+    ("Scarpe uomo", "https://www.vinted.it/catalog/1231-shoes"),
+)
+VINTED_CATEGORY_PRESET_LOOKUP = {label: url for label, url in VINTED_CATEGORY_PRESETS}
 
 
 def open_external_target(target: object) -> bool:
@@ -143,6 +152,52 @@ def open_external_target(target: object) -> bool:
         start_new_session=True,
     )
     return True
+
+
+def resolve_vinted_category_url(selection: object) -> str:
+    value = str(selection or "").strip()
+    if not value:
+        return ""
+    return str(VINTED_CATEGORY_PRESET_LOOKUP.get(value, value) or "").strip()
+
+
+def build_vinted_search_target_url(raw_search: object, category_selection: object = "") -> str:
+    search = str(raw_search or "").strip()
+    category_url = resolve_vinted_category_url(category_selection)
+    if search.lower().startswith(("http://", "https://")):
+        return search
+    if category_url:
+        if not search:
+            return category_url
+        separator = "&" if "?" in category_url else "?"
+        return f"{category_url}{separator}search_text={quote_plus(search)}"
+    if not search:
+        return "https://www.vinted.it/catalog"
+    return f"https://www.vinted.it/catalog?search_text={quote_plus(search)}"
+
+
+def format_vinted_search_target_label(raw_search: object, category_selection: object = "") -> str:
+    search = str(raw_search or "").strip()
+    category_label = str(category_selection or "").strip()
+    category_url = resolve_vinted_category_url(category_selection)
+    if search.lower().startswith(("http://", "https://")):
+        return search
+    if search and category_url:
+        return f"{search} | {category_label}"
+    if category_url:
+        return category_label or category_url
+    return search
+
+
+def detect_vinted_category_label_from_url(url: object) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return VINTED_CATEGORY_PRESETS[0][0]
+    for label, category_url in VINTED_CATEGORY_PRESETS[1:]:
+        if category_url and value.startswith(category_url):
+            return label
+    return VINTED_CATEGORY_PRESETS[0][0]
+
 RESULT_SORT_DEFAULT_DESC = {
     "Prezzo Vinted": False,
     "Ricerca Vinted": False,
@@ -291,6 +346,7 @@ class ScraperApp:
         self.google_website_timeout_var = tk.StringVar(value="10")
 
         self.vinted_search_var = tk.StringVar(value="macbook")
+        self.vinted_category_var = tk.StringVar(value=VINTED_CATEGORY_PRESETS[0][0])
         self.vinted_max_results_var = tk.StringVar(value="100")
         self.vinted_max_price_var = tk.StringVar(value="")
         self.vinted_db_path_var = tk.StringVar(value=str((script_path.parent / "data" / "scraper.db").resolve()))
@@ -420,6 +476,7 @@ class ScraperApp:
         self.subito_custom_job_keywords_var.trace_add("write", lambda *_: self._update_subito_job_keywords_preview())
         self.result_sort_var.trace_add("write", lambda *_: self._handle_result_sort_change())
         self.vinted_search_var.trace_add("write", lambda *_: self._update_vinted_search_preview())
+        self.vinted_category_var.trace_add("write", lambda *_: self._update_vinted_search_preview())
         self.vinted_offer_discount_percent_var.trace_add("write", lambda *_: self._update_vinted_offer_ui_copy())
         self._update_vinted_search_preview()
         self._update_vinted_offer_ui_copy()
@@ -564,6 +621,18 @@ class ScraperApp:
         card = self._card(self.vinted_scroll.body, "Vinted")
         card.pack(fill="x")
         self._row(card, 0, "Ricerca o URL Vinted", self.vinted_search_var)
+        category_frame = ttk.Frame(card, style="Panel.TFrame")
+        category_frame.grid(row=0, column=2, sticky="e", padx=(8, 0), pady=(0, 10))
+        ttk.Label(category_frame, text="Categoria rapida").grid(row=0, column=0, sticky="w")
+        self.vinted_category_box = ttk.Combobox(
+            category_frame,
+            textvariable=self.vinted_category_var,
+            state="readonly",
+            values=[label for label, _url in VINTED_CATEGORY_PRESETS],
+            width=24,
+        )
+        self.vinted_category_box.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.vinted_category_box.bind("<<ComboboxSelected>>", lambda _event: self._handle_vinted_category_change())
         self._row(card, 1, "Max risultati (0 = tutti)", self.vinted_max_results_var, 12)
         price_limit_frame = ttk.Frame(card, style="Panel.TFrame")
         price_limit_frame.grid(row=1, column=2, sticky="e", padx=(8, 0), pady=(0, 10))
@@ -678,7 +747,7 @@ class ScraperApp:
         batch_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Label(
             batch_frame,
-            text="Ricerche multiple: aggiungi oggetto, max articoli e prezzo massimo. Se la tabella contiene righe, la run usa la tabella invece del campo singolo.",
+            text="Ricerche multiple: aggiungi keyword, URL o categoria, max articoli e prezzo massimo. Se la tabella contiene righe, la run usa la tabella invece del campo singolo.",
             style="Hint.TLabel",
             wraplength=720,
             justify="left",
@@ -1791,13 +1860,23 @@ class ScraperApp:
                 f"Batch attivo: {len(self.vinted_search_specs)} ricerche in tabella. La run usera la tabella."
             )
             return
-        search = self.vinted_search_var.get().strip()
-        if not search:
-            self.vinted_search_preview_var.set("https://www.vinted.it/catalog")
-        elif search.lower().startswith(("http://", "https://")):
-            self.vinted_search_preview_var.set(search)
+        self.vinted_search_preview_var.set(
+            build_vinted_search_target_url(
+                self.vinted_search_var.get().strip(),
+                self.vinted_category_var.get().strip(),
+            )
+        )
+
+    def _selected_vinted_category_url(self) -> str:
+        return resolve_vinted_category_url(self.vinted_category_var.get())
+
+    def _handle_vinted_category_change(self) -> None:
+        category_url = self._selected_vinted_category_url()
+        category_label = self.vinted_category_var.get().strip()
+        if category_url:
+            self.vinted_status_var.set(f"Categoria Vinted selezionata: {category_label}.")
         else:
-            self.vinted_search_preview_var.set(f"https://www.vinted.it/catalog?search_text={quote_plus(search)}")
+            self.vinted_status_var.set("Categoria rapida Vinted disattivata.")
 
     def _selected_vinted_saved_search_terms(self) -> list[str]:
         if not hasattr(self, "vinted_saved_search_terms_listbox"):
@@ -1841,7 +1920,12 @@ class ScraperApp:
         return clean_value
 
     def _save_current_vinted_search_term(self) -> None:
-        saved_value = self._save_vinted_search_term_value(self.vinted_search_var.get(), quiet=False)
+        try:
+            current_spec = self._current_vinted_search_spec_from_form()
+        except ValueError as exc:
+            messagebox.showerror("Termini ricerca Vinted", str(exc))
+            return
+        saved_value = self._save_vinted_search_term_value(str(current_spec.get("search", "") or ""), quiet=False)
         if saved_value:
             self.vinted_status_var.set(f"Termine di ricerca salvato: {saved_value}.")
 
@@ -1851,6 +1935,7 @@ class ScraperApp:
             messagebox.showerror("Termini ricerca Vinted", "Seleziona almeno un termine salvato.")
             return
         selected_value = selected_terms[0]
+        self.vinted_category_var.set(detect_vinted_category_label_from_url(selected_value))
         self.vinted_search_var.set(selected_value)
         self.vinted_status_var.set(f"Termine caricato nel campo ricerca: {selected_value}.")
 
@@ -1889,8 +1974,10 @@ class ScraperApp:
         return value
 
     def _current_vinted_search_spec_from_form(self) -> dict:
-        search = self.vinted_search_var.get().strip()
-        if not search:
+        raw_search = self.vinted_search_var.get().strip()
+        category_label = self.vinted_category_var.get().strip()
+        resolved_search = build_vinted_search_target_url(raw_search, category_label)
+        if not raw_search and not self._selected_vinted_category_url():
             raise ValueError("Inserisci una ricerca o un URL Vinted.")
         max_results = self.vinted_max_results_var.get().strip()
         if not max_results.isdigit():
@@ -1898,7 +1985,9 @@ class ScraperApp:
         max_price_raw = self.vinted_max_price_var.get().strip()
         max_price = self._parse_vinted_max_price_value(max_price_raw)
         return {
-            "search": search,
+            "search": resolved_search,
+            "display_search": format_vinted_search_target_label(raw_search, category_label) or resolved_search,
+            "category_label": category_label if self._selected_vinted_category_url() else "",
             "max_results": int(max_results),
             "max_price": max_price,
             "max_price_text": max_price_raw,
@@ -1916,7 +2005,7 @@ class ScraperApp:
                 "end",
                 iid=f"spec_{index}",
                 values=(
-                    str(spec.get("search", "") or ""),
+                    str(spec.get("display_search", spec.get("search", "")) or ""),
                     str(spec.get("max_results", 0) or 0),
                     max_price_label,
                 ),
@@ -1933,6 +2022,8 @@ class ScraperApp:
         self.vinted_search_specs.append(
             {
                 "search": spec["search"],
+                "display_search": spec["display_search"],
+                "category_label": spec["category_label"],
                 "max_results": spec["max_results"],
                 "max_price": spec["max_price"],
             }
@@ -1978,7 +2069,11 @@ class ScraperApp:
             messagebox.showinfo("Ricerca Vinted", "Attendi la fine del processo corrente.")
             return
         if not self.vinted_search_specs:
-            self._save_vinted_search_term_value(self.vinted_search_var.get(), quiet=True)
+            try:
+                current_spec = self._current_vinted_search_spec_from_form()
+            except ValueError:
+                current_spec = {}
+            self._save_vinted_search_term_value(str(current_spec.get("search", "") or ""), quiet=True)
         active_browser = get_active_vinted_browser_session() if self.vinted_keep_browser_open_var.get() else None
         self.vinted_status_var.set("Avvio della ricerca Vinted in corso...")
         self._start_scrape()
@@ -2266,6 +2361,7 @@ class ScraperApp:
 
     def _reset_vinted_form(self) -> None:
         self.vinted_search_var.set("macbook")
+        self.vinted_category_var.set(VINTED_CATEGORY_PRESETS[0][0])
         self.vinted_max_results_var.set("100")
         self.vinted_max_price_var.set("")
         self.vinted_offer_discount_percent_var.set("15")
@@ -2876,13 +2972,10 @@ class ScraperApp:
             else:
                 url = "https://www.google.com/maps"
         elif selected == "Vinted":
-            search = self.vinted_search_var.get().strip()
-            if search.lower().startswith(("http://", "https://")):
-                url = search
-            elif search:
-                url = f"https://www.vinted.it/catalog?search_text={quote_plus(search)}"
-            else:
-                url = "https://www.vinted.it/catalog"
+            url = build_vinted_search_target_url(
+                self.vinted_search_var.get().strip(),
+                self.vinted_category_var.get().strip(),
+            )
         elif selected == "Subito Jobs":
             query = self.subito_query_var.get().strip()
             if query.lower().startswith(("http://", "https://")):

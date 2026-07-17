@@ -5,7 +5,7 @@ from botasaurus.browser import Driver, Wait, browser
 from ..browser_helpers import DEFAULT_COOKIE_REJECT_TEXTS, click_first_matching_text, current_page_url, navigate_with_retries
 from ..browser_runtime import resolve_browser_arguments, resolve_browser_profile
 from ..utils import normalize_whitespace
-from ..vinted_access import emit_vinted_access_signal, read_vinted_access_status
+from ..vinted_access import emit_vinted_access_signal, read_vinted_access_status, wait_for_vinted_access_status
 from ..vinted_database import (
     DEFAULT_VINTED_DB_PATH,
     build_vinted_item_identity_keys,
@@ -209,8 +209,12 @@ def _offer_single_vinted_listing(driver: Driver, config: dict) -> dict:
     navigated = navigate_with_retries(driver, link, wait=Wait.LONG)
     _sleep_if_needed(driver, page_settle_seconds)
     cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS) or ""
-    _sleep_if_needed(driver, action_delay_seconds)
-    access_status = read_vinted_access_status(driver)
+    if cookie_action:
+        _sleep_if_needed(driver, min(action_delay_seconds, 0.35))
+    access_status = wait_for_vinted_access_status(
+        driver,
+        max_wait_seconds=min(max(page_settle_seconds, 0.0), 0.8),
+    )
     emit_vinted_access_signal(access_status)
     access_status = _wait_for_vinted_login_if_needed(
         driver,
