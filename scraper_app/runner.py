@@ -121,6 +121,7 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
             search=spec["search"],
             max_results=int(spec.get("max_results", 100)),
             max_price=spec.get("max_price"),
+            exclude_known_items=bool(kwargs.get("exclude_known_items", True)),
             db_path=kwargs.get("db_path", "data/scraper.db"),
             ui_result_json=kwargs.get("ui_result_json", ""),
             browser_mode=kwargs.get("browser_mode", "chrome_normale"),
@@ -142,6 +143,7 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
     updated_items = 0
     new_search_hits = 0
     updated_search_hits = 0
+    filtered_out_known_items = 0
     filtered_out_by_price = 0
     priority_rows_enriched = 0
     priority_rows_demoted_by_age = 0
@@ -156,6 +158,7 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
                 search=spec["search"],
                 max_results=int(spec.get("max_results", 100)),
                 max_price=spec.get("max_price"),
+                exclude_known_items=bool(kwargs.get("exclude_known_items", True)),
                 db_path=kwargs.get("db_path", "data/scraper.db"),
                 ui_result_json="",
                 browser_mode=kwargs.get("browser_mode", "chrome_normale"),
@@ -185,6 +188,7 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
         updated_items += int(outcome.meta.get("updated_items", 0) or 0)
         new_search_hits += int(outcome.meta.get("new_search_hits", 0) or 0)
         updated_search_hits += int(outcome.meta.get("updated_search_hits", 0) or 0)
+        filtered_out_known_items += int(outcome.meta.get("filtered_out_known_items", 0) or 0)
         filtered_out_by_price += int(outcome.meta.get("filtered_out_by_price", 0) or 0)
         priority_rows_enriched += int(outcome.meta.get("priority_rows_enriched", 0) or 0)
         priority_rows_demoted_by_age += int(outcome.meta.get("priority_rows_demoted_by_age", 0) or 0)
@@ -219,6 +223,8 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
             "updated_items": updated_items,
             "new_search_hits": new_search_hits,
             "updated_search_hits": updated_search_hits,
+            "exclude_known_items": bool(kwargs.get("exclude_known_items", True)),
+            "filtered_out_known_items": filtered_out_known_items,
             "filtered_out_by_price": filtered_out_by_price,
             "priority_rows_enriched": priority_rows_enriched,
             "priority_rows_demoted_by_age": priority_rows_demoted_by_age,

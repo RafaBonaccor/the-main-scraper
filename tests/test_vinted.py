@@ -12,12 +12,15 @@ from scraper_app.sources.vinted import (
     _card_payload_to_row,
     _detach_vinted_browser_if_requested,
     _extract_vinted_description_from_body_text,
+    _extract_vinted_base_price,
     _extract_vinted_primary_price,
     _normalize_vinted_max_price,
     _read_vinted_published_text,
     _extract_vinted_shipping_price_text,
     _keep_browser_open,
+    _wait_for_vinted_detail_page_ready,
     _prioritize_vinted_rows,
+    _vinted_row_matches_known_item_keys,
     _vinted_row_matches_max_price,
     _wait_for_vinted_login_if_needed,
     _vinted_timing_config,
@@ -29,7 +32,18 @@ from scraper_app.sources.vinted import (
     parse_vinted_favorite_count,
     parse_vinted_price,
 )
-from scraper_app.vinted_database import load_vinted_rows, save_vinted_rows
+from scraper_app.vinted_database import (
+    annotate_rows_with_vinted_offer_history,
+    build_vinted_item_identity_keys,
+    delete_vinted_search_run,
+    list_vinted_search_runs,
+    load_vinted_known_item_keys,
+    load_vinted_submitted_offer_keys,
+    load_vinted_rows,
+    save_vinted_offer_results,
+    save_vinted_rows,
+    update_vinted_search_run,
+)
 
 
 class VintedTests(unittest.TestCase):
@@ -120,6 +134,7 @@ class VintedTests(unittest.TestCase):
         mocked_popen.assert_not_called()
 
     @patch("scraper_app.sources.vinted.time.sleep")
+    @patch("scraper_app.sources.vinted.click_first_matching_text")
     @patch("scraper_app.sources.vinted.emit_vinted_login_required_signal")
     @patch("scraper_app.sources.vinted.emit_vinted_access_signal")
     @patch("scraper_app.sources.vinted.read_vinted_access_status")
@@ -132,9 +147,11 @@ class VintedTests(unittest.TestCase):
         mocked_read_status,
         _mocked_emit_access,
         mocked_emit_required,
+        mocked_cookie_click,
         _mocked_sleep,
     ) -> None:
         mocked_confirmed.side_effect = [False, True]
+        mocked_cookie_click.return_value = ""
         mocked_read_status.return_value = {
             "marker_present": True,
             "expected_alt": "bonaccarla",
@@ -142,18 +159,62 @@ class VintedTests(unittest.TestCase):
             "checked_at": "2026-07-14T10:00:00",
         }
 
+        driver = Mock()
         result = _wait_for_vinted_login_if_needed(
-            object(),
+            driver,
             {
                 "marker_present": False,
                 "expected_alt": "bonaccarla",
                 "current_url": "https://www.vinted.it/catalog",
                 "checked_at": "2026-07-14T09:59:00",
             },
+            revisit_url="https://www.vinted.it/catalog?search_text=macbook",
         )
 
         self.assertTrue(result["marker_present"])
         self.assertEqual(1, mocked_emit_required.call_count)
+
+    @patch("scraper_app.sources.vinted.time.sleep")
+    @patch("scraper_app.sources.vinted.click_first_matching_text", return_value="")
+    @patch("scraper_app.sources.vinted.emit_vinted_login_required_signal")
+    @patch("scraper_app.sources.vinted.emit_vinted_access_signal")
+    @patch("scraper_app.sources.vinted.read_vinted_access_status")
+    @patch("scraper_app.sources.vinted.consume_stop_after_current_item_request", return_value=False)
+    @patch("scraper_app.sources.vinted.consume_vinted_login_confirmed_request")
+    def test_wait_for_vinted_login_reopens_target_url_after_confirmation(
+        self,
+        mocked_confirmed,
+        _mocked_stop,
+        mocked_read_status,
+        _mocked_emit_access,
+        _mocked_emit_required,
+        _mocked_cookie_click,
+        _mocked_sleep,
+    ) -> None:
+        mocked_confirmed.side_effect = [True]
+        mocked_read_status.return_value = {
+            "marker_present": True,
+            "expected_alt": "bonaccarla",
+            "current_url": "https://www.vinted.it/items/123",
+            "checked_at": "2026-07-14T10:00:00",
+        }
+        driver = Mock()
+
+        result = _wait_for_vinted_login_if_needed(
+            driver,
+            {
+                "marker_present": False,
+                "expected_alt": "bonaccarla",
+                "current_url": "https://www.vinted.it/items/123",
+                "checked_at": "2026-07-14T09:59:00",
+            },
+            revisit_url="https://www.vinted.it/items/123",
+        )
+
+        driver.get.assert_called_once()
+        self.assertEqual("https://www.vinted.it/items/123", driver.get.call_args.args[0])
+        self.assertEqual(30, driver.get.call_args.kwargs["timeout"])
+        self.assertTrue(result["marker_present"])
 
     def test_card_payload_extracts_name_price_and_clean_link(self) -> None:
         row = _card_payload_to_row(
@@ -228,15 +289,51 @@ class VintedTests(unittest.TestCase):
         self.assertIsNone(parse_vinted_favorite_count(""))
         self.assertEqual("", classify_vinted_evaluation(15, False))
         self.assertEqual("da valutare", classify_vinted_evaluation(16, False))
+        self.assertEqual("da valutare assolutamente", classify_vinted_evaluation(None, True))
+        self.assertEqual("da valutare assolutamente", classify_vinted_evaluation(3, True))
         self.assertEqual("da valutare assolutamente", classify_vinted_evaluation(16, True))
         self.assertEqual("da valutare assolutamente", classify_vinted_evaluation(16, True, "1 settimana fa"))
         self.assertEqual("da valutare", classify_vinted_evaluation(16, True, "8 giorni fa"))
         self.assertEqual("da valutare", classify_vinted_evaluation(16, True, "2 settimane fa"))
         self.assertEqual("da valutare", classify_vinted_evaluation(16, True, "1 mese fa"))
+        self.assertEqual("", classify_vinted_evaluation(16, False, "2 mesi fa"))
+        self.assertEqual("", classify_vinted_evaluation(16, True, "1 anno fa"))
 
     def test_vinted_timing_config_applies_slow_mode_floor(self) -> None:
         self.assertEqual((2.5, 4.0), _vinted_timing_config(True, 0.5, 1.0))
         self.assertEqual((1.0, 2.0), _vinted_timing_config(False, 1.0, 2.0))
+
+    @patch("scraper_app.sources.vinted.time.sleep")
+    @patch("scraper_app.sources.vinted.time.monotonic")
+    def test_wait_for_vinted_detail_page_ready_returns_early_when_page_is_ready(
+        self,
+        mocked_monotonic,
+        mocked_sleep,
+    ) -> None:
+        mocked_monotonic.side_effect = [10.0, 10.05, 10.1]
+        driver = Mock()
+        driver.run_js.side_effect = [
+            {
+                "readyState": "interactive",
+                "hasTitle": False,
+                "hasPrice": False,
+                "hasOffer": False,
+                "bodyLength": 40,
+            },
+            {
+                "readyState": "complete",
+                "hasTitle": True,
+                "hasPrice": True,
+                "hasOffer": False,
+                "bodyLength": 220,
+            },
+        ]
+
+        result = _wait_for_vinted_detail_page_ready(driver, max_wait_seconds=3.0)
+
+        self.assertTrue(result)
+        self.assertEqual(2, driver.run_js.call_count)
+        self.assertEqual(1, mocked_sleep.call_count)
 
     @patch("scraper_app.sources.vinted.time.sleep")
     @patch("scraper_app.sources.vinted.current_page_url")
@@ -274,12 +371,14 @@ class VintedTests(unittest.TestCase):
             "Magliettina vintage 3,00 € 4,90 € incl. Protezione acquisti dettagli spedizione"
         )
         self.assertEqual("4,90 €", _extract_vinted_primary_price(page_text, "Magliettina vintage"))
+        self.assertEqual("3,00 €", _extract_vinted_base_price(page_text, "Magliettina vintage"))
 
     def test_primary_price_prefers_value_before_include_protezione_acquisti(self) -> None:
         page_text = (
             "MacBook Air 1.199,00 € 1.254,70 € Include la Protezione acquisti e assistenza"
         )
         self.assertEqual("1.254,70 €", _extract_vinted_primary_price(page_text, "MacBook Air"))
+        self.assertEqual("1.199,00 €", _extract_vinted_base_price(page_text, "MacBook Air"))
 
     def test_read_vinted_published_text_from_page_text(self) -> None:
         page_text = "Titolo annuncio Caricato 3 ore fa Marca Apple"
@@ -360,6 +459,7 @@ class VintedTests(unittest.TestCase):
             self.assertEqual(2, len(rows))
             self.assertEqual(1, meta["db_total_items"])
             self.assertEqual(2, meta["db_total_search_hits"])
+            self.assertEqual(4, meta["db_total_search_runs"])
             macbook_row = next(row for row in rows if row["search_term"] == "macbook")
             self.assertEqual(3, macbook_row["times_seen"])
             self.assertEqual("MacBook", macbook_row["name"])
@@ -367,6 +467,7 @@ class VintedTests(unittest.TestCase):
             self.assertEqual("Testo descrizione", macbook_row["description"])
             self.assertEqual("3 ore fa", macbook_row["published_at"])
             self.assertEqual("5,49 â‚¬", macbook_row["shipping_price"])
+            self.assertEqual("sped > 2,99", macbook_row["shipping_alert"])
             self.assertEqual(305.49, macbook_row["total_price_value"])
             self.assertTrue(macbook_row["offer_available"])
             self.assertEqual(34, macbook_row["favorite_count"])
@@ -379,6 +480,177 @@ class VintedTests(unittest.TestCase):
             hidden_rows, hidden_meta = load_vinted_rows(db_path, tag_filter="altro", limit=10)
             self.assertEqual([], hidden_rows)
             self.assertEqual(0, hidden_meta["db_filtered_search_hits"])
+
+    def test_known_item_keys_and_offer_history_use_item_id_and_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "vinted.db"
+            row = {
+                "link": "https://www.vinted.it/items/123-macbook",
+                "item_id": "123",
+                "name": "MacBook",
+                "price": "300,00 â‚¬",
+                "price_value": 300.0,
+                "total_price": "305,49 EUR",
+                "total_price_value": 305.49,
+                "favorite_count": 12,
+                "evaluation_label": "",
+                "currency": "EUR",
+                "raw_text": "MacBook 300,00 â‚¬",
+                "extracted_at": "2026-07-01T10:00:00",
+                "search_term": "macbook",
+                "search_url": "https://www.vinted.it/catalog?search_text=macbook",
+            }
+
+            save_vinted_rows([row], db_path)
+            known_item_keys = load_vinted_known_item_keys(db_path)
+
+            self.assertIn("id:123", known_item_keys)
+            self.assertIn("link:https://www.vinted.it/items/123-macbook", known_item_keys)
+            self.assertEqual(
+                ("id:123", "link:https://www.vinted.it/items/123-macbook"),
+                build_vinted_item_identity_keys("123", "https://www.vinted.it/items/123-macbook"),
+            )
+            self.assertTrue(
+                _vinted_row_matches_known_item_keys(
+                    {"item_id": "123", "link": "https://www.vinted.it/items/123-macbook"},
+                    known_item_keys,
+                )
+            )
+
+            save_vinted_offer_results(
+                [
+                    {
+                        "link": "https://www.vinted.it/items/123-macbook",
+                        "item_id": "123",
+                        "item_name": "MacBook",
+                        "submitted": True,
+                        "offer_value": 255.0,
+                        "offer_input_value": "255.00",
+                        "offer_discount_percent": 15.0,
+                        "source_price": 300.0,
+                        "submitted_at": "2026-07-16T10:00:00",
+                    }
+                ],
+                db_path,
+            )
+            offered_keys = load_vinted_submitted_offer_keys(db_path)
+            annotated_rows = annotate_rows_with_vinted_offer_history(
+                [{"item_id": "123", "link": "https://www.vinted.it/items/123-macbook"}],
+                db_path,
+            )
+
+            self.assertIn("id:123", offered_keys)
+            self.assertIn("link:https://www.vinted.it/items/123-macbook", offered_keys)
+            self.assertTrue(annotated_rows[0]["offer_already_submitted"])
+            self.assertEqual("2026-07-16T10:00:00", annotated_rows[0]["offer_last_submitted_at"])
+            self.assertEqual(255.0, annotated_rows[0]["offer_last_value"])
+
+    def test_database_can_reload_specific_saved_search_run_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "vinted.db"
+            first_row = {
+                "link": "https://www.vinted.it/items/123-macbook",
+                "item_id": "123",
+                "name": "MacBook",
+                "price": "300,00 â‚¬",
+                "price_value": 300.0,
+                "total_price": "305,49 EUR",
+                "total_price_value": 305.49,
+                "favorite_count": 12,
+                "evaluation_label": "",
+                "currency": "EUR",
+                "raw_text": "MacBook 300,00 â‚¬",
+                "extracted_at": "2026-07-01T10:00:00",
+                "search_term": "macbook",
+                "search_url": "https://www.vinted.it/catalog?search_text=macbook",
+            }
+            updated_row = {
+                **first_row,
+                "price": "280,00 â‚¬",
+                "price_value": 280.0,
+                "total_price": "285,49 EUR",
+                "total_price_value": 285.49,
+                "favorite_count": 34,
+                "evaluation_label": "da valutare assolutamente",
+                "extracted_at": "2026-07-01T11:00:00",
+            }
+
+            first_meta = save_vinted_rows([first_row], db_path)
+            second_meta = save_vinted_rows([updated_row], db_path)
+            runs = list_vinted_search_runs(db_path, limit=10)
+
+            self.assertEqual(2, len(runs))
+            self.assertEqual(first_meta["search_run_key"], runs[-1]["run_key"])
+            self.assertEqual(second_meta["search_run_key"], runs[0]["run_key"])
+
+            first_run_rows, first_run_meta = load_vinted_rows(
+                db_path,
+                search_run_key=str(first_meta["search_run_key"]),
+                limit=10,
+            )
+            second_run_rows, second_run_meta = load_vinted_rows(
+                db_path,
+                search_run_key=str(second_meta["search_run_key"]),
+                limit=10,
+            )
+
+            self.assertEqual(1, len(first_run_rows))
+            self.assertEqual(1, len(second_run_rows))
+            self.assertEqual(305.49, first_run_rows[0]["total_price_value"])
+            self.assertEqual("", first_run_rows[0]["evaluation_label"])
+            self.assertEqual(285.49, second_run_rows[0]["total_price_value"])
+            self.assertEqual("da valutare assolutamente", second_run_rows[0]["evaluation_label"])
+            self.assertEqual(first_meta["search_run_key"], first_run_meta["db_search_run_key"])
+            self.assertEqual(second_meta["search_run_key"], second_run_meta["db_search_run_key"])
+
+    def test_saved_search_run_can_be_renamed_filtered_and_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "vinted.db"
+            row = {
+                "link": "https://www.vinted.it/items/123-macbook",
+                "item_id": "123",
+                "name": "MacBook",
+                "price": "300,00 â‚¬",
+                "price_value": 300.0,
+                "total_price": "305,49 EUR",
+                "total_price_value": 305.49,
+                "currency": "EUR",
+                "raw_text": "MacBook 300,00 â‚¬",
+                "extracted_at": "2026-07-01T10:00:00",
+                "search_term": "macbook",
+                "search_url": "https://www.vinted.it/catalog?search_text=macbook",
+            }
+            saved = save_vinted_rows([row], db_path)
+
+            updated = update_vinted_search_run(
+                run_key=str(saved["search_run_key"]),
+                db_path=db_path,
+                title="Affari MacBook",
+                notes="Controllare preferiti alti",
+            )
+            runs = list_vinted_search_runs(db_path, limit=10, text_filter="affari")
+            missing = list_vinted_search_runs(db_path, limit=10, text_filter="inesistente")
+
+            self.assertEqual("Affari MacBook", updated["title"])
+            self.assertEqual("Controllare preferiti alti", updated["notes"])
+            self.assertEqual(1, len(runs))
+            self.assertEqual("Affari MacBook", runs[0]["title"])
+            self.assertEqual([], missing)
+
+            run_rows, run_meta = load_vinted_rows(
+                db_path,
+                search_run_key=str(saved["search_run_key"]),
+                limit=10,
+            )
+            self.assertEqual("Affari MacBook", run_meta["db_search_run_title"])
+            self.assertEqual("Controllare preferiti alti", run_meta["db_search_run_notes"])
+            self.assertEqual("Affari MacBook", run_rows[0]["search_run_title"])
+
+            delete_result = delete_vinted_search_run(str(saved["search_run_key"]), db_path)
+            remaining = list_vinted_search_runs(db_path, limit=10)
+
+            self.assertEqual(0, delete_result["db_total_search_runs"])
+            self.assertEqual([], remaining)
 
     def test_existing_database_without_tag_column_is_migrated(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,13 +1,14 @@
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
 import tkinter as tk
 from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from urllib.parse import quote_plus
 
@@ -34,9 +35,17 @@ from .runtime_controls import (
     request_stop_after_current_item,
     request_vinted_login_confirmed,
 )
+from .search_terms import delete_saved_search_terms, load_saved_search_terms, save_search_term
 from .utils import build_google_maps_search_url, build_subito_search_url
 from .vinted_browser_session import get_active_vinted_browser_session
-from .vinted_database import load_vinted_rows
+from .vinted_database import (
+    annotate_rows_with_vinted_offer_history,
+    build_vinted_item_identity_keys,
+    delete_vinted_search_run,
+    list_vinted_search_runs,
+    load_vinted_rows,
+    update_vinted_search_run,
+)
 
 
 APP_BG = "#f4f6f8"
@@ -271,8 +280,12 @@ class ScraperApp:
         self.vinted_db_filter_var = tk.StringVar()
         self.vinted_db_limit_var = tk.StringVar(value="500")
         self.vinted_signal_filter_var = tk.StringVar(value="tutti")
+        self.vinted_saved_run_var = tk.StringVar()
+        self.vinted_saved_run_filter_var = tk.StringVar()
         self.vinted_keep_browser_open_var = tk.BooleanVar(value=True)
         self.vinted_keep_open_seconds_var = tk.StringVar(value="0")
+        self.vinted_exclude_known_items_var = tk.BooleanVar(value=True)
+        self.vinted_offer_discount_percent_var = tk.StringVar(value="15")
         self.vinted_refresh_browser_profile_var = tk.BooleanVar(value=False)
         self.vinted_search_preview_var = tk.StringVar()
         self.vinted_status_var = tk.StringVar(value="Pronto per una nuova ricerca Vinted.")
@@ -281,6 +294,9 @@ class ScraperApp:
         self.vinted_profile_last_import_var = tk.StringVar(value="-")
         self.vinted_profile_access_var = tk.StringVar(value="Non ancora verificato sul sito.")
         self.vinted_search_specs: list[dict] = []
+        self.vinted_saved_search_terms: list[str] = []
+        self.vinted_saved_runs: list[dict[str, int | str]] = []
+        self.vinted_saved_run_lookup: dict[str, dict[str, int | str]] = {}
 
         self.subito_query_var = tk.StringVar()
         self.subito_region_var = tk.StringVar(value="lazio")
@@ -352,6 +368,7 @@ class ScraperApp:
         self.auto_monitor_interval_ms = 0
         self.current_results_generated_at = ""
         self.current_result_meta: dict[str, object] = {}
+        self.process_stop_requested = False
         self.vinted_access_warning_shown_for_process = False
         self.vinted_login_prompt_open = False
         self.vinted_last_access_marker_present: bool | None = None
@@ -374,6 +391,8 @@ class ScraperApp:
         self._update_browser_mode()
         self._update_result_actions()
         self._update_vinted_profile_status()
+        self._refresh_vinted_saved_search_terms()
+        self._refresh_vinted_saved_runs(quiet=True)
         self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._sync_active_source_from_notebook())
         self.browser_mode_var.trace_add("write", lambda *_: self._update_browser_mode())
         self.browser_mode_var.trace_add("write", lambda *_: self._update_result_actions())
@@ -384,7 +403,9 @@ class ScraperApp:
         self.subito_custom_job_keywords_var.trace_add("write", lambda *_: self._update_subito_job_keywords_preview())
         self.result_sort_var.trace_add("write", lambda *_: self._handle_result_sort_change())
         self.vinted_search_var.trace_add("write", lambda *_: self._update_vinted_search_preview())
+        self.vinted_offer_discount_percent_var.trace_add("write", lambda *_: self._update_vinted_offer_ui_copy())
         self._update_vinted_search_preview()
+        self._update_vinted_offer_ui_copy()
         self.root.after(150, self._drain_logs)
 
     def _configure_styles(self) -> None:
@@ -398,7 +419,10 @@ class ScraperApp:
         style.configure("Header.TLabel", background=APP_BG, foreground=ACCENT, font=("Segoe UI Semibold", 21))
         style.configure("Subtitle.TLabel", background=APP_BG, foreground=MUTED, font=("Segoe UI", 10))
         style.configure("Hint.TLabel", background=PANEL_BG, foreground=MUTED, font=("Segoe UI", 9))
-        style.configure("Status.TLabel", background="#e7f0ff", foreground="#1d4ed8", font=("Segoe UI Semibold", 10), padding=(12, 7))
+        style.configure("StatusIdle.TLabel", background="#e5e7eb", foreground="#374151", font=("Segoe UI Semibold", 10), padding=(12, 7))
+        style.configure("StatusRunning.TLabel", background="#dcfce7", foreground="#166534", font=("Segoe UI Semibold", 10), padding=(12, 7))
+        style.configure("StatusStopping.TLabel", background="#fee2e2", foreground="#b91c1c", font=("Segoe UI Semibold", 10), padding=(12, 7))
+        style.configure("StatusError.TLabel", background="#fecaca", foreground="#991b1b", font=("Segoe UI Semibold", 10), padding=(12, 7))
         style.configure("Run.TButton", background=BUTTON_BG, foreground=BUTTON_FG, padding=(16, 11), font=("Segoe UI Semibold", 10))
         style.map("Run.TButton", background=[("active", "#1d4ed8"), ("pressed", "#1e40af")])
         style.configure("Accent.TButton", background="#0f766e", foreground="#ffffff", padding=(14, 10), font=("Segoe UI Semibold", 10))
@@ -423,7 +447,18 @@ class ScraperApp:
         left.pack(side="left", fill="x", expand=True)
         ttk.Label(left, text="The Main Scraper", style="Header.TLabel").pack(anchor="w")
         ttk.Label(left, text="Google Maps, Vinted e Subito in una sola interfaccia.", style="Subtitle.TLabel").pack(anchor="w", pady=(4, 0))
-        ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").pack(side="right", anchor="ne")
+        status_shell = ttk.Frame(header, style="App.TFrame")
+        status_shell.pack(side="right", anchor="ne")
+        self.status_label = ttk.Label(status_shell, textvariable=self.status_var, style="StatusIdle.TLabel")
+        self.status_label.pack(side="right", anchor="ne")
+        self.header_stop_process_button = ttk.Button(
+            status_shell,
+            text="Ferma tutto",
+            style="Secondary.TButton",
+            command=self._stop_current_process,
+            state="disabled",
+        )
+        self.header_stop_process_button.pack(side="right", padx=(0, 10), pady=(2, 0))
 
         self.page_scroll = VerticalScrolledFrame(container, background=APP_BG)
         self.page_scroll.pack(fill="both", expand=True, pady=(14, 0))
@@ -527,8 +562,61 @@ class ScraperApp:
             justify="left",
         ).grid(row=2, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(2, 8))
 
+        ttk.Label(card, text="Termini salvati").grid(row=3, column=0, sticky="nw", pady=(0, 10))
+        saved_search_terms_frame = ttk.Frame(card, style="Panel.TFrame")
+        saved_search_terms_frame.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(0, 10))
+        self.vinted_saved_search_terms_listbox = tk.Listbox(
+            saved_search_terms_frame,
+            selectmode="extended",
+            exportselection=False,
+            height=4,
+            bg="#ffffff",
+            fg=TEXT,
+            relief="solid",
+            borderwidth=1,
+        )
+        saved_search_terms_scroll = ttk.Scrollbar(
+            saved_search_terms_frame,
+            orient="vertical",
+            command=self.vinted_saved_search_terms_listbox.yview,
+        )
+        self.vinted_saved_search_terms_listbox.configure(yscrollcommand=saved_search_terms_scroll.set)
+        self.vinted_saved_search_terms_listbox.grid(row=0, column=0, sticky="nsew")
+        saved_search_terms_scroll.grid(row=0, column=1, sticky="ns")
+        saved_search_terms_frame.columnconfigure(0, weight=1)
+        saved_search_terms_actions = ttk.Frame(card, style="Panel.TFrame")
+        saved_search_terms_actions.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(0, 10))
+        ttk.Button(
+            saved_search_terms_actions,
+            text="Salva termine",
+            style="Secondary.TButton",
+            command=self._save_current_vinted_search_term,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            saved_search_terms_actions,
+            text="Usa selezionato",
+            style="Secondary.TButton",
+            command=self._apply_selected_vinted_search_term,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            saved_search_terms_actions,
+            text="Elimina selezionati",
+            style="Secondary.TButton",
+            command=self._delete_selected_vinted_saved_search_terms,
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            saved_search_terms_actions,
+            text="Pulisci selezione",
+            style="Secondary.TButton",
+            command=self._clear_vinted_saved_search_term_selection,
+        ).grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        saved_search_terms_actions.columnconfigure(0, weight=1)
+        saved_search_terms_actions.columnconfigure(1, weight=1)
+        saved_search_terms_actions.columnconfigure(2, weight=1)
+        saved_search_terms_actions.columnconfigure(3, weight=1)
+
         search_actions = ttk.Frame(card, style="Panel.TFrame")
-        search_actions.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 12))
+        search_actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 12))
         self.vinted_run_button = ttk.Button(
             search_actions,
             text="Avvia ricerca Vinted",
@@ -556,6 +644,11 @@ class ScraperApp:
             text="Ricarica login dal Chrome reale",
             variable=self.vinted_refresh_browser_profile_var,
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            keep_open_controls,
+            text="Escludi annunci gia analizzati nel DB",
+            variable=self.vinted_exclude_known_items_var,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.vinted_extract_button = ttk.Button(
             search_actions,
             text="Estrai descrizioni selezionati",
@@ -619,17 +712,38 @@ class ScraperApp:
         search_actions.columnconfigure(0, weight=2)
         search_actions.columnconfigure(1, weight=1)
 
-        ttk.Separator(card, orient="horizontal").grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 10))
-        ttk.Label(card, text="Archivio database", style="Metric.TLabel").grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        self._row(card, 7, "Database SQLite", self.vinted_db_path_var)
+        ttk.Separator(card, orient="horizontal").grid(row=7, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        ttk.Label(card, text="Archivio database", style="Metric.TLabel").grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._row(card, 9, "Database SQLite", self.vinted_db_path_var)
         ttk.Button(
             card,
             text="Scegli DB",
             style="Secondary.TButton",
             command=self._choose_vinted_db_path,
-        ).grid(row=7, column=2, sticky="e", padx=(8, 0), pady=(0, 10))
-        self._row(card, 8, "Filtro ricerca nel DB", self.vinted_db_filter_var, 30)
-        ttk.Label(card, text="Filtro rapido risultati").grid(row=9, column=0, sticky="w")
+        ).grid(row=9, column=2, sticky="e", padx=(8, 0), pady=(0, 10))
+        ttk.Label(card, text="Ricerca salvata").grid(row=10, column=0, sticky="w")
+        self.vinted_saved_run_box = ttk.Combobox(
+            card,
+            textvariable=self.vinted_saved_run_var,
+            state="readonly",
+            width=46,
+        )
+        self.vinted_saved_run_box.grid(row=10, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
+        ttk.Button(
+            card,
+            text="Aggiorna elenco",
+            style="Secondary.TButton",
+            command=self._refresh_vinted_saved_runs,
+        ).grid(row=10, column=2, sticky="e", pady=(0, 8))
+        self._row(card, 11, "Filtro archivio", self.vinted_saved_run_filter_var, 30)
+        ttk.Button(
+            card,
+            text="Filtra archivio",
+            style="Secondary.TButton",
+            command=self._refresh_vinted_saved_runs,
+        ).grid(row=11, column=2, sticky="e", pady=(0, 8))
+        self._row(card, 12, "Filtro ricerca nel DB", self.vinted_db_filter_var, 30)
+        ttk.Label(card, text="Filtro rapido risultati").grid(row=13, column=0, sticky="w")
         vinted_signal_filter_box = ttk.Combobox(
             card,
             textvariable=self.vinted_signal_filter_var,
@@ -637,18 +751,18 @@ class ScraperApp:
             state="readonly",
             width=28,
         )
-        vinted_signal_filter_box.grid(row=9, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
+        vinted_signal_filter_box.grid(row=13, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
         vinted_signal_filter_box.bind("<<ComboboxSelected>>", lambda _event: self._handle_vinted_signal_filter_change())
         ttk.Button(
             card,
             text="Applica",
             style="Secondary.TButton",
             command=self._handle_vinted_signal_filter_change,
-        ).grid(row=9, column=2, sticky="e", pady=(0, 8))
-        self._row(card, 10, "Limite righe DB (0 = tutte)", self.vinted_db_limit_var, 12)
+        ).grid(row=13, column=2, sticky="e", pady=(0, 8))
+        self._row(card, 14, "Limite righe DB (0 = tutte)", self.vinted_db_limit_var, 12)
 
         db_actions = ttk.Frame(card, style="Panel.TFrame")
-        db_actions.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(2, 8))
+        db_actions.grid(row=15, column=0, columnspan=3, sticky="ew", pady=(2, 8))
         ttk.Button(
             db_actions,
             text="Mostra database nei risultati",
@@ -657,18 +771,43 @@ class ScraperApp:
         ).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 8))
         ttk.Button(
             db_actions,
+            text="Carica ricerca salvata",
+            style="Secondary.TButton",
+            command=self._load_selected_vinted_saved_run,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 4), pady=(0, 8))
+        ttk.Button(
+            db_actions,
             text="Apri cartella database",
             style="Secondary.TButton",
             command=self._open_vinted_db_folder,
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=(0, 8))
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0), pady=(0, 8))
+        ttk.Button(
+            db_actions,
+            text="Rinomina",
+            style="Secondary.TButton",
+            command=self._rename_selected_vinted_saved_run,
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(0, 8))
+        ttk.Button(
+            db_actions,
+            text="Modifica note",
+            style="Secondary.TButton",
+            command=self._edit_selected_vinted_saved_run_notes,
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 4), pady=(0, 8))
+        ttk.Button(
+            db_actions,
+            text="Elimina",
+            style="Secondary.TButton",
+            command=self._delete_selected_vinted_saved_run,
+        ).grid(row=1, column=2, sticky="ew", padx=(4, 0), pady=(0, 8))
         ttk.Button(
             db_actions,
             text="Ripristina campi",
             style="Secondary.TButton",
             command=self._reset_vinted_form,
-        ).grid(row=1, column=0, columnspan=2, sticky="ew")
+        ).grid(row=2, column=0, columnspan=3, sticky="ew")
         db_actions.columnconfigure(0, weight=1)
         db_actions.columnconfigure(1, weight=1)
+        db_actions.columnconfigure(2, weight=1)
 
         ttk.Label(
             card,
@@ -676,47 +815,47 @@ class ScraperApp:
             style="Metric.TLabel",
             wraplength=760,
             justify="left",
-        ).grid(row=12, column=0, columnspan=3, sticky="w", pady=(4, 8))
+        ).grid(row=16, column=0, columnspan=3, sticky="w", pady=(4, 8))
         ttk.Label(
             card,
             text="I risultati vengono mostrati automaticamente nella sezione Risultati, esportati con le impostazioni globali e salvati nel database senza duplicare gli articoli.",
             style="Hint.TLabel",
             wraplength=760,
             justify="left",
-        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=17, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        ttk.Separator(card, orient="horizontal").grid(row=14, column=0, columnspan=3, sticky="ew", pady=(14, 10))
-        ttk.Label(card, text="Browser e export Vinted", style="Metric.TLabel").grid(row=15, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Separator(card, orient="horizontal").grid(row=18, column=0, columnspan=3, sticky="ew", pady=(14, 10))
+        ttk.Label(card, text="Browser e export Vinted", style="Metric.TLabel").grid(row=19, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-        ttk.Label(card, text="Sessione browser").grid(row=16, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(card, text="Sessione browser").grid(row=20, column=0, sticky="w", pady=(0, 8))
         ttk.Combobox(
             card,
             textvariable=self.browser_mode_var,
             values=("sessione_persistente", "chrome_normale", "profilo_personalizzato", "isolated"),
             state="readonly",
             width=24,
-        ).grid(row=16, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
-        ttk.Checkbutton(card, text="Connessione lenta", variable=self.slow_mode_var).grid(row=16, column=2, sticky="w", pady=(0, 8))
+        ).grid(row=20, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
+        ttk.Checkbutton(card, text="Connessione lenta", variable=self.slow_mode_var).grid(row=20, column=2, sticky="w", pady=(0, 8))
 
-        ttk.Label(card, text="Chrome User Data").grid(row=17, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(card, text="Chrome User Data").grid(row=21, column=0, sticky="w", pady=(0, 8))
         self.vinted_browser_user_data_entry = ttk.Entry(card, textvariable=self.browser_user_data_dir_var, width=54)
-        self.vinted_browser_user_data_entry.grid(row=17, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
+        self.vinted_browser_user_data_entry.grid(row=21, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
         self.vinted_browser_browse_button = ttk.Button(card, text="Sfoglia", style="Secondary.TButton", command=self._choose_browser_user_data_dir)
-        self.vinted_browser_browse_button.grid(row=17, column=2, sticky="e", pady=(0, 8))
+        self.vinted_browser_browse_button.grid(row=21, column=2, sticky="e", pady=(0, 8))
 
-        ttk.Label(card, text="Profile Directory").grid(row=18, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(card, text="Profile Directory").grid(row=22, column=0, sticky="w", pady=(0, 8))
         self.vinted_browser_profile_dir_entry = ttk.Entry(card, textvariable=self.browser_profile_directory_var, width=18)
-        self.vinted_browser_profile_dir_entry.grid(row=18, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
+        self.vinted_browser_profile_dir_entry.grid(row=22, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
         timing_frame = ttk.Frame(card, style="Panel.TFrame")
-        timing_frame.grid(row=18, column=2, sticky="ew", pady=(0, 8))
+        timing_frame.grid(row=22, column=2, sticky="ew", pady=(0, 8))
         ttk.Label(timing_frame, text="Pausa").grid(row=0, column=0, sticky="w")
         ttk.Entry(timing_frame, textvariable=self.action_delay_seconds_var, width=6).grid(row=0, column=1, sticky="w", padx=(4, 8))
         ttk.Label(timing_frame, text="Attesa").grid(row=0, column=2, sticky="w")
         ttk.Entry(timing_frame, textvariable=self.page_settle_seconds_var, width=6).grid(row=0, column=3, sticky="w", padx=(4, 0))
 
-        ttk.Label(card, text="Stato sessione").grid(row=19, column=0, sticky="nw", pady=(0, 8))
+        ttk.Label(card, text="Stato sessione").grid(row=23, column=0, sticky="nw", pady=(0, 8))
         profile_status_frame = ttk.Frame(card, style="Panel.TFrame")
-        profile_status_frame.grid(row=19, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(0, 8))
+        profile_status_frame.grid(row=23, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(0, 8))
         profile_status_frame.columnconfigure(1, weight=1)
         ttk.Label(profile_status_frame, text="Sessione").grid(row=0, column=0, sticky="w")
         ttk.Label(
@@ -754,24 +893,24 @@ class ScraperApp:
             command=self._update_vinted_profile_status,
         ).grid(row=0, column=2, rowspan=4, sticky="ne", padx=(12, 0))
 
-        ttk.Label(card, text="Export").grid(row=20, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(card, text="Export").grid(row=24, column=0, sticky="w", pady=(0, 8))
         export_frame = ttk.Frame(card, style="Panel.TFrame")
-        export_frame.grid(row=20, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(0, 8))
+        export_frame.grid(row=24, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(0, 8))
         ttk.Combobox(export_frame, textvariable=self.output_format_var, values=("json", "csv", "xlsx", "all"), state="readonly", width=10).grid(row=0, column=0, sticky="w")
         ttk.Label(export_frame, text="Nome").grid(row=0, column=1, sticky="w", padx=(12, 4))
         ttk.Entry(export_frame, textvariable=self.filename_var, width=24).grid(row=0, column=2, sticky="ew")
         export_frame.columnconfigure(2, weight=1)
 
-        ttk.Label(card, text="Cartella output").grid(row=21, column=0, sticky="w", pady=(0, 8))
-        ttk.Entry(card, textvariable=self.output_dir_var, width=54).grid(row=21, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
-        ttk.Button(card, text="Sfoglia", style="Secondary.TButton", command=self._choose_output_dir).grid(row=21, column=2, sticky="e", pady=(0, 8))
+        ttk.Label(card, text="Cartella output").grid(row=25, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(card, textvariable=self.output_dir_var, width=54).grid(row=25, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
+        ttk.Button(card, text="Sfoglia", style="Secondary.TButton", command=self._choose_output_dir).grid(row=25, column=2, sticky="e", pady=(0, 8))
         ttk.Label(
             card,
             text="Per Vinted usa sessione_persistente se vuoi mantenere login/cookie tra una ricerca e l altra. Attiva 'Ricarica login dal Chrome reale' solo quando vuoi importare di nuovo il profilo del browser principale; nei run normali lascialo spento per non sovrascrivere la sessione persistente dello scraper. Il formato export qui sopra e quello usato anche da Avvia ricerca Vinted.",
             style="Hint.TLabel",
             wraplength=760,
             justify="left",
-        ).grid(row=22, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ).grid(row=26, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
     def _build_subito_tab(self) -> None:
         self.subito_scroll = VerticalScrolledFrame(self.subito_tab, background=APP_BG)
@@ -971,8 +1110,14 @@ class ScraperApp:
         ttk.Button(card, text="Ricarica risultati", style="Secondary.TButton", command=self._load_results).grid(row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 0))
         ttk.Button(card, text="Pulisci log", style="Secondary.TButton", command=self._clear_log).grid(row=2, column=0, sticky="ew", pady=(10, 0), padx=(0, 6))
         ttk.Button(card, text="Apri lead su Maps", style="Secondary.TButton", command=self._open_selected_link).grid(row=2, column=1, sticky="ew", pady=(10, 0), padx=(6, 0))
-        self.stop_process_button = ttk.Button(card, text="Ferma processo", style="Secondary.TButton", command=self._stop_current_process)
-        self.stop_process_button.grid(row=3, column=0, sticky="ew", pady=(10, 0), padx=(0, 6))
+        self.action_stop_process_button = ttk.Button(
+            card,
+            text="Ferma processo",
+            style="Secondary.TButton",
+            command=self._stop_current_process,
+            state="disabled",
+        )
+        self.action_stop_process_button.grid(row=3, column=0, sticky="ew", pady=(10, 0), padx=(0, 6))
         self.stop_after_item_button = ttk.Button(card, text="Ferma dopo attivita", style="Secondary.TButton", command=self._request_stop_after_current_item)
         self.stop_after_item_button.grid(row=3, column=1, sticky="ew", pady=(10, 0), padx=(6, 0))
         self.skip_item_button = ttk.Button(card, text="Salta attivita corrente", style="Secondary.TButton", command=self._request_skip_current_item)
@@ -1054,6 +1199,7 @@ class ScraperApp:
         self.results_tree.tag_configure("vinted_hot", background="#fee2e2")
         self.results_tree.tag_configure("vinted_review", background="#fef3c7")
         self.results_tree.tag_configure("vinted_badge", background="#ecfccb")
+        self.results_tree.tag_configure("vinted_shipping_alert", background="#ffedd5")
         y_scroll = ttk.Scrollbar(card, orient="vertical", command=self.results_tree.yview)
         x_scroll = ttk.Scrollbar(card, orient="horizontal", command=self.results_tree.xview)
         self.results_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
@@ -1138,6 +1284,23 @@ class ScraperApp:
             state="disabled",
         )
         self.export_links_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.vinted_offer_button = ttk.Button(
+            lead_card,
+            text="Fai offerta -15%",
+            style="Accent.TButton",
+            command=self._start_vinted_offer_action,
+            state="disabled",
+        )
+        self.vinted_offer_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        offer_discount_frame = ttk.Frame(lead_card, style="Panel.TFrame")
+        offer_discount_frame.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(offer_discount_frame, text="Sconto offerta (%)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(offer_discount_frame, textvariable=self.vinted_offer_discount_percent_var, width=8).grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=(8, 0),
+        )
         lead_card.columnconfigure(0, weight=1)
         lead_card.columnconfigure(1, weight=1)
 
@@ -1207,8 +1370,10 @@ class ScraperApp:
             column_config = (
                 ("search_term", "Ricerca", 120, "w"),
                 ("evaluation_label", "Valutazione", 170, "center"),
+                ("shipping_alert", "Alert", 110, "center"),
                 ("tag", "Tag", 95, "center"),
                 ("name", "Nome prodotto", 300, "w"),
+                ("shipping_price", "Spedizione", 95, "center"),
                 ("price_value", "Totale", 90, "center"),
                 ("favorite_count", "Preferiti", 85, "center"),
                 ("item_id", "ID articolo", 110, "center"),
@@ -1262,7 +1427,7 @@ class ScraperApp:
                 self.lead_card.pack(fill="x", pady=(12, 0))
             if source == "vinted":
                 self.lead_card.configure(text="Azioni prodotto")
-                self.lead_action_hint_label.configure(text="Apri l'annuncio Vinted selezionato per verificare foto e dettagli originali.")
+                self._update_vinted_offer_ui_copy()
                 self.open_selected_button.configure(text="Apri annuncio Vinted")
             else:
                 self.lead_card.configure(text="Azioni lead")
@@ -1527,6 +1692,60 @@ class ScraperApp:
         finally:
             self.vinted_login_prompt_open = False
 
+    def _set_stop_process_buttons_state(self, state: str) -> None:
+        for attribute in ("header_stop_process_button", "action_stop_process_button"):
+            button = getattr(self, attribute, None)
+            if button is not None:
+                button.configure(state=state)
+
+    def _set_runtime_status(self, status_text: str) -> None:
+        clean_status = str(status_text or "").strip() or "Idle"
+        self.status_var.set(clean_status)
+        normalized = clean_status.lower()
+        style_name = "StatusIdle.TLabel"
+        if normalized.startswith("running"):
+            style_name = "StatusRunning.TLabel"
+        elif normalized.startswith("stopping"):
+            style_name = "StatusStopping.TLabel"
+        elif normalized.startswith("error"):
+            style_name = "StatusError.TLabel"
+        if hasattr(self, "status_label"):
+            self.status_label.configure(style=style_name)
+
+    def _parse_vinted_offer_discount_percent_value(self, raw_value: object) -> float:
+        text = str(raw_value or "").strip().replace("%", "").replace(",", ".")
+        if not text:
+            raise ValueError("Inserisci la percentuale di sconto per l'offerta Vinted.")
+        try:
+            value = float(text)
+        except ValueError as exc:
+            raise ValueError("Percentuale offerta Vinted non valida.") from exc
+        if value < 0 or value >= 100:
+            raise ValueError("Percentuale offerta Vinted deve essere tra 0 e 99.99.")
+        return value
+
+    def _format_vinted_offer_discount_percent_label(self, value: float | None = None) -> str:
+        percent_value = self._parse_vinted_offer_discount_percent_value(
+            self.vinted_offer_discount_percent_var.get() if value is None else value
+        )
+        return f"{percent_value:.2f}".rstrip("0").rstrip(".")
+
+    def _update_vinted_offer_ui_copy(self) -> None:
+        raw_value = self.vinted_offer_discount_percent_var.get().strip()
+        try:
+            percent_label = self._format_vinted_offer_discount_percent_label()
+        except ValueError:
+            percent_label = raw_value or "?"
+        if hasattr(self, "vinted_offer_button"):
+            self.vinted_offer_button.configure(text=f"Fai offerta -{percent_label}%")
+        if getattr(self, "current_result_source", "") == "vinted" and hasattr(self, "lead_action_hint_label"):
+            self.lead_action_hint_label.configure(
+                text=(
+                    "Apri l'annuncio Vinted selezionato per verificare foto e dettagli originali "
+                    f"oppure invia un'offerta automatica calcolata come prezzo annuncio - {percent_label}%."
+                )
+            )
+
     def _update_result_actions(self) -> None:
         row = self._get_selected_row()
         selected_rows = self._get_selected_rows()
@@ -1537,10 +1756,12 @@ class ScraperApp:
         has_row = row is not None and bool(str(row.get("link", "") or "").strip())
         has_website = row is not None and bool(str(row.get("website", "") or "").strip())
         is_subito = has_row and str(row.get("source", "") or "").strip().lower() == "subito"
+        is_vinted = has_row and str(row.get("source", "") or "").strip().lower() == "vinted"
         self.open_selected_button.configure(state="normal" if has_row else "disabled")
         self.subito_open_selected_button.configure(state="normal" if has_row else "disabled")
         self.open_website_button.configure(state="normal" if has_website else "disabled")
         self.export_links_button.configure(state="normal" if selected_rows_with_links else "disabled")
+        self.vinted_offer_button.configure(state="normal" if is_vinted else "disabled")
         if hasattr(self, "vinted_extract_button"):
             self.vinted_extract_button.configure(state="normal" if selected_vinted_rows else "disabled")
         self.contact_button.configure(state="normal" if is_subito else "disabled")
@@ -1560,6 +1781,81 @@ class ScraperApp:
             self.vinted_search_preview_var.set(search)
         else:
             self.vinted_search_preview_var.set(f"https://www.vinted.it/catalog?search_text={quote_plus(search)}")
+
+    def _selected_vinted_saved_search_terms(self) -> list[str]:
+        if not hasattr(self, "vinted_saved_search_terms_listbox"):
+            return []
+        selected_terms: list[str] = []
+        for index in self.vinted_saved_search_terms_listbox.curselection():
+            if 0 <= index < len(self.vinted_saved_search_terms):
+                selected_terms.append(self.vinted_saved_search_terms[index])
+        return selected_terms
+
+    def _refresh_vinted_saved_search_terms(self, preserve_selection: list[str] | None = None) -> None:
+        try:
+            terms = load_saved_search_terms("vinted")
+        except ValueError:
+            terms = []
+        if preserve_selection is None:
+            preserve_selection = self._selected_vinted_saved_search_terms()
+        selected_lookup = {str(term or "").strip().lower() for term in preserve_selection if str(term or "").strip()}
+        self.vinted_saved_search_terms = terms
+        if not hasattr(self, "vinted_saved_search_terms_listbox"):
+            return
+        self.vinted_saved_search_terms_listbox.delete(0, tk.END)
+        for index, term in enumerate(terms):
+            self.vinted_saved_search_terms_listbox.insert(tk.END, term)
+            if term.lower() in selected_lookup:
+                self.vinted_saved_search_terms_listbox.selection_set(index)
+
+    def _save_vinted_search_term_value(self, value: str, quiet: bool = False) -> str | None:
+        clean_value = str(value or "").strip()
+        if not clean_value:
+            if not quiet:
+                messagebox.showerror("Termini ricerca Vinted", "Inserisci una ricerca o un URL Vinted da salvare.")
+            return None
+        try:
+            save_search_term("vinted", clean_value)
+        except ValueError as exc:
+            if not quiet:
+                messagebox.showerror("Termini ricerca Vinted", str(exc))
+            return None
+        self._refresh_vinted_saved_search_terms(preserve_selection=[clean_value])
+        return clean_value
+
+    def _save_current_vinted_search_term(self) -> None:
+        saved_value = self._save_vinted_search_term_value(self.vinted_search_var.get(), quiet=False)
+        if saved_value:
+            self.vinted_status_var.set(f"Termine di ricerca salvato: {saved_value}.")
+
+    def _apply_selected_vinted_search_term(self) -> None:
+        selected_terms = self._selected_vinted_saved_search_terms()
+        if not selected_terms:
+            messagebox.showerror("Termini ricerca Vinted", "Seleziona almeno un termine salvato.")
+            return
+        selected_value = selected_terms[0]
+        self.vinted_search_var.set(selected_value)
+        self.vinted_status_var.set(f"Termine caricato nel campo ricerca: {selected_value}.")
+
+    def _delete_selected_vinted_saved_search_terms(self) -> None:
+        selected_terms = self._selected_vinted_saved_search_terms()
+        if not selected_terms:
+            messagebox.showerror("Termini ricerca Vinted", "Seleziona almeno un termine salvato da eliminare.")
+            return
+        remaining_terms = delete_saved_search_terms("vinted", selected_terms)
+        self._refresh_vinted_saved_search_terms()
+        deleted_count = len(selected_terms)
+        self.vinted_status_var.set(
+            f"Termini eliminati: {deleted_count}. Termini salvati rimasti: {len(remaining_terms)}."
+        )
+
+    def _delete_selected_vinted_search_terms(self) -> None:
+        self._delete_selected_vinted_saved_search_terms()
+
+    def _clear_vinted_saved_search_term_selection(self) -> None:
+        if not hasattr(self, "vinted_saved_search_terms_listbox"):
+            return
+        self.vinted_saved_search_terms_listbox.selection_clear(0, tk.END)
 
     def _parse_vinted_max_price_value(self, raw_value: str) -> float | None:
         text = str(raw_value or "").strip().replace("€", "").replace(" ", "")
@@ -1616,6 +1912,7 @@ class ScraperApp:
         except ValueError as exc:
             messagebox.showerror("Ricerche Vinted", str(exc))
             return
+        self._save_vinted_search_term_value(str(spec.get("search", "") or ""), quiet=True)
         self.vinted_search_specs.append(
             {
                 "search": spec["search"],
@@ -1663,6 +1960,8 @@ class ScraperApp:
         if self.process is not None:
             messagebox.showinfo("Ricerca Vinted", "Attendi la fine del processo corrente.")
             return
+        if not self.vinted_search_specs:
+            self._save_vinted_search_term_value(self.vinted_search_var.get(), quiet=True)
         active_browser = get_active_vinted_browser_session() if self.vinted_keep_browser_open_var.get() else None
         self.vinted_status_var.set("Avvio della ricerca Vinted in corso...")
         self._start_scrape()
@@ -1746,6 +2045,137 @@ class ScraperApp:
         if selected_path:
             self.vinted_db_path_var.set(selected_path)
             self.vinted_status_var.set("Database selezionato. Premi Mostra database oppure avvia una ricerca.")
+            self._refresh_vinted_saved_runs(quiet=True)
+
+    def _refresh_vinted_saved_runs(self, quiet: bool = False, prefer_run_key: str = "") -> None:
+        db_path = self.vinted_db_path_var.get().strip()
+        if not db_path:
+            self.vinted_saved_runs = []
+            self.vinted_saved_run_lookup = {}
+            if hasattr(self, "vinted_saved_run_box"):
+                self.vinted_saved_run_box.configure(values=())
+            self.vinted_saved_run_var.set("")
+            return
+        try:
+            runs = list_vinted_search_runs(
+                db_path=db_path,
+                limit=200,
+                run_kind="search",
+                text_filter=self.vinted_saved_run_filter_var.get().strip(),
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            self.vinted_saved_runs = []
+            self.vinted_saved_run_lookup = {}
+            if hasattr(self, "vinted_saved_run_box"):
+                self.vinted_saved_run_box.configure(values=())
+            self.vinted_saved_run_var.set("")
+            if not quiet:
+                messagebox.showerror("Database Vinted", str(exc))
+            return
+        self.vinted_saved_runs = runs
+        self.vinted_saved_run_lookup = {str(run.get("label", "")): run for run in runs}
+        labels = [str(run.get("label", "")) for run in runs if str(run.get("label", ""))]
+        if hasattr(self, "vinted_saved_run_box"):
+            self.vinted_saved_run_box.configure(values=labels)
+        selected_label = self.vinted_saved_run_var.get().strip()
+        if prefer_run_key:
+            for run in runs:
+                if str(run.get("run_key", "")) == prefer_run_key:
+                    selected_label = str(run.get("label", ""))
+                    break
+        if selected_label not in self.vinted_saved_run_lookup:
+            selected_label = labels[0] if labels else ""
+        self.vinted_saved_run_var.set(selected_label)
+
+    def _selected_vinted_saved_run(self) -> dict[str, int | str] | None:
+        label = self.vinted_saved_run_var.get().strip()
+        if not label:
+            return None
+        return self.vinted_saved_run_lookup.get(label)
+
+    def _rename_selected_vinted_saved_run(self) -> None:
+        selected_run = self._selected_vinted_saved_run()
+        if not selected_run:
+            messagebox.showerror("Ricerca salvata", "Seleziona una ricerca salvata da rinominare.")
+            return
+        current_title = str(selected_run.get("title", "") or "")
+        new_title = simpledialog.askstring(
+            "Rinomina ricerca salvata",
+            "Titolo personalizzato della ricerca salvata:",
+            initialvalue=current_title,
+            parent=self.root,
+        )
+        if new_title is None:
+            return
+        try:
+            updated = update_vinted_search_run(
+                run_key=str(selected_run.get("run_key", "")),
+                db_path=self.vinted_db_path_var.get().strip(),
+                title=new_title,
+            )
+        except ValueError as exc:
+            messagebox.showerror("Ricerca salvata", str(exc))
+            return
+        self._refresh_vinted_saved_runs(quiet=True, prefer_run_key=str(updated.get("run_key", "")))
+        self.vinted_status_var.set("Titolo ricerca salvata aggiornato.")
+
+    def _edit_selected_vinted_saved_run_notes(self) -> None:
+        selected_run = self._selected_vinted_saved_run()
+        if not selected_run:
+            messagebox.showerror("Ricerca salvata", "Seleziona una ricerca salvata di cui modificare le note.")
+            return
+        current_notes = str(selected_run.get("notes", "") or "")
+        new_notes = simpledialog.askstring(
+            "Note ricerca salvata",
+            "Note archivio per questa ricerca:",
+            initialvalue=current_notes,
+            parent=self.root,
+        )
+        if new_notes is None:
+            return
+        try:
+            updated = update_vinted_search_run(
+                run_key=str(selected_run.get("run_key", "")),
+                db_path=self.vinted_db_path_var.get().strip(),
+                notes=new_notes,
+            )
+        except ValueError as exc:
+            messagebox.showerror("Ricerca salvata", str(exc))
+            return
+        self._refresh_vinted_saved_runs(quiet=True, prefer_run_key=str(updated.get("run_key", "")))
+        self.vinted_status_var.set("Note ricerca salvata aggiornate.")
+
+    def _delete_selected_vinted_saved_run(self) -> None:
+        selected_run = self._selected_vinted_saved_run()
+        if not selected_run:
+            messagebox.showerror("Ricerca salvata", "Seleziona una ricerca salvata da eliminare.")
+            return
+        label = str(selected_run.get("label", "") or "ricerca salvata")
+        confirmed = messagebox.askyesno(
+            "Elimina ricerca salvata",
+            f"Vuoi eliminare questa ricerca salvata?\n\n{label}\n\nGli articoli restano nel database generale.",
+        )
+        if not confirmed:
+            return
+        try:
+            result = delete_vinted_search_run(
+                run_key=str(selected_run.get("run_key", "")),
+                db_path=self.vinted_db_path_var.get().strip(),
+            )
+        except ValueError as exc:
+            messagebox.showerror("Ricerca salvata", str(exc))
+            return
+        self._refresh_vinted_saved_runs(quiet=True)
+        self.vinted_status_var.set(
+            f"Ricerca salvata eliminata. Ricerche archiviate rimaste: {result.get('db_total_search_runs', 0)}."
+        )
+
+    def _load_selected_vinted_saved_run(self) -> None:
+        selected_run = self._selected_vinted_saved_run()
+        if not selected_run:
+            messagebox.showerror("Ricerca salvata", "Seleziona una ricerca salvata dal menu Archivio database.")
+            return
+        self._load_vinted_database_results(search_run_key=str(selected_run.get("run_key", "")))
 
     def _build_vinted_description_command(self, rows: list[dict]) -> list[str]:
         if not rows:
@@ -1821,15 +2251,22 @@ class ScraperApp:
         self.vinted_search_var.set("macbook")
         self.vinted_max_results_var.set("100")
         self.vinted_max_price_var.set("")
+        self.vinted_offer_discount_percent_var.set("15")
         self.vinted_db_path_var.set(str((self.script_path.parent / "data" / "scraper.db").resolve()))
         self.vinted_db_filter_var.set("")
+        self.vinted_saved_run_filter_var.set("")
         self.vinted_db_limit_var.set("500")
         self.vinted_signal_filter_var.set("tutti")
+        self.vinted_saved_run_var.set("")
         self.vinted_keep_browser_open_var.set(True)
         self.vinted_keep_open_seconds_var.set("0")
+        self.vinted_exclude_known_items_var.set(True)
         self.vinted_refresh_browser_profile_var.set(False)
         self.vinted_search_specs.clear()
         self._refresh_vinted_search_specs_tree()
+        self._clear_vinted_saved_search_term_selection()
+        self._refresh_vinted_saved_search_terms()
+        self._refresh_vinted_saved_runs(quiet=True)
         self.vinted_status_var.set("Campi Vinted ripristinati.")
         self._update_vinted_profile_status()
 
@@ -2040,6 +2477,63 @@ class ScraperApp:
         self._scroll_to_widget(self.log_tab)
         self._start_process(command, kind="contact", load_results=False)
 
+    def _start_vinted_offer_action(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Offerta Vinted", "Attendi la fine del processo corrente.")
+            return
+        rows = [row for row in self._get_selected_rows() if str(row.get("source", "") or "").strip().lower() == "vinted"]
+        if not rows:
+            messagebox.showerror("Offerta Vinted", "Seleziona almeno un annuncio Vinted nei risultati.")
+            return
+        rows, skipped_rows = self._split_vinted_offer_submission_rows(rows)
+        if skipped_rows and not rows:
+            messagebox.showinfo(
+                "Offerta Vinted",
+                "Tutti gli annunci selezionati hanno gia un'offerta inviata e vengono saltati.",
+            )
+            return
+        if skipped_rows:
+            messagebox.showinfo(
+                "Offerta Vinted",
+                f"{len(skipped_rows)} annunci con offerta gia inviata verranno esclusi automaticamente.",
+            )
+        try:
+            offer_discount_percent = self._parse_vinted_offer_discount_percent_value(
+                self.vinted_offer_discount_percent_var.get()
+            )
+        except ValueError as exc:
+            messagebox.showerror("Offerta Vinted", str(exc))
+            return
+        offer_discount_label = self._format_vinted_offer_discount_percent_label(offer_discount_percent)
+        preview_lines = []
+        for row in rows[:8]:
+            title = str(row.get("name", "") or "Annuncio senza nome").strip()
+            base_price = row.get("price_value", row.get("total_price_value"))
+            try:
+                preview_offer = round(float(base_price) * (1.0 - (offer_discount_percent / 100.0)), 2)
+                preview_lines.append(f"- {title} | prezzo {float(base_price):.2f} € -> offerta {preview_offer:.2f} €")
+            except (TypeError, ValueError):
+                preview_lines.append(f"- {title} | prezzo non valido in tabella")
+        remaining = len(rows) - len(preview_lines)
+        if remaining > 0:
+            preview_lines.append(f"... altri {remaining} annunci")
+        if not messagebox.askyesno(
+            "Conferma offerta Vinted",
+            f"Stai per aprire gli annunci selezionati e inviare un'offerta automatica (-{offer_discount_label}%) per ciascuno.\n\n"
+            f"Annunci coinvolti: {len(rows)}\n\nAnteprima:\n"
+            + "\n".join(preview_lines)
+            + "\n\nConfermi?",
+        ):
+            return
+        try:
+            command = self._build_vinted_offer_command(rows)
+        except ValueError as exc:
+            messagebox.showerror("Offerta Vinted", str(exc))
+            return
+        self.vinted_status_var.set(f"Invio offerte Vinted in corso su {len(rows)} annunci...")
+        self._scroll_to_widget(self.log_tab)
+        self._start_process(command, kind="vinted_offer", load_results=False)
+
     def _start_batch_contact_selected(self) -> None:
         rows = self._get_selected_rows()
         if not rows:
@@ -2103,12 +2597,14 @@ class ScraperApp:
         clear_runtime_control_requests()
         self.process_kind = kind
         self.process_should_load_results = load_results
+        self.process_stop_requested = False
         self.vinted_access_warning_shown_for_process = False
-        self.status_var.set("Running")
+        self._set_runtime_status("Running")
         self._append_log(f"$ {' '.join(command)}\n")
         self.run_button.configure(state="disabled")
         self.open_browser_button.configure(state="disabled")
         self.vinted_run_button.configure(state="disabled")
+        self._set_stop_process_buttons_state("normal")
         if kind == "contact":
             self.contact_button.configure(state="disabled")
         if kind == "scrape":
@@ -2119,17 +2615,70 @@ class ScraperApp:
             if self.ui_result_json_path.exists():
                 self.ui_result_json_path.unlink()
             self.ui_result_json_mtime = 0.0
-        self.process = subprocess.Popen(command, cwd=self.script_path.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        process_kwargs: dict[str, object] = {
+            "cwd": self.script_path.parent,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+        }
+        if os.name == "nt":
+            process_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            process_kwargs["start_new_session"] = True
+        self.process = subprocess.Popen(command, **process_kwargs)
         threading.Thread(target=self._read_process_output, daemon=True).start()
 
     def _stop_current_process(self) -> None:
         if self.process is None:
             messagebox.showinfo("Ferma processo", "Nessun processo in esecuzione.")
             return
+        self._stop_auto_monitor()
         clear_runtime_control_requests()
-        self._append_log("[control] Richiesta di stop immediato del processo.\n")
-        self.status_var.set("Stopping")
-        self.process.terminate()
+        process = self.process
+        self.process_stop_requested = True
+        self._append_log("[control] Richiesta di stop immediato di tutti i processi attivi del run.\n")
+        self._set_runtime_status("Stopping...")
+        self._set_stop_process_buttons_state("disabled")
+        self._terminate_process_tree(process)
+
+    def _terminate_process_tree(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            except Exception:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:
+                return
+        self.root.after(1500, lambda current_process=process: self._force_kill_process_if_alive(current_process))
+
+    def _force_kill_process_if_alive(self, process: subprocess.Popen[str]) -> None:
+        if self.process is not process:
+            return
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
 
     def _request_stop_after_current_item(self) -> None:
         if self.process is None:
@@ -2194,6 +2743,7 @@ class ScraperApp:
                     cmd += ["--keep-open-seconds", keep_open_seconds]
             else:
                 cmd.append("--no-keep-browser-open")
+            cmd.append("--exclude-known-items" if self.vinted_exclude_known_items_var.get() else "--no-exclude-known-items")
             if self.vinted_refresh_browser_profile_var.get():
                 cmd.append("--refresh-browser-profile")
         elif selected == "Subito Jobs":
@@ -2378,6 +2928,87 @@ class ScraperApp:
             cmd += ["--message", message]
         if self.contact_submit_var.get():
             cmd.append("--submit")
+        cmd += self._browser_command_args()
+        return cmd
+
+    def _annotate_vinted_rows_with_offer_history(self, rows: list[dict]) -> list[dict]:
+        if not rows:
+            return []
+        db_path = self.vinted_db_path_var.get().strip() or str((self.script_path.parent / "data" / "scraper.db").resolve())
+        try:
+            return annotate_rows_with_vinted_offer_history(rows, db_path=db_path)
+        except Exception:
+            return [dict(row) for row in rows]
+
+    def _split_vinted_offer_submission_rows(self, rows: list[dict]) -> tuple[list[dict], list[dict]]:
+        annotated_rows = self._annotate_vinted_rows_with_offer_history(rows)
+        eligible_rows: list[dict] = []
+        skipped_rows: list[dict] = []
+        seen_identity_keys: set[str] = set()
+        for row in annotated_rows:
+            identity_keys = build_vinted_item_identity_keys(
+                item_id=row.get("item_id", ""),
+                link=row.get("link", ""),
+            )
+            dedupe_key = identity_keys[0] if identity_keys else str(row.get("link", "") or "")
+            if dedupe_key and dedupe_key in seen_identity_keys:
+                continue
+            if dedupe_key:
+                seen_identity_keys.add(dedupe_key)
+            if bool(row.get("offer_already_submitted")):
+                skipped_rows.append(row)
+            else:
+                eligible_rows.append(row)
+        return eligible_rows, skipped_rows
+
+    def _build_vinted_offer_command(self, rows: list[dict] | None = None) -> list[str]:
+        selected_rows = rows if rows is not None else [row for row in self._get_selected_rows() if str(row.get("source", "") or "").strip().lower() == "vinted"]
+        if not selected_rows:
+            raise ValueError("Seleziona almeno un annuncio Vinted nei risultati.")
+        if not browser_mode_uses_profile(self.browser_mode_var.get()):
+            raise ValueError("Per usare l'offerta Vinted automatica usa sessione_persistente, chrome_normale o profilo_personalizzato.")
+        selected_rows, skipped_rows = self._split_vinted_offer_submission_rows(selected_rows)
+        if not selected_rows:
+            raise ValueError("Non ci sono annunci Vinted nuovi da processare. Le offerte gia inviate vengono escluse automaticamente.")
+        offer_discount_percent = self._parse_vinted_offer_discount_percent_value(
+            self.vinted_offer_discount_percent_var.get()
+        )
+        offer_items = self._build_vinted_offer_items(selected_rows)
+        if not offer_items:
+            raise ValueError("Gli annunci Vinted selezionati non hanno link/prezzi validi.")
+
+        cmd = [
+            sys.executable,
+            str(self.script_path),
+            "contact",
+            "vinted",
+            "--submit",
+            "--offer-discount-percent",
+            str(offer_discount_percent),
+            "--db-path",
+            self.vinted_db_path_var.get().strip() or "data/scraper.db",
+        ]
+        if len(offer_items) == 1:
+            item = offer_items[0]
+            cmd += [
+                "--link",
+                item["link"],
+                "--base-price",
+                item["base_price"],
+            ]
+        else:
+            items_file = self._write_vinted_offer_items_file(offer_items)
+            cmd += ["--links-file", str(items_file)]
+        keep_open_seconds = self.vinted_keep_open_seconds_var.get().strip() or "0"
+        if self.vinted_keep_browser_open_var.get():
+            if not keep_open_seconds.isdigit():
+                raise ValueError("I secondi per tenere aperto il browser Vinted devono essere un intero maggiore o uguale a zero.")
+            if int(keep_open_seconds) == 0:
+                cmd.append("--keep-browser-open")
+            else:
+                cmd += ["--keep-open-seconds", keep_open_seconds]
+        else:
+            cmd.append("--no-keep-browser-open")
         cmd += self._browser_command_args()
         return cmd
 
@@ -2623,6 +3254,40 @@ class ScraperApp:
         links_file.write_text(json.dumps(links, ensure_ascii=False, indent=2), encoding="utf-8")
         return links_file
 
+    def _build_vinted_offer_items(self, rows: list[dict]) -> list[dict]:
+        items: list[dict] = []
+        seen_links: set[str] = set()
+        for row in rows:
+            if str(row.get("source", "") or "").strip().lower() != "vinted":
+                continue
+            if bool(row.get("offer_already_submitted")):
+                continue
+            link = str(row.get("link", "") or "").strip()
+            if not link or link in seen_links:
+                continue
+            base_price = row.get("price_value", row.get("total_price_value"))
+            try:
+                normalized_base_price = f"{float(base_price):.2f}"
+            except (TypeError, ValueError):
+                continue
+            seen_links.add(link)
+            items.append(
+                {
+                    "link": link,
+                    "item_id": str(row.get("item_id", "") or "").strip(),
+                    "base_price": normalized_base_price,
+                    "name": str(row.get("name", "") or "").strip(),
+                }
+            )
+        return items
+
+    def _write_vinted_offer_items_file(self, items: list[dict]) -> Path:
+        output_dir = Path(self.output_dir_var.get()).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        items_file = output_dir / "_ui_vinted_offer_items.json"
+        items_file.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        return items_file
+
     def _read_process_output(self) -> None:
         assert self.process is not None and self.process.stdout is not None
         for line in self.process.stdout:
@@ -2664,18 +3329,25 @@ class ScraperApp:
                 code = int(line.split(":", 1)[1])
                 completed_kind = self.process_kind
                 should_load_results = self.process_should_load_results
+                stop_requested = self.process_stop_requested
                 self.process = None
                 clear_runtime_control_requests()
                 self.process_kind = ""
                 self.process_should_load_results = False
+                self.process_stop_requested = False
                 self.vinted_access_warning_shown_for_process = False
                 self.vinted_login_prompt_open = False
-                self.status_var.set("Idle" if code == 0 else "Error")
+                self._set_runtime_status("Idle" if code == 0 or stop_requested else "Error")
                 self._update_vinted_profile_status()
                 self.run_button.configure(state="normal")
                 self.open_browser_button.configure(state="normal")
                 self.vinted_run_button.configure(state="normal")
+                self._set_stop_process_buttons_state("disabled")
                 self._update_result_actions()
+                if stop_requested:
+                    self._append_log("[control] Processo fermato manualmente.\n")
+                    self.vinted_status_var.set("Processo fermato manualmente.")
+                    continue
                 if code == 0 and should_load_results:
                     self._load_results()
                 if completed_kind == "scrape" and self.auto_monitor_enabled:
@@ -2689,6 +3361,13 @@ class ScraperApp:
                         messagebox.showinfo("Contatto pronto", "Flusso Contatta eseguito. Controlla il browser e il log.")
                     else:
                         messagebox.showerror("Contatto fallito", "Il flusso Contatta non e stato completato. Controlla il log.")
+                elif completed_kind == "vinted_offer":
+                    if code == 0:
+                        self.vinted_status_var.set("Offerta Vinted completata.")
+                        messagebox.showinfo("Offerta Vinted completata", "Flusso offerta Vinted eseguito. Controlla il browser e il log.")
+                    else:
+                        self.vinted_status_var.set("Offerta Vinted fallita. Controlla il log per il dettaglio.")
+                        messagebox.showerror("Offerta Vinted fallita", "Il flusso offerta Vinted non e stato completato. Controlla il log.")
                 continue
             self._append_log(line)
         self._maybe_load_live_results()
@@ -2742,7 +3421,7 @@ class ScraperApp:
             return
         self._load_results()
 
-    def _load_vinted_database_results(self) -> None:
+    def _load_vinted_database_results(self, search_run_key: str = "") -> None:
         db_path = self.vinted_db_path_var.get().strip()
         if not db_path:
             messagebox.showerror("Database Vinted", "Inserisci il percorso del database SQLite.")
@@ -2758,6 +3437,7 @@ class ScraperApp:
                 search_term=self.vinted_db_filter_var.get().strip(),
                 tag_filter="",
                 limit=int(raw_limit),
+                search_run_key=str(search_run_key or "").strip(),
             )
         except (FileNotFoundError, ValueError) as exc:
             self.vinted_status_var.set("Impossibile caricare il database Vinted.")
@@ -2778,6 +3458,7 @@ class ScraperApp:
             encoding="utf-8",
         )
         self.current_run_source = "vinted"
+        self._refresh_vinted_saved_runs(quiet=True, prefer_run_key=str(meta.get("db_search_run_key", "") or ""))
         self._load_results()
 
     def _load_results(self) -> None:
@@ -2804,7 +3485,13 @@ class ScraperApp:
         self.current_result_source = source
         self.current_result_meta = dict(payload.get("meta", {}) or {})
         if source == "vinted":
+            rows = self._annotate_vinted_rows_with_offer_history(rows)
+        if source == "vinted":
             self._sync_vinted_access_from_meta(self.current_result_meta)
+            self._refresh_vinted_saved_runs(
+                quiet=True,
+                prefer_run_key=str(self.current_result_meta.get("search_run_key", "") or self.current_result_meta.get("db_search_run_key", "") or ""),
+            )
         self._configure_results_columns(source)
         self._configure_result_panels(source)
         lead_sort_modes = {
@@ -2889,19 +3576,24 @@ class ScraperApp:
                 self.result_counts_var.set(
                     f"nuovi articoli {meta.get('new_items', 0)} | "
                     f"aggiornati {meta.get('updated_items', 0)} | "
-                    f"nuovi tag {meta.get('new_search_hits', 0)}"
+                    f"nuovi tag {meta.get('new_search_hits', 0)} | "
+                    f"gia analizzati {meta.get('filtered_out_known_items', 0)}"
                 )
                 self.vinted_status_var.set(
-                    f"Ricerca completata: {len(rows)} prodotti visibili con filtro {active_filter}, {meta.get('new_items', 0)} nuovi nel database."
+                    f"Ricerca completata: {len(rows)} prodotti visibili con filtro {active_filter}, "
+                    f"{meta.get('new_items', 0)} nuovi nel database, {meta.get('filtered_out_known_items', 0)} gia analizzati saltati."
                 )
             self.result_meta_var.set(
                 " | ".join(
                     (
                         "Sorgente: Vinted",
+                        f"Archivio: {meta.get('db_search_run_label', '') or meta.get('search_run_label', '-')}",
+                        f"Note archivio: {meta.get('db_search_run_notes', '') or '-'}",
                         f"Ricerca: {meta.get('db_search_filter', '') or meta.get('search_term', 'tutte')}",
                         f"Conteggio ricerche: {meta.get('search_count', 1)}",
                         f"Prezzo max: {meta.get('max_price', '-')}",
                         f"Tag: {meta.get('db_tag_filter', '') or meta.get('tag', '') or 'tutti'}",
+                        f"Ricerche salvate: {meta.get('db_total_search_runs', '-')}",
                         f"Filtro rapido: {active_filter}",
                         f"Database: {meta.get('db_path', '-')}",
                         f"Generato: {payload.get('generated_at', '-')}",
@@ -3002,11 +3694,14 @@ class ScraperApp:
                     else "-"
                 )
                 evaluation_label = str(row.get("evaluation_label", "") or "-")
+                shipping_alert = str(row.get("shipping_alert", "") or "")
                 values = (
                     str(row.get("search_term", "") or ""),
                     evaluation_label,
+                    shipping_alert,
                     str(row.get("tag", "") or "-"),
                     str(row.get("name", "") or ""),
+                    self._vinted_shipping_display_value(row),
                     self._vinted_total_display_value(row),
                     favorite_display,
                     str(row.get("item_id", "") or ""),
@@ -3018,6 +3713,8 @@ class ScraperApp:
                     tag = "vinted_hot"
                 elif evaluation_label == "da valutare":
                     tag = "vinted_review"
+                elif str(row.get("shipping_alert", "") or "").strip():
+                    tag = "vinted_shipping_alert"
                 elif str(row.get("tag", "") or "").strip().lower() == "ricercato":
                     tag = "vinted_badge"
                 else:
@@ -3308,6 +4005,15 @@ class ScraperApp:
             return ""
         return str(raw_value)
 
+    def _vinted_shipping_display_value(self, row: dict) -> str:
+        shipping = str(row.get("shipping_price", "") or "").strip()
+        if shipping:
+            return shipping
+        raw_value = row.get("shipping_price_value")
+        if raw_value in ("", None):
+            return "-"
+        return str(raw_value)
+
     def _safe_int(self, value: object, default: int = 0) -> int:
         try:
             return int(value)
@@ -3354,9 +4060,12 @@ class ScraperApp:
             detail_text_parts = []
             total_value = str(row.get("total_price", "") or "").strip()
             shipping_value = str(row.get("shipping_price", "") or "").strip()
+            shipping_alert = str(row.get("shipping_alert", "") or "").strip()
             offer_text = str(row.get("offer_text", "") or "").strip()
             item_id = str(row.get("item_id", "") or "").strip()
             published_at = str(row.get("published_at", "") or "").strip()
+            offer_last_submitted_at = str(row.get("offer_last_submitted_at", "") or "").strip()
+            offer_last_value = row.get("offer_last_value")
             if evaluation_label and evaluation_label != "-":
                 detail_text_parts.append(f"Valutazione: {evaluation_label}")
             if favorite_display != "-":
@@ -3371,10 +4080,22 @@ class ScraperApp:
                 detail_text_parts.append(f"Totale stimato: {total_value}")
             if shipping_value:
                 detail_text_parts.append(f"Spedizione: {shipping_value}")
+            if shipping_alert:
+                detail_text_parts.append(f"Alert: {shipping_alert}")
             if offer_text:
                 detail_text_parts.append(f"Pulsante offerta: {offer_text}")
             else:
                 detail_text_parts.append(f"Offerta disponibile: {offer_display}")
+            if bool(row.get("offer_already_submitted")):
+                offer_summary = "Offerta gia inviata"
+                if offer_last_value not in ("", None):
+                    try:
+                        offer_summary += f": {float(offer_last_value):.2f} €"
+                    except (TypeError, ValueError):
+                        offer_summary += f": {offer_last_value}"
+                detail_text_parts.append(offer_summary)
+                if offer_last_submitted_at:
+                    detail_text_parts.append(f"Ultima offerta inviata: {offer_last_submitted_at}")
             first_seen_at = str(row.get("first_seen_at", row.get("extracted_at", "")) or "").strip()
             if first_seen_at:
                 detail_text_parts.append(f"Prima rilevazione DB: {first_seen_at}")

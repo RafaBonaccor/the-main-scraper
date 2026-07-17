@@ -18,6 +18,7 @@ from scraper_app.models import ExportOptions
 from scraper_app.openai_screening import DEFAULT_REASONING_EFFORT, DEFAULT_SCREENING_MODEL
 from scraper_app.runner import run_scraper
 from scraper_app.ui import launch_gui
+from scraper_app.vinted_database import annotate_rows_with_vinted_offer_history
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -99,6 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-price",
         default="",
         help="Maximum item price to keep for this Vinted search. Leave empty for no price cap.",
+    )
+    vinted_parser.add_argument(
+        "--exclude-known-items",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip Vinted listings already archived/analyzed in the SQLite database.",
     )
     vinted_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
     vinted_parser.add_argument(
@@ -231,6 +238,49 @@ def build_parser() -> argparse.ArgumentParser:
     _add_browser_arguments(contact_subito_parser)
     contact_subito_parser.set_defaults(browser_mode="sessione_persistente")
 
+    contact_vinted_parser = contact_subparsers.add_parser("vinted", help="Open the Vinted offer flow for a listing.")
+    contact_vinted_parser.add_argument("--link", default="", help="Full Vinted listing URL.")
+    contact_vinted_parser.add_argument("--links-file", default="", help="UTF-8 text or JSON file containing one or more Vinted listing URLs or offer items.")
+    contact_vinted_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path used for offer history.")
+    contact_vinted_parser.add_argument(
+        "--base-price",
+        default="",
+        help="Listing price from the selected results row, used as the primary base for the configurable discount offer calculation.",
+    )
+    contact_vinted_parser.add_argument(
+        "--base-total-price",
+        default="",
+        help="Legacy fallback field. If --base-price is absent, this value can still be used as the offer base.",
+    )
+    contact_vinted_parser.add_argument(
+        "--offer-discount-percent",
+        default=15.0,
+        type=float,
+        help="Discount percentage applied to the listing price when filling the Vinted offer.",
+    )
+    contact_vinted_parser.add_argument("--submit", action="store_true", help="Actually click the final offer button.")
+    contact_vinted_parser.add_argument(
+        "--delay-between-seconds",
+        default=2,
+        type=int,
+        help="Delay between listings when using links-file.",
+    )
+    contact_vinted_parser.add_argument(
+        "--keep-browser-open",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Leave the Vinted browser open after the offer flow without waiting for a timer.",
+    )
+    contact_vinted_parser.add_argument(
+        "--keep-open-seconds",
+        default=0,
+        type=int,
+        help="Seconds to keep the Vinted browser open after the offer flow. Use 0 with --keep-browser-open to wait until manual close.",
+    )
+    _add_orchestrator_arguments(contact_vinted_parser)
+    _add_browser_arguments(contact_vinted_parser)
+    contact_vinted_parser.set_defaults(browser_mode="sessione_persistente")
+
     return parser
 
 
@@ -338,6 +388,11 @@ def main() -> int:
     try:
         outcome = run_scraper(source=source, **payload)
         outcome.rows = annotate_rows_with_contact_history(outcome.rows)
+        if outcome.source == "vinted":
+            outcome.rows = annotate_rows_with_vinted_offer_history(
+                outcome.rows,
+                db_path=outcome.meta.get("db_path", "data/scraper.db"),
+            )
         outcome.meta["contact_counts"] = summarize_contact_status(outcome.rows)
         export_paths = export_outcome(
             outcome,
@@ -453,7 +508,7 @@ def _build_status_payload() -> dict:
         "active_venv_candidate": active_venv,
         "recommended_browser_mode": "sessione_persistente",
         "supported_sources": ["google_maps", "vinted", "vinted_descriptions", "subito", "custom_site"],
-        "supported_contact_sources": ["subito"],
+        "supported_contact_sources": ["subito", "vinted"],
         "features": {
             "gui": True,
             "browser_command": True,
@@ -534,6 +589,9 @@ def _normalize_row(source: str, row: dict) -> dict:
             "total_value": _safe_float_or_none(row.get("total_price_value")),
             "description": str(row.get("description", "") or ""),
             "currency": str(row.get("currency", "") or ""),
+            "offer_already_submitted": bool(row.get("offer_already_submitted", False)),
+            "offer_last_submitted_at": str(row.get("offer_last_submitted_at", "") or ""),
+            "offer_last_value": _safe_float_or_none(row.get("offer_last_value")),
             "first_seen_at": str(row.get("first_seen_at", "") or ""),
             "last_seen_at": str(row.get("last_seen_at", row.get("extracted_at", "")) or ""),
         }
@@ -600,6 +658,59 @@ def _normalize_contact_result(source: str, result: dict) -> dict:
             "sent_count": _safe_int_or_none(result.get("sent_count")),
             "failed_count": _safe_int_or_none(result.get("failed_count")),
             "submit": bool(result.get("submit")),
+            "results": normalized_results,
+        }
+    if source == "vinted":
+        normalized_results = []
+        for item in list(result.get("results", []) or []):
+            if not isinstance(item, dict):
+                continue
+            normalized_results.append(
+                {
+                    "link": str(item.get("link", "") or ""),
+                    "item_id": str(item.get("item_id", "") or ""),
+                    "ok": bool(item.get("ok")),
+                    "prepared": bool(item.get("prepared")),
+                    "submitted": bool(item.get("submitted")),
+                    "skipped_already_submitted": bool(item.get("skipped_already_submitted")),
+                    "error": str(item.get("error", "") or ""),
+                    "offer_discount_percent": _safe_float_or_none(item.get("offer_discount_percent")),
+                    "selected_price": _safe_float_or_none(item.get("selected_price", item.get("selected_total_price"))),
+                    "parsed_price": _safe_float_or_none(item.get("parsed_price", item.get("parsed_total_price"))),
+                    "source_price": _safe_float_or_none(item.get("source_price", item.get("source_total_price"))),
+                    "selected_total_price": _safe_float_or_none(item.get("selected_total_price")),
+                    "parsed_total_price": _safe_float_or_none(item.get("parsed_total_price")),
+                    "source_total_price": _safe_float_or_none(item.get("source_total_price")),
+                    "offer_value": _safe_float_or_none(item.get("offer_value")),
+                    "offer_input_value": str(item.get("offer_input_value", "") or ""),
+                    "current_url": str(item.get("current_url", "") or ""),
+                }
+            )
+        return {
+            "source": source,
+            "link": str(result.get("link", "") or ""),
+            "ok": bool(result.get("ok")),
+            "prepared": bool(result.get("prepared")),
+            "submitted": bool(result.get("submitted")),
+            "skipped_already_submitted": bool(result.get("skipped_already_submitted")),
+            "links_count": _safe_int_or_none(result.get("links_count")),
+            "prepared_count": _safe_int_or_none(result.get("prepared_count")),
+            "sent_count": _safe_int_or_none(result.get("sent_count")),
+            "failed_count": _safe_int_or_none(result.get("failed_count")),
+            "skipped_already_submitted_count": _safe_int_or_none(result.get("skipped_already_submitted_count")),
+            "offer_discount_percent": _safe_float_or_none(result.get("offer_discount_percent")),
+            "offer_button_action": str(result.get("offer_button_action", "") or ""),
+            "offer_input_filled": bool(result.get("offer_input_filled")),
+            "offer_submit_action": str(result.get("offer_submit_action", "") or ""),
+            "selected_price": _safe_float_or_none(result.get("selected_price", result.get("selected_total_price"))),
+            "parsed_price": _safe_float_or_none(result.get("parsed_price", result.get("parsed_total_price"))),
+            "source_price": _safe_float_or_none(result.get("source_price", result.get("source_total_price"))),
+            "selected_total_price": _safe_float_or_none(result.get("selected_total_price")),
+            "parsed_total_price": _safe_float_or_none(result.get("parsed_total_price")),
+            "source_total_price": _safe_float_or_none(result.get("source_total_price")),
+            "offer_value": _safe_float_or_none(result.get("offer_value")),
+            "offer_input_value": str(result.get("offer_input_value", "") or ""),
+            "current_url": str(result.get("current_url", "") or ""),
             "results": normalized_results,
         }
     return {"source": source}
