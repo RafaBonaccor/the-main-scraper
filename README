@@ -261,6 +261,10 @@ grigio `Idle`, verde `Running`, rosso `Stopping...` e rosso scuro `Error`.
 
 La tabella `Risultati` supporta scrollbar verticale/orizzontale e scroll da mouse o trackpad. Con `Shift` + scroll puoi scorrere anche orizzontalmente quando le colonne sono molte.
 
+I pulsanti `Apri annuncio`, `Apri Google Maps`, `Apri sito web`, `Apri allegato`
+e le aperture cartelle/output usano ora il launcher nativo del sistema:
+funzionano quindi sia su macOS sia su Windows.
+
 Se attivi l'opzione per lasciare aperto il browser Vinted con valore `0`, il run resta in attesa finche non chiudi manualmente la finestra. Se invece imposti un numero di secondi, il browser resta aperto fino alla scadenza del timer o finche la finestra non viene chiusa.
 
 ### Subito

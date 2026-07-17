@@ -126,6 +126,23 @@ RESULT_SORT_COLUMN_MAP = {
     "company": "Azienda",
     "schedule": "Orario",
 }
+
+
+def open_external_target(target: object) -> bool:
+    value = str(target or "").strip()
+    if not value:
+        return False
+    if os.name == "nt":
+        os.startfile(value)  # type: ignore[attr-defined]
+        return True
+    command = ["open", value] if sys.platform == "darwin" else ["xdg-open", value]
+    subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return True
 RESULT_SORT_DEFAULT_DESC = {
     "Prezzo Vinted": False,
     "Ricerca Vinted": False,
@@ -2222,7 +2239,7 @@ class ScraperApp:
     def _open_vinted_db_folder(self) -> None:
         db_path = Path(self.vinted_db_path_var.get().strip() or self.script_path.parent / "data" / "scraper.db").expanduser()
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        os.startfile(db_path.parent.resolve())
+        self._open_external_target_or_error(db_path.parent.resolve(), title="Database Vinted")
 
     def _write_vinted_links_file(self, rows: list[dict]) -> Path:
         output_dir = Path(self.output_dir_var.get()).resolve()
@@ -2289,12 +2306,12 @@ class ScraperApp:
     def _open_attachment_file(self) -> None:
         attachment = self.attachment_path_var.get().strip()
         if attachment and Path(attachment).exists():
-            os.startfile(attachment)
+            self._open_external_target_or_error(attachment, title="Allegato")
 
     def _open_output_dir(self) -> None:
         output_dir = Path(self.output_dir_var.get()).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        os.startfile(output_dir)
+        self._open_external_target_or_error(output_dir, title="Output")
 
     def _clear_log(self) -> None:
         self.log_widget.configure(state="normal")
@@ -4262,6 +4279,13 @@ class ScraperApp:
             rows.append(row)
         return rows
 
+    def _open_external_target_or_error(self, target: object, *, title: str) -> bool:
+        try:
+            return open_external_target(target)
+        except Exception as exc:
+            messagebox.showerror(title, f"Impossibile aprire:\n{target}\n\n{exc}")
+            return False
+
     def _build_selected_link_export_items(self, rows: list[dict]) -> list[dict]:
         items: list[dict] = []
         seen_links: set[str] = set()
@@ -4336,7 +4360,7 @@ class ScraperApp:
             return
         link = str(row.get("link", "") or "").strip()
         if link:
-            os.startfile(link)
+            self._open_external_target_or_error(link, title="Apri annuncio")
 
     def _open_selected_website(self) -> None:
         row = self._get_selected_row()
@@ -4344,7 +4368,7 @@ class ScraperApp:
             return
         website = str(row.get("website_final_url", "") or row.get("website", "") or "").strip()
         if website:
-            os.startfile(website)
+            self._open_external_target_or_error(website, title="Apri sito web")
 
 
 def launch_gui(script_path: Path) -> None:
