@@ -67,6 +67,84 @@ def load_vinted_known_item_keys(db_path: str | Path = DEFAULT_VINTED_DB_PATH) ->
     return keys
 
 
+def load_vinted_completed_detail_rows(db_path: str | Path = DEFAULT_VINTED_DB_PATH) -> dict[str, dict]:
+    path = Path(db_path).expanduser().resolve()
+    ensure_vinted_database(path)
+    try:
+        with closing(sqlite3.connect(path)) as connection:
+            connection.row_factory = sqlite3.Row
+            records = connection.execute(
+                """
+                SELECT
+                    link,
+                    item_id,
+                    name,
+                    description,
+                    published_at,
+                    price_text,
+                    price_value,
+                    shipping_price_text,
+                    shipping_price_value,
+                    total_price_text,
+                    total_price_value,
+                    offer_available,
+                    offer_text,
+                    favorite_count,
+                    evaluation_label,
+                    currency,
+                    raw_text,
+                    first_seen_at,
+                    last_seen_at
+                FROM vinted_items
+                WHERE
+                    description IS NOT NULL AND description <> ''
+                    AND (
+                        price_text IS NOT NULL AND price_text <> ''
+                        OR price_value IS NOT NULL
+                        OR total_price_text IS NOT NULL AND total_price_text <> ''
+                        OR total_price_value IS NOT NULL
+                    )
+                """
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError(f"Database Vinted non valido: {exc}") from exc
+
+    rows_by_key: dict[str, dict] = {}
+    for record in records:
+        row = {
+            "source": "vinted",
+            "item_id": record["item_id"],
+            "name": record["name"],
+            "description": record["description"],
+            "published_at": record["published_at"],
+            "price": record["price_text"],
+            "price_value": record["price_value"],
+            "shipping_price": record["shipping_price_text"],
+            "shipping_price_value": record["shipping_price_value"],
+            "shipping_alert": "sped > 2,99"
+            if record["shipping_price_value"] not in ("", None) and float(record["shipping_price_value"]) > 2.99
+            else "",
+            "total_price": record["total_price_text"],
+            "total_price_value": record["total_price_value"],
+            "offer_available": bool(record["offer_available"]),
+            "offer_text": record["offer_text"],
+            "favorite_count": record["favorite_count"],
+            "evaluation_label": record["evaluation_label"] or "",
+            "currency": record["currency"],
+            "link": record["link"],
+            "raw_text": record["raw_text"],
+            "first_seen_at": record["first_seen_at"],
+            "last_seen_at": record["last_seen_at"],
+            "extracted_at": record["last_seen_at"],
+            "db_path": str(path),
+            "db_saved": True,
+            "detail_cached": True,
+        }
+        for key in build_vinted_item_identity_keys(item_id=record["item_id"], link=record["link"]):
+            rows_by_key.setdefault(key, row)
+    return rows_by_key
+
+
 def load_vinted_submitted_offer_keys(db_path: str | Path = DEFAULT_VINTED_DB_PATH) -> set[str]:
     path = Path(db_path).expanduser().resolve()
     ensure_vinted_database(path)

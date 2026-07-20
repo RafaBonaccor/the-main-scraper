@@ -27,10 +27,18 @@ from ..vinted_browser_session import get_active_vinted_browser_session, register
 from ..vinted_database import (
     DEFAULT_VINTED_DB_PATH,
     build_vinted_item_identity_keys,
+    load_vinted_completed_detail_rows,
     load_vinted_known_item_keys,
     save_vinted_rows,
 )
 from ..vinted_access import emit_vinted_access_signal, read_vinted_access_status, wait_for_vinted_access_status
+from ..vinted_deals import (
+    VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
+    annotate_vinted_deal_hunter_row,
+    normalize_vinted_deal_hunter_max_age_hours,
+    normalize_vinted_deal_hunter_min_favorites,
+    vinted_deal_hunter_enabled,
+)
 
 
 VINTED_BASE_URL = "https://www.vinted.it"
@@ -45,12 +53,16 @@ RICERCATO_BADGE_PATTERN = re.compile(r"\bricercato\b", re.IGNORECASE)
 FAVORITE_COUNT_PATTERN = re.compile(r"\d+")
 FAVORITE_COUNT_REVIEW_THRESHOLD = 15
 VINTED_HIGH_SHIPPING_THRESHOLD = 2.99
+VINTED_PAGE_NOT_FOUND_PATTERN = re.compile(r"\b(page not found|pagina non trovata)\b", re.IGNORECASE)
+VINTED_NAVIGATION_TIMEOUT_SECONDS = 15
 
 
 def run_vinted_scraper(
     search: str,
     max_results: int = 100,
     max_price: float | None = None,
+    deal_hunter_min_favorites: int = 0,
+    deal_hunter_max_age_hours: float = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
     exclude_known_items: bool = True,
     db_path: str = str(DEFAULT_VINTED_DB_PATH),
     ui_result_json: str = "",
@@ -63,9 +75,15 @@ def run_vinted_scraper(
     slow_mode: bool = False,
     action_delay_seconds: float = 1.5,
     page_settle_seconds: float = 3.0,
+    detach_browser_on_complete: bool = True,
 ) -> ScrapeOutcome:
     search_url = build_vinted_search_url(search)
     search_term = extract_vinted_search_term(search_url) or str(search or "").strip()
+    normalized_deal_hunter_min_favorites = normalize_vinted_deal_hunter_min_favorites(deal_hunter_min_favorites, default=0)
+    normalized_deal_hunter_max_age_hours = normalize_vinted_deal_hunter_max_age_hours(
+        deal_hunter_max_age_hours,
+        default=VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
+    )
     action_delay, page_settle = _vinted_timing_config(
         slow_mode=slow_mode,
         action_delay_seconds=action_delay_seconds,
@@ -77,6 +95,12 @@ def run_vinted_scraper(
         "search_url": search_url,
         "max_results": max(int(max_results), 0),
         "max_price": max_price if max_price is None else max(float(max_price), 0.0),
+        "deal_hunter_min_favorites": normalized_deal_hunter_min_favorites,
+        "deal_hunter_max_age_hours": normalized_deal_hunter_max_age_hours,
+        "deal_hunter_enabled": vinted_deal_hunter_enabled(
+            normalized_deal_hunter_min_favorites,
+            normalized_deal_hunter_max_age_hours,
+        ),
         "exclude_known_items": bool(exclude_known_items),
         "db_path": db_path,
         "ui_result_json": ui_result_json,
@@ -86,6 +110,7 @@ def run_vinted_scraper(
         "keep_browser_open": bool(keep_browser_open),
         "refresh_browser_profile": bool(refresh_browser_profile),
         "keep_open_seconds": max(int(keep_open_seconds or 0), 0),
+        "detach_browser_on_complete": bool(detach_browser_on_complete),
         "slow_mode": bool(slow_mode),
         "action_delay_seconds": action_delay,
         "page_settle_seconds": page_settle,
@@ -151,7 +176,7 @@ def run_vinted_description_extractor(
 )
 def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
     search_url = config["search_url"]
-    driver.get(search_url, wait=Wait.LONG, timeout=30)
+    driver.get(search_url, wait=Wait.LONG, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
     _wait_for_vinted_catalog_page_ready(
         driver,
         max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
@@ -172,7 +197,10 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
     )
 
-    driver.select('a[href*="/items/"]', wait=Wait.VERY_LONG)
+    _wait_for_vinted_catalog_cards(
+        driver,
+        max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+    )
     rows_by_link: dict[str, dict] = {}
     max_results = int(config.get("max_results", 100) or 0)
     max_price = _normalize_vinted_max_price(config.get("max_price"))
@@ -199,6 +227,10 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
                 payload,
                 search_term=config["search_term"],
                 search_url=search_url,
+                deal_hunter_min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
+                deal_hunter_max_age_hours=float(
+                    config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0
+                ),
             )
             if not row["link"]:
                 continue
@@ -209,6 +241,18 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
                 filtered_out_by_price += 1
                 continue
             rows_by_link[row["link"]] = row
+            _persist_vinted_progress_results(
+                rows=rows_by_link.values(),
+                config=config,
+                search_url=search_url,
+                pages_visited=pages_visited,
+                filtered_out_known_items=filtered_out_known_items,
+                filtered_out_by_price=filtered_out_by_price,
+                cookie_action=cookie_action or "",
+                access_status=access_status,
+                enrichment_meta={"enriched_count": 0, "demoted_count": 0},
+                live_stage="catalog",
+            )
 
         if max_results > 0 and len(rows_by_link) >= max_results:
             break
@@ -221,7 +265,7 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         )
         if not next_page_url:
             break
-        _wait_for_vinted_catalog_page_ready(
+        _wait_for_vinted_catalog_cards(
             driver,
             max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
         )
@@ -241,12 +285,39 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
             action_delay_seconds=float(config.get("action_delay_seconds", 1.5) or 0),
             page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
         )
-        driver.select('a[href*="/items/"]', wait=Wait.VERY_LONG)
+        _wait_for_vinted_catalog_cards(
+            driver,
+            max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+        )
 
     rows = _prioritize_vinted_rows(rows_by_link.values())
     if max_results > 0:
         rows = rows[:max_results]
     enrichment_meta = _enrich_vinted_priority_rows(driver, rows, config)
+    rows = [
+        annotate_vinted_deal_hunter_row(
+            row,
+            min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
+            max_age_hours=float(config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0),
+        )
+        for row in rows
+    ]
+    deal_hunter_candidates = sum(1 for row in rows if bool(row.get("deal_hunter_candidate")))
+    deal_hunter_matches = sum(1 for row in rows if bool(row.get("deal_hunter_match")))
+    detail_cache_rows = [
+        row
+        for row in rows
+        if str(row.get("description", "") or "").strip()
+        and (str(row.get("price", "") or "").strip() or row.get("price_value") not in ("", None))
+    ]
+    if detail_cache_rows:
+        save_vinted_rows(
+            detail_cache_rows,
+            db_path=str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH),
+            run_kind="details",
+        )
+    if bool(config.get("deal_hunter_enabled", False)):
+        rows = [row for row in rows if bool(row.get("deal_hunter_match"))]
     rows = [row for row in rows if _vinted_row_matches_max_price(row, max_price)]
     rows = _prioritize_vinted_rows(rows)
     keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
@@ -259,6 +330,13 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         "search_url": search_url,
         "max_results": max_results,
         "max_price": max_price,
+        "deal_hunter_enabled": bool(config.get("deal_hunter_enabled", False)),
+        "deal_hunter_min_favorites": int(config.get("deal_hunter_min_favorites", 0) or 0),
+        "deal_hunter_max_age_hours": float(
+            config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0
+        ),
+        "deal_hunter_candidates": deal_hunter_candidates,
+        "deal_hunter_matches": deal_hunter_matches,
         "exclude_known_items": exclude_known_items,
         "keep_browser_open": keep_browser_open,
         "keep_open_seconds": keep_open_seconds,
@@ -277,6 +355,7 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         "row_count": len(rows),
         "priority_rows_enriched": enrichment_meta["enriched_count"],
         "priority_rows_demoted_by_age": enrichment_meta["demoted_count"],
+        "priority_rows_cached": enrichment_meta.get("cached_count", 0),
     }
     _persist_vinted_live_results(
         rows=rows,
@@ -301,6 +380,10 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
     keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
     keep_browser_open = bool(config.get("keep_browser_open", False))
     last_access_status: dict[str, object] = {}
+    cached_detail_rows = load_vinted_completed_detail_rows(
+        str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH)
+    )
+    cached_detail_count = 0
 
     for item in config.get("items", []):
         if isinstance(item, dict):
@@ -317,7 +400,24 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
             item_name = ""
         if not current_link:
             continue
-        driver.get(current_link, wait=Wait.LONG, timeout=30)
+        base_row = item if isinstance(item, dict) else {}
+        cached_row = _find_cached_vinted_detail_row(base_row, current_link, cached_detail_rows)
+        if cached_row is not None:
+            rows.append(
+                _merge_cached_vinted_detail_row(
+                    base_row=base_row,
+                    cached_row=cached_row,
+                    current_link=current_link,
+                    search_term=search_term,
+                    search_url=search_url,
+                    tag=tag,
+                    item_name=item_name,
+                    config=config,
+                )
+            )
+            cached_detail_count += 1
+            continue
+        driver.get(current_link, wait=Wait.LONG, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
         _wait_for_vinted_detail_page_ready(
             driver,
             max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
@@ -337,7 +437,6 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
             action_delay_seconds=float(config.get("action_delay_seconds", 1.5) or 0),
             page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
         )
-        base_row = item if isinstance(item, dict) else {}
         row = _build_vinted_detail_row(
             driver=driver,
             current_link=current_link,
@@ -346,7 +445,13 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
             tag=tag,
             item_name=item_name,
             base_row=base_row,
+            deal_hunter_min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
+            deal_hunter_max_age_hours=float(
+                config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0
+            ),
         )
+        if str(row.get("detail_error", "") or "").strip() == "page_not_found":
+            print(f"[vinted-detail] pagina non trovata, salto {current_link}", flush=True)
         rows.append(row)
 
     meta = {
@@ -361,6 +466,7 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
         "vinted_access_expected_alt": str(last_access_status.get("expected_alt", "") or ""),
         "vinted_access_current_url": str(last_access_status.get("current_url", "") or ""),
         "vinted_access_checked_at": str(last_access_status.get("checked_at", "") or ""),
+        "cached_detail_count": cached_detail_count,
     }
     _persist_vinted_live_results(
         rows=rows,
@@ -561,15 +667,60 @@ def _normalize_vinted_items(raw_items: list[dict | str]) -> list[dict | str]:
 
 
 def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict) -> dict[str, int]:
-    targets = [row for row in rows if _should_extract_vinted_priority_row(row)]
+    targets: list[dict] = []
+    seen_links: set[str] = set()
+    for row in rows:
+        current_link = normalize_vinted_item_url(str(row.get("link", "") or ""))
+        if not current_link or current_link in seen_links:
+            continue
+        if not (_should_extract_vinted_priority_row(row) or _should_extract_vinted_deal_hunter_row(row, config)):
+            continue
+        seen_links.add(current_link)
+        targets.append(row)
     if not targets:
-        return {"enriched_count": 0, "demoted_count": 0}
+        return {"enriched_count": 0, "demoted_count": 0, "cached_count": 0}
     demoted_count = 0
+    cached_count = 0
+    cached_detail_rows = load_vinted_completed_detail_rows(
+        str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH)
+    )
     for row in targets:
         current_link = normalize_vinted_item_url(str(row.get("link", "") or ""))
         if not current_link:
             continue
-        driver.get(current_link, wait=Wait.LONG, timeout=30)
+        cached_row = _find_cached_vinted_detail_row(row, current_link, cached_detail_rows)
+        if cached_row is not None:
+            previous_label = str(row.get("evaluation_label", "") or "").strip().lower()
+            row.update(
+                _merge_cached_vinted_detail_row(
+                    base_row=row,
+                    cached_row=cached_row,
+                    current_link=current_link,
+                    search_term=str(row.get("search_term", "") or ""),
+                    search_url=str(row.get("search_url", "") or ""),
+                    tag=str(row.get("tag", "") or ""),
+                    item_name=str(row.get("name", "") or ""),
+                    config=config,
+                )
+            )
+            current_label = str(row.get("evaluation_label", "") or "").strip().lower()
+            if previous_label == "da valutare assolutamente" and current_label == "da valutare":
+                demoted_count += 1
+            cached_count += 1
+            _persist_vinted_progress_results(
+                rows=rows,
+                config=config,
+                search_url=str(row.get("search_url", "") or config.get("search_url", "")),
+                pages_visited=[],
+                filtered_out_known_items=0,
+                filtered_out_by_price=0,
+                cookie_action="",
+                access_status={},
+                enrichment_meta={"enriched_count": len(targets), "demoted_count": demoted_count, "cached_count": cached_count},
+                live_stage="detail_cached",
+            )
+            continue
+        driver.get(current_link, wait=Wait.LONG, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
         _wait_for_vinted_detail_page_ready(
             driver,
             max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
@@ -598,16 +749,107 @@ def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict)
             tag=str(row.get("tag", "") or ""),
             item_name=str(row.get("name", "") or ""),
             base_row=row,
+            deal_hunter_min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
+            deal_hunter_max_age_hours=float(
+                config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0
+            ),
         )
+        if str(enriched_row.get("detail_error", "") or "").strip() == "page_not_found":
+            print(f"[vinted-detail] pagina non trovata, salto {current_link}", flush=True)
         row.update(enriched_row)
         current_label = str(row.get("evaluation_label", "") or "").strip().lower()
         if previous_label == "da valutare assolutamente" and current_label == "da valutare":
             demoted_count += 1
-    return {"enriched_count": len(targets), "demoted_count": demoted_count}
+        _persist_vinted_progress_results(
+            rows=rows,
+            config=config,
+            search_url=str(row.get("search_url", "") or config.get("search_url", "")),
+            pages_visited=[],
+            filtered_out_known_items=0,
+            filtered_out_by_price=0,
+            cookie_action="",
+            access_status=access_status,
+            enrichment_meta={"enriched_count": len(targets), "demoted_count": demoted_count},
+            live_stage="detail",
+        )
+    return {"enriched_count": len(targets), "demoted_count": demoted_count, "cached_count": cached_count}
 
 
 def _should_extract_vinted_priority_row(row: dict) -> bool:
     return str(row.get("evaluation_label", "") or "").strip().lower() == "da valutare assolutamente"
+
+
+def _should_extract_vinted_deal_hunter_row(row: dict, config: dict) -> bool:
+    if not bool(config.get("deal_hunter_enabled", False)):
+        return False
+    return bool(row.get("deal_hunter_candidate")) and not bool(row.get("deal_hunter_match"))
+
+
+def _find_cached_vinted_detail_row(row: dict, current_link: str, cached_detail_rows: dict[str, dict]) -> dict | None:
+    for key in build_vinted_item_identity_keys(
+        item_id=row.get("item_id", ""),
+        link=current_link or row.get("link", ""),
+    ):
+        cached_row = cached_detail_rows.get(key)
+        if cached_row is not None:
+            return cached_row
+    return None
+
+
+def _merge_cached_vinted_detail_row(
+    *,
+    base_row: dict,
+    cached_row: dict,
+    current_link: str,
+    search_term: str,
+    search_url: str,
+    tag: str,
+    item_name: str,
+    config: dict,
+) -> dict:
+    existing_row = dict(base_row or {})
+    merged = dict(existing_row)
+    merged.update(
+        {
+            key: value
+            for key, value in cached_row.items()
+            if value not in ("", None) or key in {"offer_available", "detail_cached", "db_saved"}
+        }
+    )
+    normalized_search_term = search_term or str(existing_row.get("search_term", "") or "") or extract_vinted_search_term(search_url)
+    normalized_search_url = search_url or str(existing_row.get("search_url", "") or "") or build_vinted_search_url(normalized_search_term)
+    secondary_badge_text = normalize_whitespace(str(existing_row.get("secondary_badge_text", "") or merged.get("secondary_badge_text", "") or ""))
+    has_ricercato_badge = bool(existing_row.get("has_ricercato_badge")) or bool(
+        merged.get("has_ricercato_badge")
+    ) or bool(RICERCATO_BADGE_PATTERN.search(secondary_badge_text)) or str(tag or merged.get("tag", "") or "").strip().lower() == "ricercato"
+    favorite_count = parse_vinted_favorite_count(existing_row.get("favorite_count", merged.get("favorite_count")))
+    published_at = str(merged.get("published_at", "") or "")
+    merged.update(
+        {
+            "source": "vinted",
+            "tag": "ricercato" if has_ricercato_badge else (tag or str(existing_row.get("tag", "") or merged.get("tag", "") or "")),
+            "search_term": normalized_search_term,
+            "search_url": normalized_search_url,
+            "item_id": str(merged.get("item_id", "") or existing_row.get("item_id", "") or ""),
+            "name": normalize_whitespace(str(item_name or existing_row.get("name", "") or merged.get("name", "") or current_link)),
+            "link": normalize_vinted_item_url(current_link or str(merged.get("link", "") or "")),
+            "favorite_count": favorite_count,
+            "secondary_badge_text": secondary_badge_text,
+            "has_ricercato_badge": has_ricercato_badge,
+            "evaluation_label": classify_vinted_evaluation(
+                favorite_count=favorite_count,
+                has_ricercato_badge=has_ricercato_badge,
+                published_at=published_at,
+            ),
+            "shipping_alert": _vinted_shipping_alert_text(merged.get("shipping_price_value")),
+            "detail_cached": True,
+        }
+    )
+    return annotate_vinted_deal_hunter_row(
+        merged,
+        min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
+        max_age_hours=float(config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0),
+    )
 
 
 def _build_vinted_detail_row(
@@ -618,9 +860,22 @@ def _build_vinted_detail_row(
     tag: str,
     item_name: str,
     base_row: dict | None = None,
+    deal_hunter_min_favorites: int = 0,
+    deal_hunter_max_age_hours: float = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
 ) -> dict:
     existing_row = dict(base_row or {})
     page_text = _read_vinted_detail_text(driver)
+    if _is_vinted_page_not_found_text(page_text):
+        return _build_vinted_missing_detail_row(
+            current_link=current_link,
+            search_term=search_term,
+            search_url=search_url,
+            tag=tag,
+            item_name=item_name,
+            base_row=existing_row,
+            page_text=page_text,
+            detail_error="page_not_found",
+        )
     title = _read_vinted_title(driver)
     if not title:
         title = item_name
@@ -628,6 +883,17 @@ def _build_vinted_detail_row(
         title = str(existing_row.get("name", "") or "")
     if not title:
         title = _fallback_title({"image_alt": "", "aria_label": ""}, current_link, page_text)
+    if _is_vinted_page_not_found_text(title):
+        return _build_vinted_missing_detail_row(
+            current_link=current_link,
+            search_term=search_term,
+            search_url=search_url,
+            tag=tag,
+            item_name=item_name,
+            base_row=existing_row,
+            page_text=page_text,
+            detail_error="page_not_found",
+        )
     description = _extract_vinted_description_from_body_text(page_text)
     published_at = _read_vinted_published_text(driver, page_text)
     raw_price_text = _read_vinted_price(driver)
@@ -660,7 +926,7 @@ def _build_vinted_detail_row(
     )
     item_id_match = ITEM_ID_PATTERN.search(urlsplit(current_link).path)
     normalized_search_term = search_term or extract_vinted_search_term(search_url)
-    return {
+    row = {
         "source": "vinted",
         "tag": "ricercato" if has_ricercato_badge else tag,
         "search_term": normalized_search_term,
@@ -687,6 +953,47 @@ def _build_vinted_detail_row(
         "raw_text": page_text,
         "extracted_at": datetime.now().isoformat(timespec="seconds"),
     }
+    return annotate_vinted_deal_hunter_row(
+        row,
+        min_favorites=deal_hunter_min_favorites,
+        max_age_hours=deal_hunter_max_age_hours,
+    )
+
+
+def _is_vinted_page_not_found_text(value: object) -> bool:
+    return bool(VINTED_PAGE_NOT_FOUND_PATTERN.search(normalize_whitespace(str(value or ""))))
+
+
+def _build_vinted_missing_detail_row(
+    *,
+    current_link: str,
+    search_term: str,
+    search_url: str,
+    tag: str,
+    item_name: str,
+    base_row: dict | None,
+    page_text: str,
+    detail_error: str,
+) -> dict:
+    existing_row = dict(base_row or {})
+    item_id_match = ITEM_ID_PATTERN.search(urlsplit(current_link).path)
+    normalized_search_term = search_term or extract_vinted_search_term(search_url)
+    row = dict(existing_row)
+    row.update(
+        {
+            "source": "vinted",
+            "tag": str(existing_row.get("tag", "") or tag or ""),
+            "search_term": normalized_search_term,
+            "search_url": search_url or build_vinted_search_url(normalized_search_term),
+            "item_id": str(existing_row.get("item_id", "") or (item_id_match.group(1) if item_id_match else "")),
+            "name": normalize_whitespace(str(existing_row.get("name", "") or item_name or current_link)) or current_link,
+            "link": current_link,
+            "raw_text": page_text or str(existing_row.get("raw_text", "") or ""),
+            "detail_error": detail_error,
+            "extracted_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    return row
 
 
 def _extract_vinted_description_from_body_text(body_text: str) -> str:
@@ -770,7 +1077,7 @@ def _nonnegative_float(value: object, default: float) -> float:
 def _wait_for_vinted_detail_page_ready(
     driver: Driver,
     max_wait_seconds: float,
-    poll_interval_seconds: float = 0.2,
+    poll_interval_seconds: float = 0.1,
 ) -> bool:
     max_wait = _nonnegative_float(max_wait_seconds, 0.0)
     if max_wait <= 0:
@@ -789,7 +1096,7 @@ def _wait_for_vinted_detail_page_ready(
 def _wait_for_vinted_catalog_page_ready(
     driver: Driver,
     max_wait_seconds: float,
-    poll_interval_seconds: float = 0.2,
+    poll_interval_seconds: float = 0.1,
 ) -> bool:
     max_wait = _nonnegative_float(max_wait_seconds, 0.0)
     if max_wait <= 0:
@@ -803,6 +1110,40 @@ def _wait_for_vinted_catalog_page_ready(
             break
         time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.05)))
     return _is_vinted_catalog_page_ready(driver)
+
+
+def _wait_for_vinted_catalog_cards(
+    driver: Driver,
+    max_wait_seconds: float,
+    poll_interval_seconds: float = 0.1,
+) -> bool:
+    max_wait = _nonnegative_float(max_wait_seconds, 0.0)
+    if max_wait <= 0:
+        return _vinted_catalog_card_count(driver) > 0
+    poll_interval = max(_nonnegative_float(poll_interval_seconds, 0.1), 0.05)
+    deadline = time.monotonic() + max_wait
+    while True:
+        if _vinted_catalog_card_count(driver) > 0:
+            return True
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.05)))
+    return _vinted_catalog_card_count(driver) > 0
+
+
+def _vinted_catalog_card_count(driver: Driver) -> int:
+    try:
+        value = driver.run_js(
+            """
+return document.querySelectorAll('a[href*="/items/"]').length;
+            """
+        )
+    except Exception:
+        return 0
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _is_vinted_detail_page_ready(driver: Driver) -> bool:
@@ -823,11 +1164,14 @@ return {
   hasPrice: !!(price && clean(price.innerText || price.textContent || '')),
   hasOffer: !!offer,
   bodyLength: bodyText.length,
+  pageNotFound: /page not found|pagina non trovata/i.test(bodyText),
 };
         """
     )
     if not isinstance(payload, dict):
         return False
+    if bool(payload.get("pageNotFound", False)):
+        return True
     has_title = bool(payload.get("hasTitle"))
     has_price = bool(payload.get("hasPrice"))
     has_offer = bool(payload.get("hasOffer"))
@@ -887,7 +1231,7 @@ def _wait_for_vinted_login_if_needed(
         if consume_vinted_login_confirmed_request():
             target_url = str(revisit_url or access_status.get("current_url", "") or "").strip()
             if target_url:
-                driver.get(target_url, wait=Wait.LONG, timeout=30)
+                driver.get(target_url, wait=Wait.LONG, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
                 if "/items/" in target_url:
                     _wait_for_vinted_detail_page_ready(
                         driver,
@@ -917,6 +1261,8 @@ def emit_vinted_login_required_signal(access_status: dict[str, object]) -> None:
 
 
 def _detach_vinted_browser_if_requested(driver: Driver, config: dict) -> None:
+    if not bool(config.get("detach_browser_on_complete", True)):
+        return
     keep_browser_open = bool(config.get("keep_browser_open", False))
     keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
     if not keep_browser_open and keep_open_seconds <= 0:
@@ -1028,6 +1374,80 @@ def _keep_browser_open(driver: Driver, seconds: int) -> None:
             break
 
 
+def _persist_vinted_progress_results(
+    *,
+    rows,
+    config: dict,
+    search_url: str,
+    pages_visited: list[int],
+    filtered_out_known_items: int,
+    filtered_out_by_price: int,
+    cookie_action: str,
+    access_status: dict,
+    enrichment_meta: dict[str, int],
+    live_stage: str,
+) -> None:
+    ui_result_json = str(config.get("ui_result_json", "") or "").strip()
+    if not ui_result_json:
+        return
+    max_results = int(config.get("max_results", 100) or 0)
+    max_price = _normalize_vinted_max_price(config.get("max_price"))
+    progress_rows = _prioritize_vinted_rows(
+        annotate_vinted_deal_hunter_row(
+            dict(row),
+            min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
+            max_age_hours=float(config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0),
+        )
+        for row in rows
+    )
+    if max_results > 0:
+        progress_rows = progress_rows[:max_results]
+    progress_rows = [row for row in progress_rows if _vinted_row_matches_max_price(row, max_price)]
+    deal_hunter_candidates = sum(1 for row in progress_rows if bool(row.get("deal_hunter_candidate")))
+    deal_hunter_matches = sum(1 for row in progress_rows if bool(row.get("deal_hunter_match")))
+    meta = {
+        "search": config.get("search", ""),
+        "search_term": config.get("search_term", ""),
+        "search_count": 1,
+        "tag": "",
+        "search_url": search_url,
+        "max_results": max_results,
+        "max_price": max_price,
+        "deal_hunter_enabled": bool(config.get("deal_hunter_enabled", False)),
+        "deal_hunter_min_favorites": int(config.get("deal_hunter_min_favorites", 0) or 0),
+        "deal_hunter_max_age_hours": float(
+            config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0
+        ),
+        "deal_hunter_candidates": deal_hunter_candidates,
+        "deal_hunter_matches": deal_hunter_matches,
+        "exclude_known_items": bool(config.get("exclude_known_items", True)),
+        "keep_browser_open": bool(config.get("keep_browser_open", False)),
+        "keep_open_seconds": int(config.get("keep_open_seconds", 0) or 0),
+        "slow_mode": bool(config.get("slow_mode", False)),
+        "action_delay_seconds": float(config.get("action_delay_seconds", 1.5) or 0),
+        "page_settle_seconds": float(config.get("page_settle_seconds", 3.0) or 0),
+        "cookie_banner_action": cookie_action or "",
+        "vinted_access_marker_present": bool(access_status.get("marker_present")),
+        "vinted_access_expected_alt": str(access_status.get("expected_alt", "") or ""),
+        "vinted_access_current_url": str(access_status.get("current_url", "") or ""),
+        "vinted_access_checked_at": str(access_status.get("checked_at", "") or ""),
+        "pages_visited": pages_visited,
+        "pages_visited_count": len(pages_visited),
+        "filtered_out_known_items": filtered_out_known_items,
+        "filtered_out_by_price": filtered_out_by_price,
+        "row_count": len(progress_rows),
+        "priority_rows_enriched": int(enrichment_meta.get("enriched_count", 0) or 0),
+        "priority_rows_demoted_by_age": int(enrichment_meta.get("demoted_count", 0) or 0),
+        "priority_rows_cached": int(enrichment_meta.get("cached_count", 0) or 0),
+        "live_partial": True,
+        "live_stage": live_stage,
+        "db_saved_live": False,
+    }
+    ui_result_path = Path(ui_result_json).expanduser()
+    ui_result_path.parent.mkdir(parents=True, exist_ok=True)
+    write_outcome_json(ui_result_path, ScrapeOutcome(source="vinted", rows=progress_rows, meta=meta))
+
+
 def _persist_vinted_live_results(rows: list[dict], meta: dict, db_path: str, ui_result_json: str) -> None:
     db_meta = save_vinted_rows(rows, db_path=db_path, run_kind="search")
     for row in rows:
@@ -1041,7 +1461,13 @@ def _persist_vinted_live_results(rows: list[dict], meta: dict, db_path: str, ui_
         write_outcome_json(ui_result_path, ScrapeOutcome(source="vinted", rows=rows, meta=meta))
 
 
-def _card_payload_to_row(payload: dict, search_term: str, search_url: str) -> dict:
+def _card_payload_to_row(
+    payload: dict,
+    search_term: str,
+    search_url: str,
+    deal_hunter_min_favorites: int = 0,
+    deal_hunter_max_age_hours: float = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
+) -> dict:
     link = normalize_vinted_item_url(str(payload.get("link", "") or ""))
     raw_text = normalize_whitespace(str(payload.get("raw_text", "") or ""))
     title = normalize_whitespace(str(payload.get("title", "") or ""))
@@ -1059,7 +1485,7 @@ def _card_payload_to_row(payload: dict, search_term: str, search_url: str) -> di
     )
     shipping_alert = _vinted_shipping_alert_text(None)
 
-    return {
+    row = {
         "source": "vinted",
         "search_term": search_term,
         "tag": "ricercato" if has_ricercato_badge else "",
@@ -1084,6 +1510,11 @@ def _card_payload_to_row(payload: dict, search_term: str, search_url: str) -> di
         "raw_text": raw_text,
         "extracted_at": datetime.now().isoformat(timespec="seconds"),
     }
+    return annotate_vinted_deal_hunter_row(
+        row,
+        min_favorites=deal_hunter_min_favorites,
+        max_age_hours=deal_hunter_max_age_hours,
+    )
 
 
 def _vinted_row_identity_keys(row: dict) -> tuple[str, ...]:
@@ -1236,7 +1667,7 @@ def _wait_for_vinted_catalog_page(driver: Driver, page_number: int, max_wait_sec
             return True
         if time.monotonic() >= deadline:
             return False
-        time.sleep(0.2)
+        time.sleep(0.1)
 
 
 def _open_vinted_next_page(driver: Driver, next_page_number: int, page_settle_seconds: float = 3.0) -> str:
@@ -1246,11 +1677,12 @@ def _open_vinted_next_page(driver: Driver, next_page_number: int, page_settle_se
     if not next_page_url:
         return ""
 
-    if clicked and _wait_for_vinted_catalog_page(driver, next_page_number, max(page_settle_seconds, 2.0) + 4.0):
+    navigation_wait_seconds = max(float(page_settle_seconds or 0), 0.8) + 1.0
+    if clicked and _wait_for_vinted_catalog_page(driver, next_page_number, navigation_wait_seconds):
         return str(current_page_url(driver) or next_page_url)
 
-    driver.get(next_page_url, wait=Wait.LONG, timeout=30)
-    _wait_for_vinted_catalog_page(driver, next_page_number, max(page_settle_seconds, 2.0) + 4.0)
+    driver.get(next_page_url, wait=Wait.LONG, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+    _wait_for_vinted_catalog_page(driver, next_page_number, navigation_wait_seconds)
     return str(current_page_url(driver) or next_page_url)
 
 
@@ -1379,14 +1811,16 @@ def _vinted_shipping_alert_text(shipping_price_value: object) -> str:
 
 
 def _vinted_priority_rank(row: dict) -> int:
+    if bool(row.get("deal_hunter_match")):
+        return 0
     evaluation_label = str(row.get("evaluation_label", "") or "").strip().lower()
     if evaluation_label == "da valutare assolutamente":
-        return 0
-    if evaluation_label == "da valutare":
         return 1
-    if row.get("has_ricercato_badge"):
+    if evaluation_label == "da valutare":
         return 2
-    return 3
+    if row.get("has_ricercato_badge"):
+        return 3
+    return 4
 
 
 def _extract_vinted_shipping_price_text(value: str) -> str:

@@ -2,6 +2,8 @@ import unittest
 from unittest.mock import patch
 
 from scraper_app.ui import (
+    ScraperApp,
+    build_vinted_deal_hunter_search_specs,
     build_vinted_search_target_url,
     detect_vinted_category_label_from_url,
     open_external_target,
@@ -58,6 +60,40 @@ class UiExternalOpenTests(unittest.TestCase):
             "Scarpe uomo",
             detect_vinted_category_label_from_url("https://www.vinted.it/catalog/1231-shoes?search_text=adidas"),
         )
+
+    def test_build_vinted_deal_hunter_search_specs_uses_category_and_dedupes_terms(self) -> None:
+        specs = build_vinted_deal_hunter_search_specs(
+            "charm, pandora, charm",
+            "Gioielli donna",
+            250,
+            max_price=19.9,
+        )
+
+        self.assertEqual(2, len(specs))
+        self.assertEqual("charm | Gioielli donna", specs[0]["display_search"])
+        self.assertEqual(
+            "https://www.vinted.it/catalog/21-jewellery?search_text=charm",
+            specs[0]["search"],
+        )
+        self.assertEqual(250, specs[0]["max_results"])
+        self.assertEqual(19.9, specs[0]["max_price"])
+
+    def test_submitted_offer_demotes_vinted_hot_row(self) -> None:
+        rows = ScraperApp._demote_vinted_rows_with_submitted_offers(
+            object(),
+            [
+                {
+                    "offer_already_submitted": True,
+                    "evaluation_label": "da valutare assolutamente",
+                    "deal_hunter_match": True,
+                    "deal_hunter_label": "affare 24h/70+",
+                }
+            ],
+        )
+
+        self.assertEqual("da valutare", rows[0]["evaluation_label"])
+        self.assertFalse(rows[0]["deal_hunter_match"])
+        self.assertEqual("affare 24h/70+ - offerta gia inviata", rows[0]["deal_hunter_label"])
 
 
 if __name__ == "__main__":

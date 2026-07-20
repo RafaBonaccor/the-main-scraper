@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -9,12 +10,15 @@ from scraper_app.sources.vinted import (
     _build_vinted_total,
     _build_detached_vinted_browser_command,
     _build_detached_vinted_browser_profile,
+    _build_vinted_detail_row,
     _card_payload_to_row,
     _detach_vinted_browser_if_requested,
+    _enrich_vinted_priority_rows,
     _extract_vinted_description_from_body_text,
     _extract_vinted_base_price,
     _extract_vinted_primary_price,
     _normalize_vinted_max_price,
+    _persist_vinted_progress_results,
     _read_vinted_published_text,
     _extract_vinted_shipping_price_text,
     _keep_browser_open,
@@ -39,6 +43,7 @@ from scraper_app.vinted_database import (
     build_vinted_item_identity_keys,
     delete_vinted_search_run,
     list_vinted_search_runs,
+    load_vinted_completed_detail_rows,
     load_vinted_known_item_keys,
     load_vinted_submitted_offer_keys,
     load_vinted_rows,
@@ -54,6 +59,46 @@ class VintedTests(unittest.TestCase):
 
         self.assertEqual("https://www.vinted.it/catalog?search_text=macbook+pro", url)
         self.assertEqual("macbook pro", extract_vinted_search_term(url))
+
+    def test_persist_vinted_progress_results_writes_live_ui_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ui.json"
+            _persist_vinted_progress_results(
+                rows=[
+                    {
+                        "source": "vinted",
+                        "item_id": "1",
+                        "link": "https://www.vinted.it/items/1",
+                        "favorite_count": 72,
+                        "published_at": "",
+                    }
+                ],
+                config={
+                    "search": "charm",
+                    "search_term": "charm",
+                    "ui_result_json": str(path),
+                    "deal_hunter_enabled": True,
+                    "deal_hunter_min_favorites": 70,
+                    "deal_hunter_max_age_hours": 24,
+                    "max_results": 25,
+                },
+                search_url="https://www.vinted.it/catalog?search_text=charm",
+                pages_visited=[1],
+                filtered_out_known_items=0,
+                filtered_out_by_price=0,
+                cookie_action="",
+                access_status={"marker_present": True},
+                enrichment_meta={"enriched_count": 0, "demoted_count": 0},
+                live_stage="catalog",
+            )
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual("vinted", payload["source"])
+        self.assertTrue(payload["meta"]["live_partial"])
+        self.assertEqual("catalog", payload["meta"]["live_stage"])
+        self.assertEqual(1, payload["meta"]["deal_hunter_candidates"])
+        self.assertEqual(1, len(payload["rows"]))
 
     def test_vinted_page_url_helpers(self) -> None:
         base_url = "https://www.vinted.it/catalog?search_text=magliettina&search_id=1033594103"
@@ -96,17 +141,19 @@ class VintedTests(unittest.TestCase):
             "clicked": True,
         }
 
-        next_page_url = _open_vinted_next_page(driver, 2, page_settle_seconds=3.0)
+        next_page_url = _open_vinted_next_page(driver, 2, page_settle_seconds=0.5)
 
         driver.get.assert_called_once_with(
             "https://www.vinted.it/catalog?search_id=1119058183&page=2&time=1784304226",
             wait=ANY,
-            timeout=30,
+            timeout=15,
         )
         self.assertEqual(
             "https://www.vinted.it/catalog?search_id=1119058183&page=2&time=1784304226",
             next_page_url,
         )
+        self.assertEqual(1.8, mocked_wait_for_page.call_args_list[0].args[2])
+        self.assertEqual(1.8, mocked_wait_for_page.call_args_list[1].args[2])
 
     def test_detached_vinted_browser_command_uses_custom_profile_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -257,7 +304,7 @@ class VintedTests(unittest.TestCase):
 
         driver.get.assert_called_once()
         self.assertEqual("https://www.vinted.it/items/123", driver.get.call_args.args[0])
-        self.assertEqual(30, driver.get.call_args.kwargs["timeout"])
+        self.assertEqual(15, driver.get.call_args.kwargs["timeout"])
         self.assertTrue(result["marker_present"])
 
     def test_card_payload_extracts_name_price_and_clean_link(self) -> None:
@@ -430,6 +477,28 @@ class VintedTests(unittest.TestCase):
         driver.run_js.return_value = ""
         self.assertEqual("3 ore fa", _read_vinted_published_text(driver, page_text))
 
+    @patch("scraper_app.sources.vinted._read_vinted_detail_text", return_value="Page not found")
+    def test_build_vinted_detail_row_marks_missing_page_without_crashing(self, _mocked_page_text) -> None:
+        row = _build_vinted_detail_row(
+            driver=Mock(),
+            current_link="https://www.vinted.it/items/123-page-missing",
+            search_term="pandora",
+            search_url="https://www.vinted.it/catalog?search_text=pandora",
+            tag="",
+            item_name="Pandora charm",
+            base_row={
+                "name": "Pandora charm",
+                "favorite_count": 78,
+                "deal_hunter_candidate": True,
+                "deal_hunter_match": False,
+            },
+        )
+
+        self.assertEqual("page_not_found", row["detail_error"])
+        self.assertEqual("Pandora charm", row["name"])
+        self.assertEqual("123", row["item_id"])
+        self.assertEqual("https://www.vinted.it/items/123-page-missing", row["link"])
+
     def test_description_parser_uses_text_after_descrizione_heading(self) -> None:
         body_text = "\n".join(
             [
@@ -524,6 +593,64 @@ class VintedTests(unittest.TestCase):
             hidden_rows, hidden_meta = load_vinted_rows(db_path, tag_filter="altro", limit=10)
             self.assertEqual([], hidden_rows)
             self.assertEqual(0, hidden_meta["db_filtered_search_hits"])
+
+    def test_completed_detail_cache_prevents_reextracting_vinted_item(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "scraper.db")
+            save_vinted_rows(
+                [
+                    {
+                        "source": "vinted",
+                        "item_id": "9425130935",
+                        "name": "Charm Pandora",
+                        "description": "Descrizione gia estratta",
+                        "published_at": "3 ore fa",
+                        "price": "10,00 €",
+                        "price_value": 10.0,
+                        "total_price": "12,49 €",
+                        "total_price_value": 12.49,
+                        "favorite_count": 80,
+                        "evaluation_label": "da valutare assolutamente",
+                        "link": "https://www.vinted.it/items/9425130935-charm-pandora",
+                        "search_term": "charm",
+                    }
+                ],
+                db_path,
+            )
+
+            cached_rows = load_vinted_completed_detail_rows(db_path)
+            driver = Mock()
+            rows = [
+                {
+                    "source": "vinted",
+                    "item_id": "9425130935",
+                    "name": "Charm Pandora",
+                    "link": "https://www.vinted.it/items/9425130935-charm-pandora",
+                    "search_term": "charm",
+                    "search_url": "https://www.vinted.it/catalog?search_text=charm",
+                    "favorite_count": 80,
+                    "deal_hunter_candidate": True,
+                    "deal_hunter_match": False,
+                }
+            ]
+
+            meta = _enrich_vinted_priority_rows(
+                driver,
+                rows,
+                {
+                    "db_path": db_path,
+                    "deal_hunter_enabled": True,
+                    "deal_hunter_min_favorites": 70,
+                    "deal_hunter_max_age_hours": 24,
+                },
+            )
+
+        self.assertIn("id:9425130935", cached_rows)
+        driver.get.assert_not_called()
+        self.assertEqual(1, meta["cached_count"])
+        self.assertEqual("Descrizione gia estratta", rows[0]["description"])
+        self.assertTrue(rows[0]["detail_cached"])
+        self.assertTrue(rows[0]["deal_hunter_match"])
 
     def test_known_item_keys_and_offer_history_use_item_id_and_link(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

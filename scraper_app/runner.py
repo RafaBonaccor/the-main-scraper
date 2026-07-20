@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .date_filter import apply_age_filter_to_outcome
+from .exporters import write_outcome_json
 from .location_filter import apply_geo_sorting_to_outcome
 from .models import ScrapeOutcome
 from .openai_screening import DEFAULT_REASONING_EFFORT, DEFAULT_SCREENING_MODEL, apply_openai_screening_to_outcome
@@ -121,6 +122,8 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
             search=spec["search"],
             max_results=int(spec.get("max_results", 100)),
             max_price=spec.get("max_price"),
+            deal_hunter_min_favorites=int(kwargs.get("deal_hunter_min_favorites", 0) or 0),
+            deal_hunter_max_age_hours=float(kwargs.get("deal_hunter_max_age_hours", 24.0) or 0),
             exclude_known_items=bool(kwargs.get("exclude_known_items", True)),
             db_path=kwargs.get("db_path", "data/scraper.db"),
             ui_result_json=kwargs.get("ui_result_json", ""),
@@ -147,29 +150,39 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
     filtered_out_by_price = 0
     priority_rows_enriched = 0
     priority_rows_demoted_by_age = 0
+    priority_rows_cached = 0
+    deal_hunter_candidates = 0
+    deal_hunter_matches = 0
     last_meta: dict = {}
+    stopped_early = False
 
     for index, spec in enumerate(search_specs):
         if consume_stop_after_current_item_request():
+            stopped_early = True
             break
         is_last = index == len(search_specs) - 1
+        deal_hunter_enabled = int(kwargs.get("deal_hunter_min_favorites", 0) or 0) > 0
+        inner_keep_browser_open = bool(kwargs.get("keep_browser_open", True)) if is_last or not deal_hunter_enabled else True
         try:
             outcome = run_vinted_scraper(
                 search=spec["search"],
                 max_results=int(spec.get("max_results", 100)),
                 max_price=spec.get("max_price"),
+                deal_hunter_min_favorites=int(kwargs.get("deal_hunter_min_favorites", 0) or 0),
+                deal_hunter_max_age_hours=float(kwargs.get("deal_hunter_max_age_hours", 24.0) or 0),
                 exclude_known_items=bool(kwargs.get("exclude_known_items", True)),
                 db_path=kwargs.get("db_path", "data/scraper.db"),
-                ui_result_json="",
+                ui_result_json=str(kwargs.get("ui_result_json", "") or "") if deal_hunter_enabled else "",
                 browser_mode=kwargs.get("browser_mode", "chrome_normale"),
                 browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
                 browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
-                keep_browser_open=bool(kwargs.get("keep_browser_open", True)) if is_last else False,
+                keep_browser_open=inner_keep_browser_open,
                 refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
                 keep_open_seconds=int(kwargs.get("keep_open_seconds", 0)) if is_last else 0,
                 slow_mode=bool(kwargs.get("slow_mode", False)),
                 action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
                 page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
+                detach_browser_on_complete=not deal_hunter_enabled and is_last,
             )
         except Exception as exc:
             search_errors.append(
@@ -192,17 +205,90 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
         filtered_out_by_price += int(outcome.meta.get("filtered_out_by_price", 0) or 0)
         priority_rows_enriched += int(outcome.meta.get("priority_rows_enriched", 0) or 0)
         priority_rows_demoted_by_age += int(outcome.meta.get("priority_rows_demoted_by_age", 0) or 0)
+        priority_rows_cached += int(outcome.meta.get("priority_rows_cached", 0) or 0)
+        deal_hunter_candidates += int(outcome.meta.get("deal_hunter_candidates", 0) or 0)
+        deal_hunter_matches += int(outcome.meta.get("deal_hunter_matches", 0) or 0)
         for row in outcome.rows:
             annotated_row = dict(row)
             annotated_row["batch_search_index"] = index + 1
             annotated_row["batch_search_count"] = len(search_specs)
             annotated_row["extracted_order"] = len(rows) + 1
             rows.append(annotated_row)
+        partial_outcome = _build_vinted_batch_outcome(
+            rows=rows,
+            search_specs=search_specs,
+            search_urls=search_urls,
+            pages_visited=pages_visited,
+            search_errors=search_errors,
+            new_items=new_items,
+            updated_items=updated_items,
+            new_search_hits=new_search_hits,
+            updated_search_hits=updated_search_hits,
+            filtered_out_known_items=filtered_out_known_items,
+            filtered_out_by_price=filtered_out_by_price,
+            priority_rows_enriched=priority_rows_enriched,
+            priority_rows_demoted_by_age=priority_rows_demoted_by_age,
+            priority_rows_cached=priority_rows_cached,
+            deal_hunter_candidates=deal_hunter_candidates,
+            deal_hunter_matches=deal_hunter_matches,
+            last_meta=last_meta,
+            kwargs=kwargs,
+            stopped_early=False,
+        )
+        _persist_partial_vinted_batch_outcome(
+            outcome=partial_outcome,
+            ui_result_json=str(kwargs.get("ui_result_json", "") or ""),
+        )
 
     if not rows and search_errors:
         error_preview = "; ".join(f"{item['search']}: {item['error']}" for item in search_errors[:3])
         raise RuntimeError(f"Nessuna ricerca Vinted completata. {error_preview}")
 
+    return _build_vinted_batch_outcome(
+        rows=rows,
+        search_specs=search_specs,
+        search_urls=search_urls,
+        pages_visited=pages_visited,
+        search_errors=search_errors,
+        new_items=new_items,
+        updated_items=updated_items,
+        new_search_hits=new_search_hits,
+        updated_search_hits=updated_search_hits,
+        filtered_out_known_items=filtered_out_known_items,
+        filtered_out_by_price=filtered_out_by_price,
+        priority_rows_enriched=priority_rows_enriched,
+        priority_rows_demoted_by_age=priority_rows_demoted_by_age,
+        priority_rows_cached=priority_rows_cached,
+        deal_hunter_candidates=deal_hunter_candidates,
+        deal_hunter_matches=deal_hunter_matches,
+        last_meta=last_meta,
+        kwargs=kwargs,
+        stopped_early=stopped_early,
+    )
+
+
+def _build_vinted_batch_outcome(
+    *,
+    rows: list[dict],
+    search_specs: list[dict],
+    search_urls: list[str],
+    pages_visited: list[int],
+    search_errors: list[dict[str, str]],
+    new_items: int,
+    updated_items: int,
+    new_search_hits: int,
+    updated_search_hits: int,
+    filtered_out_known_items: int,
+    filtered_out_by_price: int,
+    priority_rows_enriched: int,
+    priority_rows_demoted_by_age: int,
+    priority_rows_cached: int,
+    deal_hunter_candidates: int,
+    deal_hunter_matches: int,
+    last_meta: dict,
+    kwargs: dict,
+    stopped_early: bool,
+) -> ScrapeOutcome:
     search_labels = [str(spec.get("search", "") or "") for spec in search_specs]
     return ScrapeOutcome(
         source="vinted",
@@ -228,6 +314,12 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
             "filtered_out_by_price": filtered_out_by_price,
             "priority_rows_enriched": priority_rows_enriched,
             "priority_rows_demoted_by_age": priority_rows_demoted_by_age,
+            "priority_rows_cached": priority_rows_cached,
+            "deal_hunter_enabled": bool(last_meta.get("deal_hunter_enabled", False)),
+            "deal_hunter_min_favorites": int(kwargs.get("deal_hunter_min_favorites", 0) or 0),
+            "deal_hunter_max_age_hours": float(kwargs.get("deal_hunter_max_age_hours", 24.0) or 0),
+            "deal_hunter_candidates": deal_hunter_candidates,
+            "deal_hunter_matches": deal_hunter_matches,
             "search_errors": search_errors,
             "keep_browser_open": bool(kwargs.get("keep_browser_open", True)),
             "keep_open_seconds": int(kwargs.get("keep_open_seconds", 0)),
@@ -238,9 +330,19 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
             "vinted_access_expected_alt": str(last_meta.get("vinted_access_expected_alt", "") or ""),
             "vinted_access_current_url": str(last_meta.get("vinted_access_current_url", "") or ""),
             "vinted_access_checked_at": str(last_meta.get("vinted_access_checked_at", "") or ""),
+            "stopped_early": bool(stopped_early),
             "db_saved_live": False,
         },
     )
+
+
+def _persist_partial_vinted_batch_outcome(outcome: ScrapeOutcome, ui_result_json: str) -> None:
+    target = str(ui_result_json or "").strip()
+    if not target:
+        return
+    path = Path(target).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_outcome_json(path, outcome)
 
 
 def _resolve_vinted_search_specs(kwargs: dict) -> list[dict]:

@@ -257,9 +257,21 @@ Flusso tipico:
    - totale
 12. se ti servono gli URL delle righe selezionate, usa `Esporta link selezionati` nella tab risultati; puoi salvarli in `.json` o `.txt`
 13. dopo la run puoi selezionare uno o più annunci Vinted nei risultati, impostare `Sconto offerta (%)` e usare `Fai offerta -X%`; il tool apre ogni annuncio, clicca `Fai un'offerta`, usa il prezzo annuncio già presente in tabella come base, calcola `prezzo - percentuale scelta`, inserisce il valore e preme `Offri`
-14. le offerte inviate vengono salvate nel DB Vinted: se selezioni di nuovo lo stesso annuncio, la GUI lo esclude automaticamente e il backend non lo reinvia
+14. le offerte inviate vengono salvate nel DB Vinted: se selezioni di nuovo lo stesso annuncio, la GUI lo esclude automaticamente e il backend non lo reinvia; inoltre non resta piu in `da valutare assolutamente`
+15. puoi inviare offerte anche mentre il `Procacciatore affari` sta lavorando: l'offerta gira in un processo separato e il procacciatore continua il loop
 15. nell'area `Archivio database` puoi scegliere una `Ricerca salvata`, filtrarla per data/query/titolo/note, aggiornarne l'elenco e ricaricare in tabella una run specifica
 16. puoi anche rinominare la ricerca salvata, aggiungere note archivio o eliminarla senza cancellare gli articoli dal database generale
+17. se vuoi lavorare in modalita `Procacciatore affari`, usa il pannello dedicato:
+   - inserisci una lista di termini ruotati, ad esempio `charm, bracciali, pandora, collane, gioielli`
+   - imposta `Like min` e `Eta max (ore)`; il default e `70` like entro `24` ore
+   - imposta `Max articoli / ricerca` per definire quanto fondo scansionare ogni keyword del ciclo
+   - imposta `Pausa loop (s)` per la distanza tra un ciclo completo e il successivo; il default e `5`
+   - il procacciatore usa un profilo rapido dedicato: pausa azioni `0,25s`, attesa pagina `1,0s`, senza modalita lenta
+   - usa `Carica preset nella tabella` se vuoi ispezionare o modificare il batch prima di avviarlo
+   - usa `Avvia procacciatore affari` per far partire il loop continuo; ogni ciclo visita le keyword, entra nei candidati con almeno la soglia like, conferma la data dal dettaglio e tiene nei risultati solo gli affari confermati
+   - se un annuncio e gia presente nel DB con `item_id`, prezzo e descrizione, il dettaglio viene riusato dalla cache e la pagina annuncio non viene riaperta
+   - l'estrazione descrizioni Vinted usa lo stesso profilo rapido: pausa azioni `0,25s`, attesa pagina `1,0s`, timeout navigazione `15s`
+   - usa `Ferma procacciatore` per disarmare il loop; se il ciclo corrente e in esecuzione viene fermato insieme al processo
 
 I dati vengono salvati nel DB e mostrati nei risultati.
 

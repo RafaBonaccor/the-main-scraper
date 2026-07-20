@@ -102,6 +102,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum item price to keep for this Vinted search. Leave empty for no price cap.",
     )
     vinted_parser.add_argument(
+        "--deal-hunter-min-favorites",
+        default=0,
+        type=int,
+        help="If greater than zero, keep only Vinted listings with at least this many likes after confirming age from the detail page.",
+    )
+    vinted_parser.add_argument(
+        "--deal-hunter-max-age-hours",
+        default=24.0,
+        type=float,
+        help="Maximum listing age in hours for deal-hunter mode.",
+    )
+    vinted_parser.add_argument(
         "--exclude-known-items",
         action=argparse.BooleanOptionalAction,
         default=True,

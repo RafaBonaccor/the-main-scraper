@@ -46,6 +46,19 @@ from .vinted_database import (
     load_vinted_rows,
     update_vinted_search_run,
 )
+from .vinted_deals import (
+    VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL,
+    VINTED_DEAL_HUNTER_DEFAULT_LOOP_SECONDS,
+    VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
+    VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH,
+    VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES,
+    VINTED_DEAL_HUNTER_DEFAULT_TERMS,
+    annotate_vinted_deal_hunter_rows,
+    normalize_vinted_deal_hunter_max_age_hours,
+    normalize_vinted_deal_hunter_min_favorites,
+    normalize_vinted_deal_hunter_terms,
+    vinted_deal_hunter_enabled,
+)
 
 
 APP_BG = "#f4f6f8"
@@ -135,6 +148,13 @@ VINTED_CATEGORY_PRESETS = (
     ("Scarpe uomo", "https://www.vinted.it/catalog/1231-shoes"),
 )
 VINTED_CATEGORY_PRESET_LOOKUP = {label: url for label, url in VINTED_CATEGORY_PRESETS}
+VINTED_SIGNAL_FILTER_VALUES = (
+    "tutti",
+    "procacciatore affari",
+    "ricercato",
+    "da valutare",
+    "da valutare assolutamente",
+)
 
 
 def open_external_target(target: object) -> bool:
@@ -197,6 +217,33 @@ def detect_vinted_category_label_from_url(url: object) -> str:
         if category_url and value.startswith(category_url):
             return label
     return VINTED_CATEGORY_PRESETS[0][0]
+
+
+def build_vinted_deal_hunter_search_specs(
+    raw_terms: object,
+    category_selection: object,
+    max_results: object,
+    max_price: float | None = None,
+) -> list[dict]:
+    try:
+        normalized_max_results = max(int(max_results), 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Max risultati per ricerca del procacciatore affari non valido.") from exc
+    category_label = str(category_selection or "").strip() or VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL
+    normalized_terms = normalize_vinted_deal_hunter_terms(raw_terms)
+    specs: list[dict] = []
+    for term in normalized_terms:
+        resolved_search = build_vinted_search_target_url(term, category_label)
+        specs.append(
+            {
+                "search": resolved_search,
+                "display_search": format_vinted_search_target_label(term, category_label) or resolved_search,
+                "category_label": category_label if resolve_vinted_category_url(category_label) else "",
+                "max_results": normalized_max_results,
+                "max_price": max_price,
+            }
+        )
+    return specs
 
 RESULT_SORT_DEFAULT_DESC = {
     "Prezzo Vinted": False,
@@ -326,6 +373,7 @@ class ScraperApp:
         self.root = root
         self.script_path = script_path
         self.process: subprocess.Popen[str] | None = None
+        self.vinted_offer_process: subprocess.Popen[str] | None = None
         self.process_kind = ""
         self.process_should_load_results = False
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -349,6 +397,12 @@ class ScraperApp:
         self.vinted_category_var = tk.StringVar(value=VINTED_CATEGORY_PRESETS[0][0])
         self.vinted_max_results_var = tk.StringVar(value="100")
         self.vinted_max_price_var = tk.StringVar(value="")
+        self.vinted_deal_hunter_terms_var = tk.StringVar(value=", ".join(VINTED_DEAL_HUNTER_DEFAULT_TERMS))
+        self.vinted_deal_hunter_category_var = tk.StringVar(value=VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL)
+        self.vinted_deal_hunter_max_results_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH))
+        self.vinted_deal_hunter_min_favorites_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES))
+        self.vinted_deal_hunter_max_age_hours_var = tk.StringVar(value=str(int(VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS)))
+        self.vinted_deal_hunter_cycle_seconds_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_LOOP_SECONDS))
         self.vinted_db_path_var = tk.StringVar(value=str((script_path.parent / "data" / "scraper.db").resolve()))
         self.vinted_db_filter_var = tk.StringVar()
         self.vinted_db_limit_var = tk.StringVar(value="500")
@@ -362,6 +416,7 @@ class ScraperApp:
         self.vinted_refresh_browser_profile_var = tk.BooleanVar(value=False)
         self.vinted_search_preview_var = tk.StringVar()
         self.vinted_status_var = tk.StringVar(value="Pronto per una nuova ricerca Vinted.")
+        self.vinted_deal_hunter_status_var = tk.StringVar(value="Procacciatore affari disattivato.")
         self.vinted_profile_session_var = tk.StringVar(value="Controllo in corso...")
         self.vinted_profile_cookies_var = tk.StringVar(value="-")
         self.vinted_profile_last_import_var = tk.StringVar(value="-")
@@ -439,6 +494,12 @@ class ScraperApp:
         self.auto_monitor_after_id: str | None = None
         self.auto_monitor_command: list[str] | None = None
         self.auto_monitor_interval_ms = 0
+        self.vinted_deal_hunter_enabled = False
+        self.vinted_deal_hunter_after_id: str | None = None
+        self.vinted_deal_hunter_command: list[str] | None = None
+        self.vinted_deal_hunter_interval_ms = 0
+        self.vinted_deal_hunter_session_active = False
+        self.vinted_deal_hunter_session_rows: list[dict] = []
         self.current_results_generated_at = ""
         self.current_result_meta: dict[str, object] = {}
         self.process_stop_requested = False
@@ -798,6 +859,103 @@ class ScraperApp:
         search_actions.columnconfigure(0, weight=2)
         search_actions.columnconfigure(1, weight=1)
 
+        deal_hunter_frame = ttk.Frame(card, style="Panel.TFrame")
+        deal_hunter_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 8))
+        deal_hunter_frame.columnconfigure(1, weight=1)
+        ttk.Label(deal_hunter_frame, text="Procacciatore affari", style="Metric.TLabel").grid(
+            row=0,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            pady=(0, 6),
+        )
+        ttk.Label(
+            deal_hunter_frame,
+            text="Loop Vinted che ruota i termini, controlla i candidati con almeno N like e tiene solo gli annunci entro le ultime ore impostate.",
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        ttk.Label(deal_hunter_frame, text="Termini rotazione").grid(row=2, column=0, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_terms_var).grid(
+            row=2,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            padx=(10, 8),
+            pady=(0, 8),
+        )
+        ttk.Label(deal_hunter_frame, text="Categoria").grid(row=2, column=3, sticky="w")
+        ttk.Combobox(
+            deal_hunter_frame,
+            textvariable=self.vinted_deal_hunter_category_var,
+            state="readonly",
+            values=[label for label, _url in VINTED_CATEGORY_PRESETS],
+            width=22,
+        ).grid(row=2, column=4, sticky="w", padx=(8, 0), pady=(0, 8))
+        ttk.Label(deal_hunter_frame, text="Max articoli / ricerca").grid(row=3, column=0, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_max_results_var, width=8).grid(
+            row=3,
+            column=1,
+            sticky="w",
+            padx=(10, 8),
+            pady=(0, 8),
+        )
+        ttk.Label(deal_hunter_frame, text="Like min").grid(row=3, column=2, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_min_favorites_var, width=8).grid(
+            row=3,
+            column=3,
+            sticky="w",
+            padx=(8, 8),
+            pady=(0, 8),
+        )
+        ttk.Label(deal_hunter_frame, text="Eta max (ore)").grid(row=3, column=4, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_max_age_hours_var, width=8).grid(
+            row=3,
+            column=5,
+            sticky="w",
+            padx=(8, 8),
+            pady=(0, 8),
+        )
+        ttk.Label(deal_hunter_frame, text="Pausa loop (s)").grid(row=3, column=6, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_cycle_seconds_var, width=8).grid(
+            row=3,
+            column=7,
+            sticky="w",
+            padx=(8, 0),
+            pady=(0, 8),
+        )
+        deal_hunter_actions = ttk.Frame(deal_hunter_frame, style="Panel.TFrame")
+        deal_hunter_actions.grid(row=4, column=0, columnspan=8, sticky="ew", pady=(2, 0))
+        ttk.Button(
+            deal_hunter_actions,
+            text="Carica preset nella tabella",
+            style="Secondary.TButton",
+            command=self._load_vinted_deal_hunter_specs_into_table,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            deal_hunter_actions,
+            text="Avvia procacciatore affari",
+            style="Accent.TButton",
+            command=self._start_vinted_deal_hunter,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            deal_hunter_actions,
+            text="Ferma procacciatore",
+            style="Secondary.TButton",
+            command=self._stop_vinted_deal_hunter,
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        deal_hunter_actions.columnconfigure(0, weight=1)
+        deal_hunter_actions.columnconfigure(1, weight=1)
+        deal_hunter_actions.columnconfigure(2, weight=1)
+        ttk.Label(
+            deal_hunter_frame,
+            textvariable=self.vinted_deal_hunter_status_var,
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=5, column=0, columnspan=8, sticky="w", pady=(8, 0))
+
         ttk.Separator(card, orient="horizontal").grid(row=7, column=0, columnspan=3, sticky="ew", pady=(0, 10))
         ttk.Label(card, text="Archivio database", style="Metric.TLabel").grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 8))
         self._row(card, 9, "Database SQLite", self.vinted_db_path_var)
@@ -833,7 +991,7 @@ class ScraperApp:
         vinted_signal_filter_box = ttk.Combobox(
             card,
             textvariable=self.vinted_signal_filter_var,
-            values=("tutti", "ricercato", "da valutare", "da valutare assolutamente"),
+            values=VINTED_SIGNAL_FILTER_VALUES,
             state="readonly",
             width=28,
         )
@@ -1282,6 +1440,7 @@ class ScraperApp:
         self.results_tree.tag_configure("accepted", background="#edf7f0")
         self.results_tree.tag_configure("maybe", background="#fff7e8")
         self.results_tree.tag_configure("rejected", background="#fdeeee")
+        self.results_tree.tag_configure("vinted_deal", background="#dcfce7")
         self.results_tree.tag_configure("vinted_hot", background="#fee2e2")
         self.results_tree.tag_configure("vinted_review", background="#fef3c7")
         self.results_tree.tag_configure("vinted_badge", background="#ecfccb")
@@ -1847,7 +2006,9 @@ class ScraperApp:
         self.subito_open_selected_button.configure(state="normal" if has_row else "disabled")
         self.open_website_button.configure(state="normal" if has_website else "disabled")
         self.export_links_button.configure(state="normal" if selected_rows_with_links else "disabled")
-        self.vinted_offer_button.configure(state="normal" if is_vinted else "disabled")
+        self.vinted_offer_button.configure(
+            state="normal" if is_vinted and self.vinted_offer_process is None else "disabled"
+        )
         if hasattr(self, "vinted_extract_button"):
             self.vinted_extract_button.configure(state="normal" if selected_vinted_rows else "disabled")
         self.contact_button.configure(state="normal" if is_subito else "disabled")
@@ -2064,10 +2225,232 @@ class ScraperApp:
         searches_file.write_text(json.dumps(searches, ensure_ascii=False, indent=2), encoding="utf-8")
         return searches_file
 
+    def _parse_vinted_deal_hunter_min_favorites(self) -> int:
+        raw_value = self.vinted_deal_hunter_min_favorites_var.get().strip()
+        normalized = normalize_vinted_deal_hunter_min_favorites(
+            raw_value,
+            default=VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES,
+        )
+        if normalized <= 0:
+            raise ValueError("Like min del procacciatore affari deve essere maggiore di zero.")
+        return normalized
+
+    def _parse_vinted_deal_hunter_max_age_hours(self) -> float:
+        raw_value = self.vinted_deal_hunter_max_age_hours_var.get().strip()
+        normalized = normalize_vinted_deal_hunter_max_age_hours(
+            raw_value,
+            default=VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
+        )
+        if normalized <= 0:
+            raise ValueError("Eta max (ore) del procacciatore affari deve essere maggiore di zero.")
+        return normalized
+
+    def _parse_vinted_deal_hunter_cycle_seconds(self) -> int:
+        raw_value = self.vinted_deal_hunter_cycle_seconds_var.get().strip()
+        if not raw_value:
+            raise ValueError("Inserisci la pausa loop del procacciatore affari in secondi.")
+        try:
+            seconds = int(raw_value)
+        except ValueError as exc:
+            raise ValueError("Pausa loop del procacciatore affari non valida.") from exc
+        if seconds <= 0:
+            raise ValueError("Pausa loop del procacciatore affari deve essere maggiore di zero.")
+        return seconds
+
+    def _current_vinted_deal_hunter_specs_from_form(self) -> list[dict]:
+        raw_max_results = self.vinted_deal_hunter_max_results_var.get().strip()
+        if not raw_max_results:
+            raw_max_results = str(VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH)
+        if not raw_max_results.isdigit():
+            raise ValueError("Max articoli / ricerca del procacciatore affari deve essere un intero maggiore o uguale a zero.")
+        max_price_raw = self.vinted_max_price_var.get().strip()
+        max_price = self._parse_vinted_max_price_value(max_price_raw)
+        specs = build_vinted_deal_hunter_search_specs(
+            raw_terms=self.vinted_deal_hunter_terms_var.get(),
+            category_selection=self.vinted_deal_hunter_category_var.get().strip() or VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL,
+            max_results=raw_max_results,
+            max_price=max_price,
+        )
+        if not specs:
+            raise ValueError("Inserisci almeno un termine valido per il procacciatore affari.")
+        return specs
+
+    def _load_vinted_deal_hunter_specs_into_table(self) -> None:
+        try:
+            specs = self._current_vinted_deal_hunter_specs_from_form()
+        except ValueError as exc:
+            messagebox.showerror("Procacciatore affari", str(exc))
+            return
+        self.vinted_search_specs = [dict(spec) for spec in specs]
+        self._refresh_vinted_search_specs_tree()
+        self.vinted_status_var.set(f"Preset procacciatore caricato: {len(specs)} ricerche in tabella.")
+        self.vinted_deal_hunter_status_var.set(f"Preset pronto: {len(specs)} ricerche ruotate nel loop.")
+
+    def _build_vinted_deal_hunter_command(self) -> list[str]:
+        db_path = self.vinted_db_path_var.get().strip()
+        if not db_path:
+            raise ValueError("Inserisci il percorso del database SQLite.")
+        keep_open_seconds = self.vinted_keep_open_seconds_var.get().strip() or "0"
+        if self.vinted_keep_browser_open_var.get() and not keep_open_seconds.isdigit():
+            raise ValueError("I secondi per tenere aperto il browser Vinted devono essere un intero maggiore o uguale a zero.")
+        specs = self._current_vinted_deal_hunter_specs_from_form()
+        searches_file = self._write_vinted_searches_file(specs)
+        min_favorites = self._parse_vinted_deal_hunter_min_favorites()
+        max_age_hours = self._parse_vinted_deal_hunter_max_age_hours()
+
+        cmd = [
+            sys.executable,
+            str(self.script_path),
+            "run",
+            "vinted",
+            "--db-path",
+            db_path,
+            "--searches-file",
+            str(searches_file),
+            "--deal-hunter-min-favorites",
+            str(min_favorites),
+            "--deal-hunter-max-age-hours",
+            str(max_age_hours),
+        ]
+        if self.vinted_keep_browser_open_var.get():
+            if int(keep_open_seconds) == 0:
+                cmd.append("--keep-browser-open")
+            else:
+                cmd += ["--keep-open-seconds", keep_open_seconds]
+        else:
+            cmd.append("--no-keep-browser-open")
+        cmd.append("--exclude-known-items" if self.vinted_exclude_known_items_var.get() else "--no-exclude-known-items")
+        if self.vinted_refresh_browser_profile_var.get():
+            cmd.append("--refresh-browser-profile")
+        cmd += self._browser_command_args(
+            action_delay_override="0.25",
+            page_settle_override="1.0",
+            slow_mode_override=False,
+        )
+        cmd += [
+            "--format",
+            self.output_format_var.get().strip(),
+            "--output-dir",
+            self.output_dir_var.get().strip(),
+            "--ui-result-json",
+            str(self.ui_result_json_path),
+        ]
+        if self.filename_var.get().strip():
+            cmd += ["--filename", self.filename_var.get().strip()]
+        return cmd
+
+    def _start_vinted_deal_hunter(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Procacciatore affari", "Attendi la fine del processo corrente.")
+            return
+        try:
+            command = self._build_vinted_deal_hunter_command()
+            cycle_seconds = self._parse_vinted_deal_hunter_cycle_seconds()
+            specs = self._current_vinted_deal_hunter_specs_from_form()
+        except ValueError as exc:
+            messagebox.showerror("Procacciatore affari", str(exc))
+            return
+        self._stop_auto_monitor()
+        self._stop_vinted_deal_hunter(quiet=True, stop_process=False)
+        self._reset_vinted_deal_hunter_session()
+        self.vinted_deal_hunter_session_active = True
+        self._clear_results()
+        self.vinted_signal_filter_var.set("procacciatore affari")
+        self.vinted_deal_hunter_enabled = True
+        self.vinted_deal_hunter_command = list(command)
+        self.vinted_deal_hunter_interval_ms = max(cycle_seconds * 1000, 1_000)
+        self._cancel_vinted_deal_hunter_timer()
+        self.current_run_source = "vinted"
+        self.vinted_status_var.set("Procacciatore affari avviato. Controllo candidati 70+ e conferma 24h in corso...")
+        self.vinted_deal_hunter_status_var.set(
+            f"Procacciatore attivo: {len(specs)} ricerche in rotazione, pausa {cycle_seconds}s tra i cicli."
+        )
+        self._append_log(
+            f"[deal-hunter] Avvio loop Vinted: {len(specs)} ricerche, pausa {cycle_seconds}s, "
+            f"like min {self._parse_vinted_deal_hunter_min_favorites()}, eta max {self._parse_vinted_deal_hunter_max_age_hours():g}h.\n"
+        )
+        self._start_process(list(command), kind="scrape", load_results=True)
+
+    def _stop_vinted_deal_hunter(self, quiet: bool = False, stop_process: bool = True) -> None:
+        was_enabled = self.vinted_deal_hunter_enabled or self.vinted_deal_hunter_after_id is not None
+        self.vinted_deal_hunter_enabled = False
+        self.vinted_deal_hunter_command = None
+        self.vinted_deal_hunter_interval_ms = 0
+        self._cancel_vinted_deal_hunter_timer()
+        self.vinted_deal_hunter_status_var.set("Procacciatore affari disattivato.")
+        if was_enabled:
+            self._append_log("[deal-hunter] Loop procacciatore affari fermato.\n")
+        if stop_process and self.process is not None and self.process_kind == "scrape" and self.current_run_source == "vinted":
+            self._stop_current_process()
+            return
+        if not quiet and not was_enabled:
+            messagebox.showinfo("Procacciatore affari", "Il procacciatore affari non e attivo.")
+
+    def _cancel_vinted_deal_hunter_timer(self) -> None:
+        if self.vinted_deal_hunter_after_id is not None:
+            self.root.after_cancel(self.vinted_deal_hunter_after_id)
+            self.vinted_deal_hunter_after_id = None
+
+    def _reset_vinted_deal_hunter_session(self) -> None:
+        self.vinted_deal_hunter_session_active = False
+        self.vinted_deal_hunter_session_rows = []
+
+    def _merge_vinted_deal_hunter_session_rows(self, current_rows: list[dict], incoming_rows: list[dict]) -> list[dict]:
+        merged_by_key: dict[str, dict] = {}
+        order: list[str] = []
+        for row in current_rows + incoming_rows:
+            identity_keys = build_vinted_item_identity_keys(
+                item_id=row.get("item_id", ""),
+                link=row.get("link", ""),
+            )
+            dedupe_key = identity_keys[0] if identity_keys else str(row.get("link", "") or "").strip()
+            if not dedupe_key:
+                continue
+            if dedupe_key not in merged_by_key:
+                order.append(dedupe_key)
+            merged_by_key[dedupe_key] = dict(row)
+        return [merged_by_key[key] for key in order if key in merged_by_key]
+
+    def _schedule_next_vinted_deal_hunter_run(self, *, code: int) -> None:
+        if not self.vinted_deal_hunter_enabled or not self.vinted_deal_hunter_command or self.vinted_deal_hunter_interval_ms <= 0:
+            return
+        self._cancel_vinted_deal_hunter_timer()
+        next_run_at = datetime.now() + timedelta(milliseconds=self.vinted_deal_hunter_interval_ms)
+        status = "ok" if code == 0 else f"errore exit {code}"
+        self.vinted_deal_hunter_status_var.set(
+            f"Procacciatore attivo: prossimo ciclo alle {next_run_at.strftime('%H:%M:%S')} ({status})."
+        )
+        self._append_log(
+            f"[deal-hunter] Prossimo ciclo pianificato per le {next_run_at.strftime('%H:%M:%S')}.\n"
+        )
+        self.vinted_deal_hunter_after_id = self.root.after(
+            self.vinted_deal_hunter_interval_ms,
+            self._run_scheduled_vinted_deal_hunter,
+        )
+
+    def _run_scheduled_vinted_deal_hunter(self) -> None:
+        self.vinted_deal_hunter_after_id = None
+        if not self.vinted_deal_hunter_enabled or not self.vinted_deal_hunter_command:
+            return
+        if self.process is not None:
+            retry_at = datetime.now() + timedelta(seconds=3)
+            self.vinted_deal_hunter_status_var.set(
+                f"Procacciatore attivo: processo ancora in corso, ritento alle {retry_at.strftime('%H:%M:%S')}."
+            )
+            self._append_log("[deal-hunter] Processo ancora attivo, ritento tra 3 secondi.\n")
+            self.vinted_deal_hunter_after_id = self.root.after(3_000, self._run_scheduled_vinted_deal_hunter)
+            return
+        self.vinted_deal_hunter_status_var.set("Procacciatore attivo: avvio nuovo ciclo.")
+        self.current_run_source = "vinted"
+        self._append_log("[deal-hunter] Avvio ciclo programmato.\n")
+        self._start_process(list(self.vinted_deal_hunter_command), kind="scrape", load_results=True)
+
     def _start_vinted_search(self) -> None:
         if self.process is not None:
             messagebox.showinfo("Ricerca Vinted", "Attendi la fine del processo corrente.")
             return
+        self._stop_vinted_deal_hunter(quiet=True, stop_process=False)
+        self._reset_vinted_deal_hunter_session()
         if not self.vinted_search_specs:
             try:
                 current_spec = self._current_vinted_search_spec_from_form()
@@ -2318,7 +2701,11 @@ class ScraperApp:
             cmd.append("--no-keep-browser-open")
         if self.vinted_refresh_browser_profile_var.get():
             cmd.append("--refresh-browser-profile")
-        cmd += self._browser_command_args()
+        cmd += self._browser_command_args(
+            action_delay_override="0.25",
+            page_settle_override="1.0",
+            slow_mode_override=False,
+        )
         cmd += [
             "--format",
             self.output_format_var.get().strip(),
@@ -2360,10 +2747,18 @@ class ScraperApp:
         return links_file
 
     def _reset_vinted_form(self) -> None:
+        self._stop_vinted_deal_hunter(quiet=True, stop_process=False)
+        self._reset_vinted_deal_hunter_session()
         self.vinted_search_var.set("macbook")
         self.vinted_category_var.set(VINTED_CATEGORY_PRESETS[0][0])
         self.vinted_max_results_var.set("100")
         self.vinted_max_price_var.set("")
+        self.vinted_deal_hunter_terms_var.set(", ".join(VINTED_DEAL_HUNTER_DEFAULT_TERMS))
+        self.vinted_deal_hunter_category_var.set(VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL)
+        self.vinted_deal_hunter_max_results_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH))
+        self.vinted_deal_hunter_min_favorites_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES))
+        self.vinted_deal_hunter_max_age_hours_var.set(str(int(VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS)))
+        self.vinted_deal_hunter_cycle_seconds_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_LOOP_SECONDS))
         self.vinted_offer_discount_percent_var.set("15")
         self.vinted_db_path_var.set(str((self.script_path.parent / "data" / "scraper.db").resolve()))
         self.vinted_db_filter_var.set("")
@@ -2381,6 +2776,7 @@ class ScraperApp:
         self._refresh_vinted_saved_search_terms()
         self._refresh_vinted_saved_runs(quiet=True)
         self.vinted_status_var.set("Campi Vinted ripristinati.")
+        self.vinted_deal_hunter_status_var.set("Procacciatore affari disattivato.")
         self._update_vinted_profile_status()
 
     def _choose_output_dir(self) -> None:
@@ -2474,6 +2870,7 @@ class ScraperApp:
         if len(command) < 4 or command[3] != "subito":
             messagebox.showerror("Monitor automatico", "Il monitor automatico supporta solo lo scraping Subito.")
             return
+        self._stop_vinted_deal_hunter(quiet=True, stop_process=False)
         self.auto_monitor_enabled = True
         self.auto_monitor_command = list(command)
         self.auto_monitor_interval_ms = max(int(interval_hours * 3600 * 1000), 60_000)
@@ -2591,8 +2988,8 @@ class ScraperApp:
         self._start_process(command, kind="contact", load_results=False)
 
     def _start_vinted_offer_action(self) -> None:
-        if self.process is not None:
-            messagebox.showinfo("Offerta Vinted", "Attendi la fine del processo corrente.")
+        if self.vinted_offer_process is not None:
+            messagebox.showinfo("Offerta Vinted", "Attendi la fine dell'offerta Vinted corrente.")
             return
         rows = [row for row in self._get_selected_rows() if str(row.get("source", "") or "").strip().lower() == "vinted"]
         if not rows:
@@ -2645,7 +3042,7 @@ class ScraperApp:
             return
         self.vinted_status_var.set(f"Invio offerte Vinted in corso su {len(rows)} annunci...")
         self._scroll_to_widget(self.log_tab)
-        self._start_process(command, kind="vinted_offer", load_results=False)
+        self._start_vinted_offer_process(command)
 
     def _start_batch_contact_selected(self) -> None:
         rows = self._get_selected_rows()
@@ -2741,11 +3138,31 @@ class ScraperApp:
         self.process = subprocess.Popen(command, **process_kwargs)
         threading.Thread(target=self._read_process_output, daemon=True).start()
 
+    def _start_vinted_offer_process(self, command: list[str]) -> None:
+        if self.vinted_offer_process is not None:
+            messagebox.showinfo("Offerta Vinted", "Attendi la fine dell'offerta Vinted corrente.")
+            return
+        process_kwargs: dict[str, object] = {
+            "cwd": self.script_path.parent,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+        }
+        if os.name == "nt":
+            process_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            process_kwargs["start_new_session"] = True
+        self._append_log(f"$ {' '.join(command)}\n")
+        self.vinted_offer_button.configure(state="disabled")
+        self.vinted_offer_process = subprocess.Popen(command, **process_kwargs)
+        threading.Thread(target=self._read_vinted_offer_process_output, daemon=True).start()
+
     def _stop_current_process(self) -> None:
         if self.process is None:
             messagebox.showinfo("Ferma processo", "Nessun processo in esecuzione.")
             return
         self._stop_auto_monitor()
+        self._stop_vinted_deal_hunter(quiet=True, stop_process=False)
         clear_runtime_control_requests()
         process = self.process
         self.process_stop_requested = True
@@ -2753,6 +3170,9 @@ class ScraperApp:
         self._set_runtime_status("Stopping...")
         self._set_stop_process_buttons_state("disabled")
         self._terminate_process_tree(process)
+        if self.vinted_offer_process is not None:
+            self._append_log("[control] Richiesta di stop anche per offerta Vinted in corso.\n")
+            self._terminate_process_tree(self.vinted_offer_process)
 
     def _terminate_process_tree(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:
@@ -3046,9 +3466,27 @@ class ScraperApp:
             return []
         db_path = self.vinted_db_path_var.get().strip() or str((self.script_path.parent / "data" / "scraper.db").resolve())
         try:
-            return annotate_rows_with_vinted_offer_history(rows, db_path=db_path)
+            return self._demote_vinted_rows_with_submitted_offers(
+                annotate_rows_with_vinted_offer_history(rows, db_path=db_path)
+            )
         except Exception:
-            return [dict(row) for row in rows]
+            return self._demote_vinted_rows_with_submitted_offers([dict(row) for row in rows])
+
+    def _demote_vinted_rows_with_submitted_offers(self, rows: list[dict]) -> list[dict]:
+        demoted_rows: list[dict] = []
+        for row in rows:
+            annotated = dict(row)
+            if bool(annotated.get("offer_already_submitted")):
+                if str(annotated.get("evaluation_label", "") or "").strip().lower() == "da valutare assolutamente":
+                    annotated["evaluation_label"] = "da valutare"
+                annotated["deal_hunter_match"] = False
+                label = str(annotated.get("deal_hunter_label", "") or "").strip()
+                if label:
+                    annotated["deal_hunter_label"] = f"{label} - offerta gia inviata"
+                else:
+                    annotated["deal_hunter_label"] = "offerta gia inviata"
+            demoted_rows.append(annotated)
+        return demoted_rows
 
     def _split_vinted_offer_submission_rows(self, rows: list[dict]) -> tuple[list[dict], list[dict]]:
         annotated_rows = self._annotate_vinted_rows_with_offer_history(rows)
@@ -3110,7 +3548,10 @@ class ScraperApp:
             items_file = self._write_vinted_offer_items_file(offer_items)
             cmd += ["--links-file", str(items_file)]
         keep_open_seconds = self.vinted_keep_open_seconds_var.get().strip() or "0"
-        if self.vinted_keep_browser_open_var.get():
+        concurrent_scrape_active = self.process is not None and self.process_kind == "scrape"
+        if concurrent_scrape_active:
+            cmd.append("--no-keep-browser-open")
+        elif self.vinted_keep_browser_open_var.get():
             if not keep_open_seconds.isdigit():
                 raise ValueError("I secondi per tenere aperto il browser Vinted devono essere un intero maggiore o uguale a zero.")
             if int(keep_open_seconds) == 0:
@@ -3175,9 +3616,17 @@ class ScraperApp:
         cmd += self._browser_command_args()
         return cmd
 
-    def _browser_command_args(self) -> list[str]:
-        action_delay = self._validated_delay_text(self.action_delay_seconds_var.get().strip() or "1.5", "Pausa azioni")
-        page_settle = self._validated_delay_text(self.page_settle_seconds_var.get().strip() or "3.0", "Attesa post-caricamento")
+    def _browser_command_args(
+        self,
+        *,
+        action_delay_override: str | None = None,
+        page_settle_override: str | None = None,
+        slow_mode_override: bool | None = None,
+    ) -> list[str]:
+        raw_action_delay = action_delay_override if action_delay_override is not None else self.action_delay_seconds_var.get().strip() or "1.5"
+        raw_page_settle = page_settle_override if page_settle_override is not None else self.page_settle_seconds_var.get().strip() or "3.0"
+        action_delay = self._validated_delay_text(raw_action_delay, "Pausa azioni")
+        page_settle = self._validated_delay_text(raw_page_settle, "Attesa post-caricamento")
         args = [
             "--browser-mode", self.browser_mode_var.get().strip(),
             "--browser-user-data-dir", self.browser_user_data_dir_var.get().strip(),
@@ -3185,7 +3634,8 @@ class ScraperApp:
             "--action-delay-seconds", action_delay,
             "--page-settle-seconds", page_settle,
         ]
-        if self.slow_mode_var.get():
+        use_slow_mode = self.slow_mode_var.get() if slow_mode_override is None else bool(slow_mode_override)
+        if use_slow_mode:
             args.append("--slow-mode")
         return args
 
@@ -3406,6 +3856,16 @@ class ScraperApp:
         self.log_queue.put(f"\nProcesso terminato con exit code {code}.\n")
         self.log_queue.put(f"__DONE__:{code}")
 
+    def _read_vinted_offer_process_output(self) -> None:
+        process = self.vinted_offer_process
+        if process is None or process.stdout is None:
+            return
+        for line in process.stdout:
+            self.log_queue.put(line)
+        code = process.wait()
+        self.log_queue.put(f"\nOfferta Vinted terminata con exit code {code}.\n")
+        self.log_queue.put(f"__VINTED_OFFER_DONE__:{code}")
+
     def _drain_logs(self) -> None:
         while True:
             try:
@@ -3455,15 +3915,37 @@ class ScraperApp:
                 self._set_stop_process_buttons_state("disabled")
                 self._update_result_actions()
                 if stop_requested:
+                    partial_results_loaded = False
+                    if should_load_results and self.ui_result_json_path.exists():
+                        self._load_results()
+                        partial_results_loaded = True
                     self._append_log("[control] Processo fermato manualmente.\n")
-                    self.vinted_status_var.set("Processo fermato manualmente.")
+                    self.vinted_status_var.set(
+                        "Processo fermato manualmente. Risultati parziali caricati."
+                        if partial_results_loaded
+                        else "Processo fermato manualmente."
+                    )
+                    if self.current_run_source == "vinted":
+                        if self.vinted_deal_hunter_session_active:
+                            suffix = " Risultati accumulati mantenuti." if partial_results_loaded else ""
+                            self.vinted_deal_hunter_status_var.set(f"Procacciatore affari fermato manualmente.{suffix}")
+                        elif partial_results_loaded:
+                            self.vinted_deal_hunter_status_var.set("Ultimi risultati parziali caricati.")
+                        else:
+                            self.vinted_deal_hunter_status_var.set("Procacciatore affari fermato manualmente.")
                     continue
                 if code == 0 and should_load_results:
                     self._load_results()
                 if completed_kind == "scrape" and self.auto_monitor_enabled:
                     self._schedule_next_auto_run(code=code)
+                elif completed_kind == "scrape" and self.vinted_deal_hunter_enabled and self.current_run_source == "vinted":
+                    self._schedule_next_vinted_deal_hunter_run(code=code)
                 elif completed_kind == "scrape" and self.current_run_source == "vinted" and code != 0:
                     self.vinted_status_var.set("Ricerca Vinted fallita. Controlla il log per il dettaglio.")
+                    if self.vinted_deal_hunter_enabled:
+                        self.vinted_deal_hunter_status_var.set(
+                            "Procacciatore attivo: ultimo ciclo fallito, verra riprovato dopo la pausa configurata."
+                        )
                 elif completed_kind == "contact":
                     if code == 0:
                         if self.ui_result_json_path.exists():
@@ -3478,6 +3960,21 @@ class ScraperApp:
                     else:
                         self.vinted_status_var.set("Offerta Vinted fallita. Controlla il log per il dettaglio.")
                         messagebox.showerror("Offerta Vinted fallita", "Il flusso offerta Vinted non e stato completato. Controlla il log.")
+                continue
+            if line.startswith("__VINTED_OFFER_DONE__:"):
+                code = int(line.split(":", 1)[1])
+                self.vinted_offer_process = None
+                self._update_result_actions()
+                if code == 0:
+                    self.vinted_status_var.set("Offerta Vinted completata. Il procacciatore continua se era attivo.")
+                    if self.current_result_source == "vinted":
+                        self.result_rows = self._annotate_vinted_rows_with_offer_history(self.result_rows)
+                        self._render_results_rows(self.result_rows)
+                        self._update_result_actions()
+                    messagebox.showinfo("Offerta Vinted completata", "Flusso offerta Vinted eseguito. Il procacciatore continua se era attivo.")
+                else:
+                    self.vinted_status_var.set("Offerta Vinted fallita. Il procacciatore continua se era attivo.")
+                    messagebox.showerror("Offerta Vinted fallita", "Il flusso offerta Vinted non e stato completato. Controlla il log.")
                 continue
             self._append_log(line)
         self._maybe_load_live_results()
@@ -3508,6 +4005,31 @@ class ScraperApp:
     def _selected_vinted_signal_filter(self) -> str:
         return str(self.vinted_signal_filter_var.get() or "tutti").strip().lower() or "tutti"
 
+    def _active_vinted_deal_hunter_thresholds(self, meta: dict | None = None) -> tuple[int, float]:
+        payload = meta or self.current_result_meta
+        min_favorites = normalize_vinted_deal_hunter_min_favorites(
+            payload.get("deal_hunter_min_favorites", self.vinted_deal_hunter_min_favorites_var.get()),
+            default=VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES,
+        )
+        max_age_hours = normalize_vinted_deal_hunter_max_age_hours(
+            payload.get("deal_hunter_max_age_hours", self.vinted_deal_hunter_max_age_hours_var.get()),
+            default=VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
+        )
+        return min_favorites, max_age_hours
+
+    def _annotate_vinted_rows_with_deal_hunter(self, rows: list[dict], meta: dict | None = None) -> list[dict]:
+        if not rows:
+            return []
+        min_favorites, max_age_hours = self._active_vinted_deal_hunter_thresholds(meta)
+        if not vinted_deal_hunter_enabled(min_favorites, max_age_hours):
+            min_favorites = VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES
+            max_age_hours = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS
+        return annotate_vinted_deal_hunter_rows(
+            rows,
+            min_favorites=min_favorites,
+            max_age_hours=max_age_hours,
+        )
+
     def _filter_vinted_rows(self, rows: list[dict]) -> list[dict]:
         selected_filter = self._selected_vinted_signal_filter()
         if selected_filter == "tutti":
@@ -3516,6 +4038,12 @@ class ScraperApp:
         for row in rows:
             tag = str(row.get("tag", "") or "").strip().lower()
             evaluation_label = str(row.get("evaluation_label", "") or "").strip().lower()
+            if selected_filter == "procacciatore affari":
+                if bool(row.get("deal_hunter_match")) or (
+                    self.vinted_deal_hunter_session_active and bool(row.get("deal_hunter_candidate"))
+                ):
+                    filtered_rows.append(row)
+                continue
             if selected_filter == "ricercato":
                 if tag == "ricercato":
                     filtered_rows.append(row)
@@ -3554,6 +4082,7 @@ class ScraperApp:
             messagebox.showerror("Database Vinted", str(exc))
             return
 
+        self._reset_vinted_deal_hunter_session()
         generated_at = datetime.now().isoformat(timespec="seconds")
         payload = {
             "source": "vinted",
@@ -3596,6 +4125,22 @@ class ScraperApp:
         self.current_result_meta = dict(payload.get("meta", {}) or {})
         if source == "vinted":
             rows = self._annotate_vinted_rows_with_offer_history(rows)
+            rows = self._annotate_vinted_rows_with_deal_hunter(rows, self.current_result_meta)
+            rows = self._demote_vinted_rows_with_submitted_offers(rows)
+            if bool(self.current_result_meta.get("loaded_from_db")):
+                self._reset_vinted_deal_hunter_session()
+            elif self.vinted_deal_hunter_session_active:
+                rows = self._merge_vinted_deal_hunter_session_rows(self.vinted_deal_hunter_session_rows, rows)
+                rows = self._annotate_vinted_rows_with_deal_hunter(rows, self.current_result_meta)
+                rows = self._demote_vinted_rows_with_submitted_offers(rows)
+                self.vinted_deal_hunter_session_rows = [dict(row) for row in rows]
+                self.current_result_meta["deal_hunter_enabled"] = True
+                self.current_result_meta["deal_hunter_candidates"] = sum(
+                    1 for row in rows if bool(row.get("deal_hunter_candidate"))
+                )
+                self.current_result_meta["deal_hunter_matches"] = sum(
+                    1 for row in rows if bool(row.get("deal_hunter_match"))
+                )
         if source == "vinted":
             self._sync_vinted_access_from_meta(self.current_result_meta)
             self._refresh_vinted_saved_runs(
@@ -3624,7 +4169,11 @@ class ScraperApp:
         if source == "google_maps" and current_sort not in lead_sort_modes:
             current_sort = "Score opportunita"
         elif source == "vinted" and current_sort not in vinted_sort_modes:
-            current_sort = "Prezzo Vinted"
+            current_sort = (
+                "Preferiti Vinted"
+                if bool(self.current_result_meta.get("deal_hunter_enabled", False))
+                else "Prezzo Vinted"
+            )
         elif source not in {"google_maps", "vinted"} and current_sort in lead_sort_modes | vinted_sort_modes:
             current_sort = "Priorita consigliata"
         self._updating_result_sort_var = True
@@ -3669,38 +4218,87 @@ class ScraperApp:
             return
         if source == "vinted":
             active_filter = self._selected_vinted_signal_filter()
+            deal_hunter_candidates = int(meta.get("deal_hunter_candidates", 0) or 0)
+            deal_hunter_matches = int(meta.get("deal_hunter_matches", 0) or 0)
+            if deal_hunter_candidates <= 0:
+                deal_hunter_candidates = sum(1 for row in rows if bool(row.get("deal_hunter_candidate")))
+            if deal_hunter_matches <= 0:
+                deal_hunter_matches = sum(1 for row in rows if bool(row.get("deal_hunter_match")))
+            deal_hunter_enabled_for_result = bool(
+                meta.get("deal_hunter_enabled", False)
+                or deal_hunter_candidates > 0
+                or deal_hunter_matches > 0
+            )
+            deal_hunter_min_favorites, deal_hunter_max_age_hours = self._active_vinted_deal_hunter_thresholds(meta)
             self.result_total_var.set(f"{len(rows)} prodotti")
             if meta.get("loaded_from_db"):
-                self.result_counts_var.set(
-                    f"articoli DB {meta.get('db_total_items', 0)} | "
-                    f"tag DB {meta.get('db_total_search_hits', 0)} | "
-                    f"mostrati {len(rows)}"
-                )
+                counts_parts = [
+                    f"articoli DB {meta.get('db_total_items', 0)}",
+                    f"tag DB {meta.get('db_total_search_hits', 0)}",
+                    f"mostrati {len(rows)}",
+                ]
+                if deal_hunter_enabled_for_result:
+                    counts_parts.extend(
+                        [
+                            f"candidati {deal_hunter_candidates}",
+                            f"affari {deal_hunter_matches}",
+                        ]
+                    )
+                self.result_counts_var.set(" | ".join(counts_parts))
                 if meta.get("db_created") and not rows:
                     self.vinted_status_var.set("Database creato correttamente. Non contiene ancora prodotti: avvia la prima ricerca.")
                 else:
-                    self.vinted_status_var.set(
-                        f"Database caricato: {len(rows)} righe mostrate su {meta.get('db_filtered_search_hits', len(rows))} con filtro {active_filter}."
-                    )
+                    if deal_hunter_enabled_for_result:
+                        self.vinted_status_var.set(
+                            f"Archivio Vinted caricato: {len(rows)} affari mostrati con filtro {active_filter} "
+                            f"(soglia {deal_hunter_min_favorites}+ like, {deal_hunter_max_age_hours:g}h)."
+                        )
+                    else:
+                        self.vinted_status_var.set(
+                            f"Database caricato: {len(rows)} righe mostrate su {meta.get('db_filtered_search_hits', len(rows))} con filtro {active_filter}."
+                        )
             else:
-                self.result_counts_var.set(
-                    f"nuovi articoli {meta.get('new_items', 0)} | "
-                    f"aggiornati {meta.get('updated_items', 0)} | "
-                    f"nuovi tag {meta.get('new_search_hits', 0)} | "
-                    f"gia analizzati {meta.get('filtered_out_known_items', 0)}"
-                )
-                self.vinted_status_var.set(
-                    f"Ricerca completata: {len(rows)} prodotti visibili con filtro {active_filter}, "
-                    f"{meta.get('new_items', 0)} nuovi nel database, {meta.get('filtered_out_known_items', 0)} gia analizzati saltati."
-                )
+                counts_parts = [
+                    f"nuovi articoli {meta.get('new_items', 0)}",
+                    f"aggiornati {meta.get('updated_items', 0)}",
+                    f"nuovi tag {meta.get('new_search_hits', 0)}",
+                    f"gia analizzati {meta.get('filtered_out_known_items', 0)}",
+                ]
+                cached_details = int(meta.get("priority_rows_cached", 0) or meta.get("cached_detail_count", 0) or 0)
+                if cached_details:
+                    counts_parts.append(f"cache dettagli {cached_details}")
+                if deal_hunter_enabled_for_result:
+                    counts_parts.extend(
+                        [
+                            f"candidati {deal_hunter_candidates}",
+                            f"affari {deal_hunter_matches}",
+                        ]
+                    )
+                self.result_counts_var.set(" | ".join(counts_parts))
+                if deal_hunter_enabled_for_result:
+                    self.vinted_status_var.set(
+                        f"Procacciatore completato: {deal_hunter_matches} affari trovati su {deal_hunter_candidates} candidati 70+ "
+                        f"con filtro {active_filter}."
+                    )
+                    self.vinted_deal_hunter_status_var.set(
+                        f"Procacciatore attivo: ultimo ciclo ha trovato {deal_hunter_matches} affari confermati."
+                    )
+                else:
+                    self.vinted_status_var.set(
+                        f"Ricerca completata: {len(rows)} prodotti visibili con filtro {active_filter}, "
+                        f"{meta.get('new_items', 0)} nuovi nel database, {meta.get('filtered_out_known_items', 0)} gia analizzati saltati."
+                    )
             self.result_meta_var.set(
                 " | ".join(
                     (
                         "Sorgente: Vinted",
+                        f"Procacciatore: {'si' if deal_hunter_enabled_for_result else 'no'}",
                         f"Archivio: {meta.get('db_search_run_label', '') or meta.get('search_run_label', '-')}",
                         f"Note archivio: {meta.get('db_search_run_notes', '') or '-'}",
                         f"Ricerca: {meta.get('db_search_filter', '') or meta.get('search_term', 'tutte')}",
                         f"Conteggio ricerche: {meta.get('search_count', 1)}",
+                        f"Like min: {deal_hunter_min_favorites}",
+                        f"Eta max: {deal_hunter_max_age_hours:g}h",
                         f"Prezzo max: {meta.get('max_price', '-')}",
                         f"Tag: {meta.get('db_tag_filter', '') or meta.get('tag', '') or 'tutti'}",
                         f"Ricerche salvate: {meta.get('db_total_search_runs', '-')}",
@@ -4171,6 +4769,8 @@ class ScraperApp:
             total_value = str(row.get("total_price", "") or "").strip()
             shipping_value = str(row.get("shipping_price", "") or "").strip()
             shipping_alert = str(row.get("shipping_alert", "") or "").strip()
+            deal_hunter_label = str(row.get("deal_hunter_label", "") or "").strip()
+            deal_hunter_reason = str(row.get("deal_hunter_reason", "") or "").strip()
             offer_text = str(row.get("offer_text", "") or "").strip()
             item_id = str(row.get("item_id", "") or "").strip()
             published_at = str(row.get("published_at", "") or "").strip()
@@ -4192,6 +4792,10 @@ class ScraperApp:
                 detail_text_parts.append(f"Spedizione: {shipping_value}")
             if shipping_alert:
                 detail_text_parts.append(f"Alert: {shipping_alert}")
+            if deal_hunter_label:
+                detail_text_parts.append(f"Procacciatore: {deal_hunter_label}")
+            if deal_hunter_reason:
+                detail_text_parts.append(f"Motivo procacciatore: {deal_hunter_reason}")
             if offer_text:
                 detail_text_parts.append(f"Pulsante offerta: {offer_text}")
             else:
