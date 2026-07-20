@@ -119,6 +119,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Skip Vinted listings already archived/analyzed in the SQLite database.",
     )
+    vinted_parser.add_argument(
+        "--discord-deal-notifications",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Send each newly confirmed Vinted deal-hunter match to a Discord webhook.",
+    )
+    vinted_parser.add_argument(
+        "--discord-webhook-url",
+        default="",
+        help="Discord webhook URL used for Vinted deal notifications.",
+    )
     vinted_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
     vinted_parser.add_argument(
         "--keep-browser-open",

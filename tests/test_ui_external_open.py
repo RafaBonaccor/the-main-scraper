@@ -95,6 +95,35 @@ class UiExternalOpenTests(unittest.TestCase):
         self.assertFalse(rows[0]["deal_hunter_match"])
         self.assertEqual("affare 24h/70+ - offerta gia inviata", rows[0]["deal_hunter_label"])
 
+    def test_submitted_offer_rows_are_sorted_after_other_vinted_rows(self) -> None:
+        app = object.__new__(ScraperApp)
+        app.result_sort_var = type("SortVar", (), {"get": lambda self: "Valutazione Vinted"})()
+        app.result_sort_reverse = False
+
+        rows = [
+            {
+                "source": "vinted",
+                "name": "Ricercato",
+                "evaluation_label": "da valutare assolutamente",
+                "favorite_count": 40,
+                "tag": "ricercato",
+                "offer_already_submitted": False,
+            },
+            {
+                "source": "vinted",
+                "name": "Offerto",
+                "evaluation_label": "da valutare",
+                "favorite_count": 99,
+                "tag": "",
+                "offer_already_submitted": True,
+            },
+        ]
+
+        ordered = ScraperApp._sorted_result_rows(app, rows)
+
+        self.assertEqual("Ricercato", ordered[0]["name"])
+        self.assertEqual("Offerto", ordered[1]["name"])
+
 
 if __name__ == "__main__":
     unittest.main()

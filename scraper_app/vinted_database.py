@@ -162,6 +162,102 @@ def load_vinted_submitted_offer_keys(db_path: str | Path = DEFAULT_VINTED_DB_PAT
     return keys
 
 
+def load_vinted_notified_deal_keys(
+    db_path: str | Path = DEFAULT_VINTED_DB_PATH,
+    webhook_target: str = "",
+) -> set[str]:
+    path = Path(db_path).expanduser().resolve()
+    ensure_vinted_database(path)
+    normalized_target = str(webhook_target or "").strip()
+    try:
+        with closing(sqlite3.connect(path)) as connection:
+            if normalized_target:
+                records = connection.execute(
+                    "SELECT item_id, item_link FROM vinted_deal_notifications WHERE webhook_target = ?",
+                    (normalized_target,),
+                ).fetchall()
+            else:
+                records = connection.execute(
+                    "SELECT item_id, item_link FROM vinted_deal_notifications"
+                ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError(f"Database Vinted non valido: {exc}") from exc
+
+    keys: set[str] = set()
+    for item_id, link in records:
+        keys.update(build_vinted_item_identity_keys(item_id=item_id, link=link))
+    return keys
+
+
+def save_vinted_deal_notifications(
+    rows: list[dict],
+    db_path: str | Path = DEFAULT_VINTED_DB_PATH,
+    webhook_target: str = "",
+) -> dict[str, int | str]:
+    path = Path(db_path).expanduser().resolve()
+    ensure_vinted_database(path)
+    normalized_target = str(webhook_target or "").strip()
+    valid_rows = [
+        row
+        for row in rows
+        if isinstance(row, dict) and str(row.get("link", "") or "").strip()
+    ]
+    if not valid_rows:
+        return {
+            "db_path": str(path),
+            "deal_notifications_saved_count": 0,
+            "new_deal_notifications": 0,
+            "updated_deal_notifications": 0,
+        }
+
+    new_entries = 0
+    updated_entries = 0
+    with closing(sqlite3.connect(path)) as connection:
+        _create_schema(connection)
+        for row in valid_rows:
+            link = str(row.get("link", "") or "").strip()
+            item_id = str(row.get("item_id", "") or "").strip() or extract_vinted_item_id_from_link(link)
+            already_exists = connection.execute(
+                "SELECT 1 FROM vinted_deal_notifications WHERE item_link = ? AND webhook_target = ?",
+                (link, normalized_target),
+            ).fetchone() is not None
+            sent_at = str(row.get("notification_sent_at", "") or "").strip() or datetime.now().isoformat(timespec="seconds")
+            connection.execute(
+                """
+                INSERT INTO vinted_deal_notifications (
+                    item_link, webhook_target, item_id, item_name, search_term, sent_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(item_link, webhook_target) DO UPDATE SET
+                    item_id = excluded.item_id,
+                    item_name = excluded.item_name,
+                    search_term = excluded.search_term,
+                    sent_at = excluded.sent_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    link,
+                    normalized_target,
+                    item_id,
+                    str(row.get("name", "") or ""),
+                    str(row.get("search_term", "") or ""),
+                    sent_at,
+                    json.dumps(row, ensure_ascii=False),
+                ),
+            )
+            if already_exists:
+                updated_entries += 1
+            else:
+                new_entries += 1
+        connection.commit()
+
+    return {
+        "db_path": str(path),
+        "deal_notifications_saved_count": len(valid_rows),
+        "new_deal_notifications": new_entries,
+        "updated_deal_notifications": updated_entries,
+    }
+
+
 def annotate_rows_with_vinted_offer_history(
     rows: list[dict],
     db_path: str | Path = DEFAULT_VINTED_DB_PATH,
@@ -955,6 +1051,23 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_vinted_offer_history_item_id
         ON vinted_offer_history(item_id);
+
+        CREATE TABLE IF NOT EXISTS vinted_deal_notifications (
+            item_link TEXT NOT NULL,
+            webhook_target TEXT NOT NULL DEFAULT '',
+            item_id TEXT NOT NULL DEFAULT '',
+            item_name TEXT NOT NULL DEFAULT '',
+            search_term TEXT NOT NULL DEFAULT '',
+            sent_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(item_link, webhook_target)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vinted_deal_notifications_sent_at
+        ON vinted_deal_notifications(sent_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_vinted_deal_notifications_item_id
+        ON vinted_deal_notifications(item_id);
         """
     )
     _ensure_vinted_search_hits_tag_column(connection)

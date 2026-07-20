@@ -13,6 +13,7 @@ from botasaurus.browser import Driver, Wait, browser
 
 from ..browser_helpers import DEFAULT_COOKIE_REJECT_TEXTS, click_first_matching_text, current_page_url
 from ..chrome_reuse import preferred_host_fragment_for_url, try_reuse_running_chrome
+from ..discord_notifications import build_vinted_deal_discord_message, send_discord_webhook_message
 from ..browser_runtime import (
     PROFILE_SKIP_DIR_NAMES,
     PROFILE_SKIP_FILE_NAMES,
@@ -29,6 +30,8 @@ from ..vinted_database import (
     build_vinted_item_identity_keys,
     load_vinted_completed_detail_rows,
     load_vinted_known_item_keys,
+    load_vinted_notified_deal_keys,
+    save_vinted_deal_notifications,
     save_vinted_rows,
 )
 from ..vinted_access import emit_vinted_access_signal, read_vinted_access_status, wait_for_vinted_access_status
@@ -55,6 +58,7 @@ FAVORITE_COUNT_REVIEW_THRESHOLD = 15
 VINTED_HIGH_SHIPPING_THRESHOLD = 2.99
 VINTED_PAGE_NOT_FOUND_PATTERN = re.compile(r"\b(page not found|pagina non trovata)\b", re.IGNORECASE)
 VINTED_NAVIGATION_TIMEOUT_SECONDS = 15
+VINTED_NAVIGATION_WAIT = Wait.SHORT
 
 
 def run_vinted_scraper(
@@ -76,6 +80,8 @@ def run_vinted_scraper(
     action_delay_seconds: float = 1.5,
     page_settle_seconds: float = 3.0,
     detach_browser_on_complete: bool = True,
+    discord_deal_notifications: bool = False,
+    discord_webhook_url: str = "",
 ) -> ScrapeOutcome:
     search_url = build_vinted_search_url(search)
     search_term = extract_vinted_search_term(search_url) or str(search or "").strip()
@@ -114,6 +120,8 @@ def run_vinted_scraper(
         "slow_mode": bool(slow_mode),
         "action_delay_seconds": action_delay,
         "page_settle_seconds": page_settle,
+        "discord_deal_notifications": bool(discord_deal_notifications),
+        "discord_webhook_url": str(discord_webhook_url or "").strip(),
     }
     payload = _scrape_vinted_task(config, reuse_driver=bool(keep_browser_open))
     if not payload["meta"].get("db_saved_live"):
@@ -176,7 +184,7 @@ def run_vinted_description_extractor(
 )
 def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
     search_url = config["search_url"]
-    driver.get(search_url, wait=Wait.LONG, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+    driver.get(search_url, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
     _wait_for_vinted_catalog_page_ready(
         driver,
         max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
@@ -299,6 +307,7 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
             row,
             min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
             max_age_hours=float(config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0),
+            max_price=max_price,
         )
         for row in rows
     ]
@@ -320,6 +329,7 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         rows = [row for row in rows if bool(row.get("deal_hunter_match"))]
     rows = [row for row in rows if _vinted_row_matches_max_price(row, max_price)]
     rows = _prioritize_vinted_rows(rows)
+    notification_meta = _notify_new_vinted_deals(rows, config)
     keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
     keep_browser_open = bool(config.get("keep_browser_open", False))
     meta = {
@@ -356,6 +366,7 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         "priority_rows_enriched": enrichment_meta["enriched_count"],
         "priority_rows_demoted_by_age": enrichment_meta["demoted_count"],
         "priority_rows_cached": enrichment_meta.get("cached_count", 0),
+        **notification_meta,
     }
     _persist_vinted_live_results(
         rows=rows,
@@ -367,6 +378,85 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
     return {
         "rows": rows,
         "meta": meta,
+    }
+
+
+def _notify_new_vinted_deals(rows: list[dict], config: dict) -> dict[str, int | bool | str]:
+    if not bool(config.get("discord_deal_notifications", False)):
+        return {
+            "discord_deal_notifications": False,
+            "discord_deal_notifications_sent": 0,
+            "discord_deal_notifications_skipped": 0,
+            "discord_deal_notifications_failed": 0,
+            "discord_deal_notifications_last_error": "",
+        }
+    webhook_url = str(config.get("discord_webhook_url", "") or "").strip()
+    if not webhook_url:
+        return {
+            "discord_deal_notifications": False,
+            "discord_deal_notifications_sent": 0,
+            "discord_deal_notifications_skipped": 0,
+            "discord_deal_notifications_failed": 0,
+            "discord_deal_notifications_last_error": "webhook assente",
+        }
+
+    candidate_rows = [
+        row
+        for row in rows
+        if bool(row.get("deal_hunter_match")) and str(row.get("link", "") or "").strip()
+    ]
+    if not candidate_rows:
+        return {
+            "discord_deal_notifications": True,
+            "discord_deal_notifications_sent": 0,
+            "discord_deal_notifications_skipped": 0,
+            "discord_deal_notifications_failed": 0,
+            "discord_deal_notifications_last_error": "",
+        }
+
+    notified_keys = load_vinted_notified_deal_keys(
+        str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH),
+        webhook_target=webhook_url,
+    )
+    pending_rows: list[dict] = []
+    skipped = 0
+    for row in candidate_rows:
+        identity_keys = build_vinted_item_identity_keys(item_id=row.get("item_id", ""), link=row.get("link", ""))
+        if any(key in notified_keys for key in identity_keys):
+            skipped += 1
+            continue
+        pending_rows.append(row)
+
+    sent_rows: list[dict] = []
+    failed = 0
+    last_error = ""
+    for row in pending_rows:
+        result = send_discord_webhook_message(
+            webhook_url,
+            build_vinted_deal_discord_message(row),
+        )
+        if bool(result.get("ok")):
+            annotated = dict(row)
+            annotated["notification_sent_at"] = str(result.get("sent_at", "") or "")
+            sent_rows.append(annotated)
+            continue
+        failed += 1
+        last_error = str(result.get("error", "") or "")
+        print(f"[discord-notify] invio fallito per {row.get('link', '')}: {last_error}", flush=True)
+
+    if sent_rows:
+        save_vinted_deal_notifications(
+            sent_rows,
+            db_path=str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH),
+            webhook_target=webhook_url,
+        )
+
+    return {
+        "discord_deal_notifications": True,
+        "discord_deal_notifications_sent": len(sent_rows),
+        "discord_deal_notifications_skipped": skipped,
+        "discord_deal_notifications_failed": failed,
+        "discord_deal_notifications_last_error": last_error,
     }
 
 
@@ -417,7 +507,7 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
             )
             cached_detail_count += 1
             continue
-        driver.get(current_link, wait=Wait.LONG, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+        driver.get(current_link, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
         _wait_for_vinted_detail_page_ready(
             driver,
             max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
@@ -522,6 +612,57 @@ return document.body ? (document.body.innerText || document.body.textContent || 
         """
     )
     return str(payload or "").strip()
+
+
+def _read_vinted_detail_payload(driver: Driver) -> dict[str, object]:
+    payload = driver.run_js(
+        """
+const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+const bodyText = clean(document.body ? (document.body.innerText || document.body.textContent || '') : '');
+const title = document.querySelector('h1');
+const price = document.querySelector('[data-testid*="price-text"], [data-testid*="item-price"], span[aria-label*="€"]');
+const offer = [...document.querySelectorAll('button, a, span, div')].find((node) => {
+  const text = clean(node.innerText || node.textContent || '');
+  return text && text.length <= 40 && /offerta/i.test(text) && /fare|fai|invia/i.test(text);
+});
+let shippingText = '';
+for (const node of document.querySelectorAll('[data-testid], button, span, div, p, li')) {
+  const text = clean(node.innerText || node.textContent || '');
+  if (!text) continue;
+  if (/spedizione|consegna/i.test(text) && /\\d/.test(text)) {
+    shippingText = text;
+    break;
+  }
+}
+let publishedText = '';
+for (const node of document.querySelectorAll('span, div, p, li')) {
+  const text = clean(node.innerText || node.textContent || '');
+  if (!text) continue;
+  if (/^(\\d+\\s+\\w+\\s+fa)$/i.test(text)) {
+    publishedText = text;
+    break;
+  }
+  if (/^Caricato\\s+/i.test(text)) {
+    publishedText = clean(text.replace(/^Caricato\\s+/i, ''));
+    break;
+  }
+}
+return {
+  readyState: document.readyState || '',
+  bodyText,
+  bodyLength: bodyText.length,
+  pageNotFound: /page not found|pagina non trovata/i.test(bodyText),
+  title: clean(title ? (title.innerText || title.textContent || '') : ''),
+  rawPriceText: clean(price ? (price.innerText || price.textContent || '') : ''),
+  shippingText,
+  offerText: clean(offer ? (offer.innerText || offer.textContent || '') : ''),
+  publishedText,
+};
+        """
+    )
+    if not isinstance(payload, dict):
+        return {}
+    return payload
 
 
 def _read_vinted_title(driver: Driver) -> str:
@@ -720,7 +861,7 @@ def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict)
                 live_stage="detail_cached",
             )
             continue
-        driver.get(current_link, wait=Wait.LONG, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+        driver.get(current_link, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
         _wait_for_vinted_detail_page_ready(
             driver,
             max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
@@ -849,6 +990,7 @@ def _merge_cached_vinted_detail_row(
         merged,
         min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
         max_age_hours=float(config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0),
+        max_price=config.get("max_price"),
     )
 
 
@@ -864,7 +1006,8 @@ def _build_vinted_detail_row(
     deal_hunter_max_age_hours: float = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
 ) -> dict:
     existing_row = dict(base_row or {})
-    page_text = _read_vinted_detail_text(driver)
+    detail_payload = _read_vinted_detail_payload(driver)
+    page_text = normalize_whitespace(str(detail_payload.get("bodyText", "") or "")) or _read_vinted_detail_text(driver)
     if _is_vinted_page_not_found_text(page_text):
         return _build_vinted_missing_detail_row(
             current_link=current_link,
@@ -876,7 +1019,9 @@ def _build_vinted_detail_row(
             page_text=page_text,
             detail_error="page_not_found",
         )
-    title = _read_vinted_title(driver)
+    title = normalize_whitespace(str(detail_payload.get("title", "") or ""))
+    if not title:
+        title = _read_vinted_title(driver)
     if not title:
         title = item_name
     if not title:
@@ -895,8 +1040,8 @@ def _build_vinted_detail_row(
             detail_error="page_not_found",
         )
     description = _extract_vinted_description_from_body_text(page_text)
-    published_at = _read_vinted_published_text(driver, page_text)
-    raw_price_text = _read_vinted_price(driver)
+    published_at = normalize_whitespace(str(detail_payload.get("publishedText", "") or "")) or _read_vinted_published_text(driver, page_text)
+    raw_price_text = normalize_whitespace(str(detail_payload.get("rawPriceText", "") or "")) or _read_vinted_price(driver)
     total_price_text = _extract_vinted_primary_price(page_text, title)
     base_price_text = (
         _extract_vinted_base_price(page_text, title)
@@ -905,10 +1050,10 @@ def _build_vinted_detail_row(
         or _find_price(page_text)
         or total_price_text
     )
-    shipping_price = _read_vinted_shipping_price(driver, page_text)
+    shipping_price = _extract_vinted_shipping_price_text(str(detail_payload.get("shippingText", "") or "")) or _read_vinted_shipping_price(driver, page_text)
     shipping_price_value = parse_vinted_price(shipping_price)
     shipping_alert = _vinted_shipping_alert_text(shipping_price_value)
-    offer_text = _read_vinted_offer_text(driver)
+    offer_text = normalize_whitespace(str(detail_payload.get("offerText", "") or "")) or _read_vinted_offer_text(driver)
     if total_price_text:
         total_price = normalize_whitespace(total_price_text)
         total_price_value = parse_vinted_price(total_price_text)
@@ -957,6 +1102,7 @@ def _build_vinted_detail_row(
         row,
         min_favorites=deal_hunter_min_favorites,
         max_age_hours=deal_hunter_max_age_hours,
+        max_price=base_row.get("max_price") if isinstance(base_row, dict) else None,
     )
 
 
@@ -1147,34 +1293,14 @@ return document.querySelectorAll('a[href*="/items/"]').length;
 
 
 def _is_vinted_detail_page_ready(driver: Driver) -> bool:
-    payload = driver.run_js(
-        """
-const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
-const title = document.querySelector('h1');
-const price = document.querySelector('[data-testid*="price-text"], [data-testid*="item-price"], span[aria-label*="€"]');
-const offer = [...document.querySelectorAll('button, a, span, div')].find((node) => {
-  const text = clean(node.innerText || node.textContent || '');
-  return text && text.length <= 40 && /offerta/i.test(text) && /fare|fai|invia/i.test(text);
-});
-const bodyText = clean(document.body ? (document.body.innerText || document.body.textContent || '') : '');
-const readyState = document.readyState || '';
-return {
-  readyState,
-  hasTitle: !!(title && clean(title.innerText || title.textContent || '')),
-  hasPrice: !!(price && clean(price.innerText || price.textContent || '')),
-  hasOffer: !!offer,
-  bodyLength: bodyText.length,
-  pageNotFound: /page not found|pagina non trovata/i.test(bodyText),
-};
-        """
-    )
+    payload = _read_vinted_detail_payload(driver)
     if not isinstance(payload, dict):
         return False
     if bool(payload.get("pageNotFound", False)):
         return True
-    has_title = bool(payload.get("hasTitle"))
-    has_price = bool(payload.get("hasPrice"))
-    has_offer = bool(payload.get("hasOffer"))
+    has_title = bool(str(payload.get("title", "") or "").strip())
+    has_price = bool(str(payload.get("rawPriceText", "") or "").strip())
+    has_offer = bool(str(payload.get("offerText", "") or "").strip())
     body_length = int(payload.get("bodyLength", 0) or 0)
     ready_state = str(payload.get("readyState", "") or "").strip().lower()
     if has_title and has_price:
@@ -1231,7 +1357,7 @@ def _wait_for_vinted_login_if_needed(
         if consume_vinted_login_confirmed_request():
             target_url = str(revisit_url or access_status.get("current_url", "") or "").strip()
             if target_url:
-                driver.get(target_url, wait=Wait.LONG, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+                driver.get(target_url, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
                 if "/items/" in target_url:
                     _wait_for_vinted_detail_page_ready(
                         driver,
@@ -1397,6 +1523,7 @@ def _persist_vinted_progress_results(
             dict(row),
             min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
             max_age_hours=float(config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0),
+            max_price=max_price,
         )
         for row in rows
     )
@@ -1514,6 +1641,7 @@ def _card_payload_to_row(
         row,
         min_favorites=deal_hunter_min_favorites,
         max_age_hours=deal_hunter_max_age_hours,
+        max_price=None,
     )
 
 
@@ -1681,7 +1809,7 @@ def _open_vinted_next_page(driver: Driver, next_page_number: int, page_settle_se
     if clicked and _wait_for_vinted_catalog_page(driver, next_page_number, navigation_wait_seconds):
         return str(current_page_url(driver) or next_page_url)
 
-    driver.get(next_page_url, wait=Wait.LONG, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+    driver.get(next_page_url, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
     _wait_for_vinted_catalog_page(driver, next_page_number, navigation_wait_seconds)
     return str(current_page_url(driver) or next_page_url)
 

@@ -50,11 +50,13 @@ from .vinted_deals import (
     VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL,
     VINTED_DEAL_HUNTER_DEFAULT_LOOP_SECONDS,
     VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
+    VINTED_DEAL_HUNTER_MAX_SHIPPING_PRICE,
     VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH,
     VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES,
     VINTED_DEAL_HUNTER_DEFAULT_TERMS,
     annotate_vinted_deal_hunter_rows,
     normalize_vinted_deal_hunter_max_age_hours,
+    normalize_vinted_deal_hunter_max_price,
     normalize_vinted_deal_hunter_min_favorites,
     normalize_vinted_deal_hunter_terms,
     vinted_deal_hunter_enabled,
@@ -400,9 +402,12 @@ class ScraperApp:
         self.vinted_deal_hunter_terms_var = tk.StringVar(value=", ".join(VINTED_DEAL_HUNTER_DEFAULT_TERMS))
         self.vinted_deal_hunter_category_var = tk.StringVar(value=VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL)
         self.vinted_deal_hunter_max_results_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH))
+        self.vinted_deal_hunter_max_price_var = tk.StringVar(value="")
         self.vinted_deal_hunter_min_favorites_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES))
         self.vinted_deal_hunter_max_age_hours_var = tk.StringVar(value=str(int(VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS)))
         self.vinted_deal_hunter_cycle_seconds_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_LOOP_SECONDS))
+        self.vinted_discord_notifications_var = tk.BooleanVar(value=False)
+        self.vinted_discord_webhook_url_var = tk.StringVar(value="")
         self.vinted_db_path_var = tk.StringVar(value=str((script_path.parent / "data" / "scraper.db").resolve()))
         self.vinted_db_filter_var = tk.StringVar()
         self.vinted_db_limit_var = tk.StringVar(value="500")
@@ -871,7 +876,12 @@ class ScraperApp:
         )
         ttk.Label(
             deal_hunter_frame,
-            text="Loop Vinted che ruota i termini, controlla i candidati con almeno N like e tiene solo gli annunci entro le ultime ore impostate.",
+            text=(
+                "Loop Vinted che ruota i termini, controlla i candidati con almeno N like "
+                "e tiene come affari solo gli annunci entro le ultime ore impostate, "
+                f"con spedizione <= {VINTED_DEAL_HUNTER_MAX_SHIPPING_PRICE:.2f} € "
+                "e sotto il prezzo massimo del procacciatore."
+            ),
             style="Hint.TLabel",
             wraplength=760,
             justify="left",
@@ -909,24 +919,48 @@ class ScraperApp:
             padx=(8, 8),
             pady=(0, 8),
         )
-        ttk.Label(deal_hunter_frame, text="Eta max (ore)").grid(row=3, column=4, sticky="w")
-        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_max_age_hours_var, width=8).grid(
+        ttk.Label(deal_hunter_frame, text="Prezzo max (€)").grid(row=3, column=4, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_max_price_var, width=8).grid(
             row=3,
             column=5,
             sticky="w",
             padx=(8, 8),
             pady=(0, 8),
         )
-        ttk.Label(deal_hunter_frame, text="Pausa loop (s)").grid(row=3, column=6, sticky="w")
-        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_cycle_seconds_var, width=8).grid(
+        ttk.Label(deal_hunter_frame, text="Eta max (ore)").grid(row=3, column=6, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_max_age_hours_var, width=8).grid(
             row=3,
             column=7,
+            sticky="w",
+            padx=(8, 8),
+            pady=(0, 8),
+        )
+        ttk.Label(deal_hunter_frame, text="Pausa loop (s)").grid(row=3, column=8, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_cycle_seconds_var, width=8).grid(
+            row=3,
+            column=9,
             sticky="w",
             padx=(8, 0),
             pady=(0, 8),
         )
+        discord_frame = ttk.Frame(deal_hunter_frame, style="Panel.TFrame")
+        discord_frame.grid(row=4, column=0, columnspan=10, sticky="ew", pady=(0, 8))
+        ttk.Checkbutton(
+            discord_frame,
+            text="Invia ogni nuovo affare su Discord",
+            variable=self.vinted_discord_notifications_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(discord_frame, text="Webhook URL").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(discord_frame, textvariable=self.vinted_discord_webhook_url_var, width=88).grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(10, 0),
+            pady=(6, 0),
+        )
+        discord_frame.columnconfigure(1, weight=1)
         deal_hunter_actions = ttk.Frame(deal_hunter_frame, style="Panel.TFrame")
-        deal_hunter_actions.grid(row=4, column=0, columnspan=8, sticky="ew", pady=(2, 0))
+        deal_hunter_actions.grid(row=5, column=0, columnspan=10, sticky="ew", pady=(2, 0))
         ttk.Button(
             deal_hunter_actions,
             text="Carica preset nella tabella",
@@ -1445,6 +1479,7 @@ class ScraperApp:
         self.results_tree.tag_configure("vinted_review", background="#fef3c7")
         self.results_tree.tag_configure("vinted_badge", background="#ecfccb")
         self.results_tree.tag_configure("vinted_shipping_alert", background="#ffedd5")
+        self.results_tree.tag_configure("vinted_offered", background="#e0e7ff")
         y_scroll = ttk.Scrollbar(card, orient="vertical", command=self.results_tree.yview)
         x_scroll = ttk.Scrollbar(card, orient="horizontal", command=self.results_tree.xview)
         self.results_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
@@ -2263,7 +2298,7 @@ class ScraperApp:
             raw_max_results = str(VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH)
         if not raw_max_results.isdigit():
             raise ValueError("Max articoli / ricerca del procacciatore affari deve essere un intero maggiore o uguale a zero.")
-        max_price_raw = self.vinted_max_price_var.get().strip()
+        max_price_raw = self.vinted_deal_hunter_max_price_var.get().strip()
         max_price = self._parse_vinted_max_price_value(max_price_raw)
         specs = build_vinted_deal_hunter_search_specs(
             raw_terms=self.vinted_deal_hunter_terms_var.get(),
@@ -2274,6 +2309,16 @@ class ScraperApp:
         if not specs:
             raise ValueError("Inserisci almeno un termine valido per il procacciatore affari.")
         return specs
+
+    def _validated_vinted_discord_webhook_url(self) -> str:
+        webhook_url = str(self.vinted_discord_webhook_url_var.get() or "").strip()
+        if not self.vinted_discord_notifications_var.get():
+            return webhook_url
+        if not webhook_url:
+            raise ValueError("Inserisci il webhook Discord del procacciatore oppure disattiva le notifiche.")
+        if not webhook_url.startswith(("https://discord.com/api/webhooks/", "https://ptb.discord.com/api/webhooks/")):
+            raise ValueError("Webhook Discord non valido.")
+        return webhook_url
 
     def _load_vinted_deal_hunter_specs_into_table(self) -> None:
         try:
@@ -2297,6 +2342,7 @@ class ScraperApp:
         searches_file = self._write_vinted_searches_file(specs)
         min_favorites = self._parse_vinted_deal_hunter_min_favorites()
         max_age_hours = self._parse_vinted_deal_hunter_max_age_hours()
+        discord_webhook_url = self._validated_vinted_discord_webhook_url()
 
         cmd = [
             sys.executable,
@@ -2312,6 +2358,11 @@ class ScraperApp:
             "--deal-hunter-max-age-hours",
             str(max_age_hours),
         ]
+        if self.vinted_discord_notifications_var.get():
+            cmd.append("--discord-deal-notifications")
+            cmd += ["--discord-webhook-url", discord_webhook_url]
+        else:
+            cmd.append("--no-discord-deal-notifications")
         if self.vinted_keep_browser_open_var.get():
             if int(keep_open_seconds) == 0:
                 cmd.append("--keep-browser-open")
@@ -2323,8 +2374,8 @@ class ScraperApp:
         if self.vinted_refresh_browser_profile_var.get():
             cmd.append("--refresh-browser-profile")
         cmd += self._browser_command_args(
-            action_delay_override="0.25",
-            page_settle_override="1.0",
+            action_delay_override="0.15",
+            page_settle_override="0.6",
             slow_mode_override=False,
         )
         cmd += [
@@ -2756,9 +2807,12 @@ class ScraperApp:
         self.vinted_deal_hunter_terms_var.set(", ".join(VINTED_DEAL_HUNTER_DEFAULT_TERMS))
         self.vinted_deal_hunter_category_var.set(VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL)
         self.vinted_deal_hunter_max_results_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH))
+        self.vinted_deal_hunter_max_price_var.set("")
         self.vinted_deal_hunter_min_favorites_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES))
         self.vinted_deal_hunter_max_age_hours_var.set(str(int(VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS)))
         self.vinted_deal_hunter_cycle_seconds_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_LOOP_SECONDS))
+        self.vinted_discord_notifications_var.set(False)
+        self.vinted_discord_webhook_url_var.set("")
         self.vinted_offer_discount_percent_var.set("15")
         self.vinted_db_path_var.set(str((self.script_path.parent / "data" / "scraper.db").resolve()))
         self.vinted_db_filter_var.set("")
@@ -4005,7 +4059,7 @@ class ScraperApp:
     def _selected_vinted_signal_filter(self) -> str:
         return str(self.vinted_signal_filter_var.get() or "tutti").strip().lower() or "tutti"
 
-    def _active_vinted_deal_hunter_thresholds(self, meta: dict | None = None) -> tuple[int, float]:
+    def _active_vinted_deal_hunter_thresholds(self, meta: dict | None = None) -> tuple[int, float, float | None]:
         payload = meta or self.current_result_meta
         min_favorites = normalize_vinted_deal_hunter_min_favorites(
             payload.get("deal_hunter_min_favorites", self.vinted_deal_hunter_min_favorites_var.get()),
@@ -4015,12 +4069,16 @@ class ScraperApp:
             payload.get("deal_hunter_max_age_hours", self.vinted_deal_hunter_max_age_hours_var.get()),
             default=VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
         )
-        return min_favorites, max_age_hours
+        max_price = normalize_vinted_deal_hunter_max_price(
+            payload.get("max_price", self.vinted_deal_hunter_max_price_var.get()),
+            default=None,
+        )
+        return min_favorites, max_age_hours, max_price
 
     def _annotate_vinted_rows_with_deal_hunter(self, rows: list[dict], meta: dict | None = None) -> list[dict]:
         if not rows:
             return []
-        min_favorites, max_age_hours = self._active_vinted_deal_hunter_thresholds(meta)
+        min_favorites, max_age_hours, max_price = self._active_vinted_deal_hunter_thresholds(meta)
         if not vinted_deal_hunter_enabled(min_favorites, max_age_hours):
             min_favorites = VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES
             max_age_hours = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS
@@ -4028,6 +4086,7 @@ class ScraperApp:
             rows,
             min_favorites=min_favorites,
             max_age_hours=max_age_hours,
+            max_price=max_price,
         )
 
     def _filter_vinted_rows(self, rows: list[dict]) -> list[dict]:
@@ -4229,7 +4288,7 @@ class ScraperApp:
                 or deal_hunter_candidates > 0
                 or deal_hunter_matches > 0
             )
-            deal_hunter_min_favorites, deal_hunter_max_age_hours = self._active_vinted_deal_hunter_thresholds(meta)
+            deal_hunter_min_favorites, deal_hunter_max_age_hours, deal_hunter_max_price = self._active_vinted_deal_hunter_thresholds(meta)
             self.result_total_var.set(f"{len(rows)} prodotti")
             if meta.get("loaded_from_db"):
                 counts_parts = [
@@ -4251,7 +4310,8 @@ class ScraperApp:
                     if deal_hunter_enabled_for_result:
                         self.vinted_status_var.set(
                             f"Archivio Vinted caricato: {len(rows)} affari mostrati con filtro {active_filter} "
-                            f"(soglia {deal_hunter_min_favorites}+ like, {deal_hunter_max_age_hours:g}h)."
+                            f"(soglia {deal_hunter_min_favorites}+ like, {deal_hunter_max_age_hours:g}h, "
+                            f"prezzo max {deal_hunter_max_price if deal_hunter_max_price is not None else '-'})."
                         )
                     else:
                         self.vinted_status_var.set(
@@ -4299,6 +4359,7 @@ class ScraperApp:
                         f"Conteggio ricerche: {meta.get('search_count', 1)}",
                         f"Like min: {deal_hunter_min_favorites}",
                         f"Eta max: {deal_hunter_max_age_hours:g}h",
+                        f"Sped max: {VINTED_DEAL_HUNTER_MAX_SHIPPING_PRICE:.2f}€",
                         f"Prezzo max: {meta.get('max_price', '-')}",
                         f"Tag: {meta.get('db_tag_filter', '') or meta.get('tag', '') or 'tutti'}",
                         f"Ricerche salvate: {meta.get('db_total_search_runs', '-')}",
@@ -4417,7 +4478,9 @@ class ScraperApp:
                     self._extracted_display_value(row),
                     str(row.get("link", "") or ""),
                 )
-                if evaluation_label == "da valutare assolutamente":
+                if bool(row.get("offer_already_submitted")):
+                    tag = "vinted_offered"
+                elif evaluation_label == "da valutare assolutamente":
                     tag = "vinted_hot"
                 elif evaluation_label == "da valutare":
                     tag = "vinted_review"
@@ -4461,7 +4524,18 @@ class ScraperApp:
             self._clear_detail_panel()
 
     def _sorted_result_rows(self, rows: list[dict]) -> list[dict]:
-        return sorted(list(rows), key=self._result_sort_key, reverse=self.result_sort_reverse)
+        sorted_rows = sorted(list(rows), key=self._result_sort_key, reverse=self.result_sort_reverse)
+        normal_rows: list[dict] = []
+        offered_rows: list[dict] = []
+        for row in sorted_rows:
+            if (
+                str(row.get("source", "") or "").strip().lower() == "vinted"
+                and bool(row.get("offer_already_submitted"))
+            ):
+                offered_rows.append(row)
+            else:
+                normal_rows.append(row)
+        return normal_rows + offered_rows
 
     def _apply_result_sort(self) -> None:
         if not getattr(self, "results_tree", None):

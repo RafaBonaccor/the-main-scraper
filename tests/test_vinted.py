@@ -6,6 +6,8 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import ANY, Mock, patch
 
+from botasaurus.browser import Wait
+
 from scraper_app.sources.vinted import (
     _build_vinted_total,
     _build_detached_vinted_browser_command,
@@ -145,7 +147,7 @@ class VintedTests(unittest.TestCase):
 
         driver.get.assert_called_once_with(
             "https://www.vinted.it/catalog?search_id=1119058183&page=2&time=1784304226",
-            wait=ANY,
+            wait=Wait.SHORT,
             timeout=15,
         )
         self.assertEqual(
@@ -304,6 +306,7 @@ class VintedTests(unittest.TestCase):
 
         driver.get.assert_called_once()
         self.assertEqual("https://www.vinted.it/items/123", driver.get.call_args.args[0])
+        self.assertEqual(Wait.SHORT, driver.get.call_args.kwargs["wait"])
         self.assertEqual(15, driver.get.call_args.kwargs["timeout"])
         self.assertTrue(result["marker_present"])
 
@@ -406,16 +409,16 @@ class VintedTests(unittest.TestCase):
         driver.run_js.side_effect = [
             {
                 "readyState": "interactive",
-                "hasTitle": False,
-                "hasPrice": False,
-                "hasOffer": False,
+                "title": "",
+                "rawPriceText": "",
+                "offerText": "",
                 "bodyLength": 40,
             },
             {
                 "readyState": "complete",
-                "hasTitle": True,
-                "hasPrice": True,
-                "hasOffer": False,
+                "title": "Charm Pandora",
+                "rawPriceText": "12,00 €",
+                "offerText": "",
                 "bodyLength": 220,
             },
         ]
@@ -607,6 +610,8 @@ class VintedTests(unittest.TestCase):
                         "published_at": "3 ore fa",
                         "price": "10,00 €",
                         "price_value": 10.0,
+                        "shipping_price": "1,99 €",
+                        "shipping_price_value": 1.99,
                         "total_price": "12,49 €",
                         "total_price_value": 12.49,
                         "favorite_count": 80,
