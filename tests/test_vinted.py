@@ -657,6 +657,138 @@ class VintedTests(unittest.TestCase):
         self.assertTrue(rows[0]["detail_cached"])
         self.assertTrue(rows[0]["deal_hunter_match"])
 
+    @patch("scraper_app.sources.vinted._read_vinted_offer_text", return_value="Fai un'offerta")
+    @patch("scraper_app.sources.vinted._read_vinted_shipping_price", return_value="1,99 €")
+    @patch("scraper_app.sources.vinted._read_vinted_price", return_value="10,00 €")
+    @patch("scraper_app.sources.vinted._read_vinted_published_text", return_value="3 ore fa")
+    @patch("scraper_app.sources.vinted._read_vinted_title", return_value="Charm Pandora")
+    @patch(
+        "scraper_app.sources.vinted._read_vinted_detail_payload",
+        return_value={
+            "bodyText": "Charm Pandora 10,00 € 11,99 € incl. 3 ore fa",
+            "title": "Charm Pandora",
+            "publishedText": "3 ore fa",
+            "rawPriceText": "10,00 €",
+            "shippingText": "Spedizione da 1,99 €",
+            "offerText": "Fai un'offerta",
+            "favorite_count_text": "80",
+        },
+    )
+    def test_detail_extraction_promotes_hot_listing_to_deal_when_detail_data_matches(
+        self,
+        _mocked_payload,
+        _mocked_title,
+        _mocked_published,
+        _mocked_price,
+        _mocked_shipping,
+        _mocked_offer,
+    ) -> None:
+        row = _build_vinted_detail_row(
+            driver=Mock(),
+            current_link="https://www.vinted.it/items/9425130935-charm-pandora",
+            search_term="charm",
+            search_url="https://www.vinted.it/catalog?search_text=charm",
+            tag="ricercato",
+            item_name="Charm Pandora",
+            base_row={
+                "source": "vinted",
+                "item_id": "9425130935",
+                "name": "Charm Pandora",
+                "link": "https://www.vinted.it/items/9425130935-charm-pandora",
+                "search_term": "charm",
+                "search_url": "https://www.vinted.it/catalog?search_text=charm",
+                "favorite_count": 12,
+                "evaluation_label": "da valutare assolutamente",
+                "has_ricercato_badge": True,
+                "secondary_badge_text": "Ricercato",
+            },
+            deal_hunter_min_favorites=70,
+            deal_hunter_max_age_hours=24,
+        )
+
+        self.assertEqual(80, row["favorite_count"])
+        self.assertEqual("da valutare assolutamente", row["evaluation_label"])
+        self.assertTrue(row["deal_hunter_candidate"])
+        self.assertTrue(row["deal_hunter_match"])
+        self.assertEqual("affare 24h/70+", row["deal_hunter_label"])
+
+    @patch("scraper_app.sources.vinted.time.monotonic", side_effect=[0.0, 61.0])
+    @patch("scraper_app.sources.vinted._wait_for_vinted_login_if_needed", return_value={"marker_present": True})
+    @patch("scraper_app.sources.vinted.wait_for_vinted_access_status", return_value={"marker_present": True})
+    @patch("scraper_app.sources.vinted.click_first_matching_text", return_value="")
+    @patch("scraper_app.sources.vinted._wait_for_vinted_detail_page_ready")
+    def test_priority_detail_timeout_skips_listing_without_blocking(
+        self,
+        _mocked_ready,
+        _mocked_cookie,
+        _mocked_access,
+        _mocked_login,
+        _mocked_monotonic,
+    ) -> None:
+        driver = Mock()
+        rows = [
+            {
+                "source": "vinted",
+                "item_id": "9425130935",
+                "name": "Charm Pandora",
+                "link": "https://www.vinted.it/items/9425130935-charm-pandora",
+                "search_term": "charm",
+                "search_url": "https://www.vinted.it/catalog?search_text=charm",
+                "favorite_count": 80,
+                "evaluation_label": "da valutare assolutamente",
+                "deal_hunter_candidate": True,
+                "deal_hunter_match": False,
+            }
+        ]
+
+        meta = _enrich_vinted_priority_rows(
+            driver,
+            rows,
+            {
+                "db_path": ":memory:",
+                "deal_hunter_enabled": True,
+                "deal_hunter_min_favorites": 70,
+                "deal_hunter_max_age_hours": 24,
+                "detail_item_timeout_seconds": 60,
+            },
+        )
+
+        self.assertEqual(1, meta["enriched_count"])
+        self.assertEqual("detail_timeout", rows[0]["detail_error"])
+        self.assertFalse(rows[0].get("deal_hunter_match", False))
+
+    def test_deal_hunter_does_not_extract_hot_listing_below_min_likes(self) -> None:
+        driver = Mock()
+        rows = [
+            {
+                "source": "vinted",
+                "item_id": "1",
+                "name": "Ricercato low likes",
+                "link": "https://www.vinted.it/items/1-ricercato-low-likes",
+                "search_term": "charm",
+                "search_url": "https://www.vinted.it/catalog?search_text=charm",
+                "favorite_count": 12,
+                "evaluation_label": "da valutare assolutamente",
+                "deal_hunter_candidate": False,
+                "deal_hunter_match": False,
+                "has_ricercato_badge": True,
+            }
+        ]
+
+        meta = _enrich_vinted_priority_rows(
+            driver,
+            rows,
+            {
+                "db_path": ":memory:",
+                "deal_hunter_enabled": True,
+                "deal_hunter_min_favorites": 70,
+                "deal_hunter_max_age_hours": 24,
+            },
+        )
+
+        driver.get.assert_not_called()
+        self.assertEqual(0, meta["enriched_count"])
+
     def test_known_item_keys_and_offer_history_use_item_id_and_link(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "vinted.db"

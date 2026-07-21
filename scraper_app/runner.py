@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -116,6 +117,43 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
     if not search_specs:
         raise ValueError("Inserisci una ricerca Vinted o un searches-file valido.")
 
+    deal_hunter_loop_seconds = max(int(kwargs.get("deal_hunter_loop_seconds", 0) or 0), 0)
+    deal_hunter_enabled = int(kwargs.get("deal_hunter_min_favorites", 0) or 0) > 0
+
+    if deal_hunter_enabled and deal_hunter_loop_seconds > 0:
+        latest_outcome: ScrapeOutcome | None = None
+        cycle_index = 0
+        while True:
+            if consume_stop_after_current_item_request():
+                break
+            cycle_index += 1
+            print(f"[deal-hunter] ciclo interno {cycle_index} avviato.", flush=True)
+            latest_outcome = _run_vinted_queries_once(search_specs, **kwargs)
+            if consume_stop_after_current_item_request():
+                break
+            print(
+                f"[deal-hunter] ciclo interno {cycle_index} completato, pausa {deal_hunter_loop_seconds}s prima del prossimo giro.",
+                flush=True,
+            )
+            deadline = time.monotonic() + deal_hunter_loop_seconds
+            while time.monotonic() < deadline:
+                if consume_stop_after_current_item_request():
+                    break
+                time.sleep(min(1.0, max(deadline - time.monotonic(), 0.0)))
+            if consume_stop_after_current_item_request():
+                break
+        if latest_outcome is not None:
+            return latest_outcome
+        raise RuntimeError("Procacciatore Vinted interrotto prima di completare il primo ciclo.")
+
+    return _run_vinted_queries_once(search_specs, **kwargs)
+
+
+def _run_vinted_queries_once(search_specs: list[dict], **kwargs) -> ScrapeOutcome:
+    if not search_specs:
+        raise ValueError("Inserisci una ricerca Vinted o un searches-file valido.")
+    deal_hunter_enabled = int(kwargs.get("deal_hunter_min_favorites", 0) or 0) > 0
+
     if len(search_specs) == 1:
         spec = search_specs[0]
         return run_vinted_scraper(
@@ -163,7 +201,6 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
             stopped_early = True
             break
         is_last = index == len(search_specs) - 1
-        deal_hunter_enabled = int(kwargs.get("deal_hunter_min_favorites", 0) or 0) > 0
         inner_keep_browser_open = bool(kwargs.get("keep_browser_open", True)) if is_last or not deal_hunter_enabled else True
         try:
             outcome = run_vinted_scraper(

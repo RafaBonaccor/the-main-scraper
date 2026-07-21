@@ -21,6 +21,11 @@ from .browser_runtime import (
 )
 from .contact_history import annotate_rows_with_contact_history, summarize_contact_status
 from .date_filter import describe_age_days, to_datetime_for_sorting
+from .discord_notifications import (
+    build_vinted_deal_discord_message,
+    build_vinted_login_required_discord_message,
+    send_discord_webhook_message,
+)
 from .job_profiles import (
     is_builtin_job_profile,
     load_job_profiles,
@@ -143,8 +148,10 @@ RESULT_SORT_COLUMN_MAP = {
 }
 VINTED_CATEGORY_PRESETS = (
     ("Nessuna categoria rapida", ""),
+    ("Monitoraggio", "__all_categories__"),
     ("Accessori donna", "https://www.vinted.it/catalog/1187-accessories"),
     ("Accessori uomo", "https://www.vinted.it/catalog/82-accessories"),
+    ("Elettronica", "https://www.vinted.it/catalog/2994-electronics"),
     ("Gioielli donna", "https://www.vinted.it/catalog/21-jewellery"),
     ("Scarpe donna", "https://www.vinted.it/catalog/16-shoes"),
     ("Scarpe uomo", "https://www.vinted.it/catalog/1231-shoes"),
@@ -157,6 +164,29 @@ VINTED_SIGNAL_FILTER_VALUES = (
     "da valutare",
     "da valutare assolutamente",
 )
+VINTED_MONITORING_CATEGORY_LABEL = "Monitoraggio"
+VINTED_MONITORING_DEFAULT_TERMS = (
+    "nike",
+    "adidas",
+    "jordan",
+    "new balance",
+    "apple",
+    "airpods",
+    "magsafe",
+    "pokemon",
+    "pandora",
+    "swarovski",
+    "gucci",
+    "prada",
+)
+
+
+def _iter_vinted_monitoring_categories() -> list[tuple[str, str]]:
+    return [
+        (label, url)
+        for label, url in VINTED_CATEGORY_PRESETS
+        if url and url != "__all_categories__"
+    ]
 
 
 def open_external_target(target: object) -> bool:
@@ -232,7 +262,36 @@ def build_vinted_deal_hunter_search_specs(
     except (TypeError, ValueError) as exc:
         raise ValueError("Max risultati per ricerca del procacciatore affari non valido.") from exc
     category_label = str(category_selection or "").strip() or VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL
-    normalized_terms = normalize_vinted_deal_hunter_terms(raw_terms)
+    normalized_terms = normalize_vinted_deal_hunter_terms(raw_terms, use_default_when_empty=False)
+    if category_label == VINTED_MONITORING_CATEGORY_LABEL:
+        if not normalized_terms:
+            normalized_terms = list(VINTED_MONITORING_DEFAULT_TERMS)
+        monitoring_specs: list[dict] = []
+        monitoring_categories = _iter_vinted_monitoring_categories()
+        for resolved_category_label, _resolved_category_url in monitoring_categories:
+            for term in normalized_terms:
+                resolved_search = build_vinted_search_target_url(term, resolved_category_label)
+                monitoring_specs.append(
+                    {
+                        "search": resolved_search,
+                        "display_search": f"{term} | {resolved_category_label} | {VINTED_MONITORING_CATEGORY_LABEL}",
+                        "category_label": VINTED_MONITORING_CATEGORY_LABEL,
+                        "max_results": normalized_max_results,
+                        "max_price": max_price,
+                    }
+                )
+        return monitoring_specs
+    if not normalized_terms:
+        resolved_search = build_vinted_search_target_url("", category_label)
+        return [
+            {
+                "search": resolved_search,
+                "display_search": format_vinted_search_target_label("", category_label) or resolved_search,
+                "category_label": category_label if resolve_vinted_category_url(category_label) else "",
+                "max_results": normalized_max_results,
+                "max_price": max_price,
+            }
+        ]
     specs: list[dict] = []
     for term in normalized_terms:
         resolved_search = build_vinted_search_target_url(term, category_label)
@@ -374,6 +433,7 @@ class ScraperApp:
     def __init__(self, root: tk.Tk, script_path: Path) -> None:
         self.root = root
         self.script_path = script_path
+        self.ui_settings_path = (script_path.parent / "data" / "ui_settings.json").resolve()
         self.process: subprocess.Popen[str] | None = None
         self.vinted_offer_process: subprocess.Popen[str] | None = None
         self.process_kind = ""
@@ -511,11 +571,16 @@ class ScraperApp:
         self.vinted_access_warning_shown_for_process = False
         self.vinted_login_prompt_open = False
         self.vinted_last_access_marker_present: bool | None = None
+        self.vinted_login_discord_notified_for_process = False
         self.result_sort_reverse = RESULT_SORT_DEFAULT_DESC.get("Score opportunita", True)
         self.result_sort_active_column = RESULT_SORT_MODE_DEFAULT_COLUMN.get("Score opportunita", "")
         self._updating_result_sort_var = False
         self.results_column_labels: dict[str, str] = {}
         self.current_result_source = "google_maps"
+        self._persist_ui_settings_after_id: str | None = None
+        self._loading_persisted_ui_settings = False
+
+        self._load_persisted_ui_settings()
 
         self.root.title("The Main Scraper")
         self.root.geometry("1360x920")
@@ -544,9 +609,66 @@ class ScraperApp:
         self.vinted_search_var.trace_add("write", lambda *_: self._update_vinted_search_preview())
         self.vinted_category_var.trace_add("write", lambda *_: self._update_vinted_search_preview())
         self.vinted_offer_discount_percent_var.trace_add("write", lambda *_: self._update_vinted_offer_ui_copy())
+        self._install_persisted_ui_setting_watchers()
+        self.root.protocol("WM_DELETE_WINDOW", self._handle_window_close)
         self._update_vinted_search_preview()
         self._update_vinted_offer_ui_copy()
         self.root.after(150, self._drain_logs)
+
+    def _persisted_ui_settings_payload(self) -> dict[str, object]:
+        return {
+            "vinted_discord_notifications_enabled": bool(self.vinted_discord_notifications_var.get()),
+            "vinted_discord_webhook_url": str(self.vinted_discord_webhook_url_var.get() or "").strip(),
+        }
+
+    def _load_persisted_ui_settings(self) -> None:
+        if not self.ui_settings_path.exists():
+            return
+        try:
+            payload = json.loads(self.ui_settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+        self._loading_persisted_ui_settings = True
+        try:
+            webhook_url = payload.get("vinted_discord_webhook_url")
+            if isinstance(webhook_url, str):
+                self.vinted_discord_webhook_url_var.set(webhook_url.strip())
+            enabled = payload.get("vinted_discord_notifications_enabled")
+            if isinstance(enabled, bool):
+                self.vinted_discord_notifications_var.set(enabled)
+        finally:
+            self._loading_persisted_ui_settings = False
+
+    def _schedule_persist_ui_settings(self, *_args: object) -> None:
+        if self._loading_persisted_ui_settings:
+            return
+        if self._persist_ui_settings_after_id:
+            try:
+                self.root.after_cancel(self._persist_ui_settings_after_id)
+            except Exception:
+                pass
+        self._persist_ui_settings_after_id = self.root.after(250, self._persist_ui_settings)
+
+    def _persist_ui_settings(self) -> None:
+        self._persist_ui_settings_after_id = None
+        try:
+            self.ui_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self.ui_settings_path.write_text(
+                json.dumps(self._persisted_ui_settings_payload(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
+
+    def _install_persisted_ui_setting_watchers(self) -> None:
+        self.vinted_discord_notifications_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_discord_webhook_url_var.trace_add("write", self._schedule_persist_ui_settings)
+
+    def _handle_window_close(self) -> None:
+        self._persist_ui_settings()
+        self.root.destroy()
 
     def _configure_styles(self) -> None:
         style = ttk.Style()
@@ -1572,8 +1694,16 @@ class ScraperApp:
             state="disabled",
         )
         self.vinted_offer_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.vinted_discord_button = ttk.Button(
+            lead_card,
+            text="Invia annuncio su Discord",
+            style="Secondary.TButton",
+            command=self._send_selected_vinted_to_discord,
+            state="disabled",
+        )
+        self.vinted_discord_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         offer_discount_frame = ttk.Frame(lead_card, style="Panel.TFrame")
-        offer_discount_frame.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        offer_discount_frame.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(offer_discount_frame, text="Sconto offerta (%)").grid(row=0, column=0, sticky="w")
         ttk.Entry(offer_discount_frame, textvariable=self.vinted_offer_discount_percent_var, width=8).grid(
             row=0,
@@ -1934,6 +2064,7 @@ class ScraperApp:
         self.vinted_status_var.set(
             "Attenzione: accesso Vinted non confermato. Marker account assente."
         )
+        self._notify_vinted_login_required_on_discord(status)
         if notify and not self.vinted_access_warning_shown_for_process:
             self.vinted_access_warning_shown_for_process = True
             suffix = f"\n\nURL controllato:\n{current_url}" if current_url else ""
@@ -2022,7 +2153,8 @@ class ScraperApp:
             self.lead_action_hint_label.configure(
                 text=(
                     "Apri l'annuncio Vinted selezionato per verificare foto e dettagli originali "
-                    f"oppure invia un'offerta automatica calcolata come prezzo annuncio - {percent_label}%."
+                    f"oppure invia un'offerta automatica calcolata come prezzo annuncio - {percent_label}%. "
+                    "Se il webhook Discord e configurato puoi anche inviare manualmente l'annuncio selezionato sul canale."
                 )
             )
 
@@ -2044,6 +2176,8 @@ class ScraperApp:
         self.vinted_offer_button.configure(
             state="normal" if is_vinted and self.vinted_offer_process is None else "disabled"
         )
+        if hasattr(self, "vinted_discord_button"):
+            self.vinted_discord_button.configure(state="normal" if is_vinted else "disabled")
         if hasattr(self, "vinted_extract_button"):
             self.vinted_extract_button.configure(state="normal" if selected_vinted_rows else "disabled")
         self.contact_button.configure(state="normal" if is_subito else "disabled")
@@ -2320,6 +2454,38 @@ class ScraperApp:
             raise ValueError("Webhook Discord non valido.")
         return webhook_url
 
+    def _masked_discord_webhook_target(self, webhook_url: str) -> str:
+        raw_value = str(webhook_url or "").strip().rstrip("/")
+        if not raw_value:
+            return "webhook-assente"
+        token_fragment = raw_value.rsplit("/", 1)[-1]
+        if len(token_fragment) <= 8:
+            masked_token = token_fragment
+        else:
+            masked_token = f"{token_fragment[:4]}…{token_fragment[-4:]}"
+        return f"discord-webhook:{masked_token}"
+
+    def _notify_vinted_login_required_on_discord(self, status: dict[str, object]) -> None:
+        if self.vinted_login_discord_notified_for_process:
+            return
+        try:
+            webhook_url = self._validated_vinted_discord_webhook_url()
+        except ValueError:
+            return
+        if not webhook_url:
+            return
+        webhook_target = self._masked_discord_webhook_target(webhook_url)
+        result = send_discord_webhook_message(
+            webhook_url,
+            build_vinted_login_required_discord_message(status),
+        )
+        if not bool(result.get("ok")):
+            error_text = str(result.get("error", "") or "Invio Discord fallito.")
+            self._append_log(f"[discord] notifica login Vinted fallita ({webhook_target}): {error_text}\n")
+            return
+        self.vinted_login_discord_notified_for_process = True
+        self._append_log(f"[discord] notifica login Vinted inviata ({webhook_target}).\n")
+
     def _load_vinted_deal_hunter_specs_into_table(self) -> None:
         try:
             specs = self._current_vinted_deal_hunter_specs_from_form()
@@ -2357,6 +2523,8 @@ class ScraperApp:
             str(min_favorites),
             "--deal-hunter-max-age-hours",
             str(max_age_hours),
+            "--deal-hunter-loop-seconds",
+            str(self._parse_vinted_deal_hunter_cycle_seconds()),
         ]
         if self.vinted_discord_notifications_var.get():
             cmd.append("--discord-deal-notifications")
@@ -3098,6 +3266,39 @@ class ScraperApp:
         self._scroll_to_widget(self.log_tab)
         self._start_vinted_offer_process(command)
 
+    def _send_selected_vinted_to_discord(self) -> None:
+        row = self._get_selected_row()
+        if row is None or str(row.get("source", "") or "").strip().lower() != "vinted":
+            messagebox.showerror("Discord Vinted", "Seleziona un annuncio Vinted nei risultati.")
+            return
+        try:
+            webhook_url = self._validated_vinted_discord_webhook_url()
+        except ValueError as exc:
+            messagebox.showerror("Discord Vinted", str(exc))
+            return
+        if not webhook_url:
+            messagebox.showerror("Discord Vinted", "Attiva le notifiche Discord o inserisci un webhook valido nel procacciatore.")
+            return
+        title = str(row.get("name", "") or "Annuncio senza nome").strip()
+        if not messagebox.askyesno(
+            "Invia annuncio su Discord",
+            f"Stai per inviare questo annuncio su Discord:\n\n{title}\n\nConfermi?",
+        ):
+            return
+        result = send_discord_webhook_message(
+            webhook_url,
+            build_vinted_deal_discord_message(row),
+        )
+        webhook_target = self._masked_discord_webhook_target(webhook_url)
+        if not bool(result.get("ok")):
+            error_text = str(result.get("error", "") or "Invio Discord fallito.")
+            self._append_log(f"[discord] invio manuale fallito ({webhook_target}): {error_text}\n")
+            messagebox.showerror("Discord Vinted", f"{error_text}\n\nTarget usato: {webhook_target}")
+            return
+        self._append_log(f"[discord] annuncio inviato manualmente ({webhook_target}): {row.get('link', '')}\n")
+        self.vinted_status_var.set("Annuncio Vinted inviato su Discord.")
+        messagebox.showinfo("Discord Vinted", "Annuncio inviato su Discord.")
+
     def _start_batch_contact_selected(self) -> None:
         rows = self._get_selected_rows()
         if not rows:
@@ -3163,6 +3364,7 @@ class ScraperApp:
         self.process_should_load_results = load_results
         self.process_stop_requested = False
         self.vinted_access_warning_shown_for_process = False
+        self.vinted_login_discord_notified_for_process = False
         self._set_runtime_status("Running")
         self._append_log(f"$ {' '.join(command)}\n")
         self.run_button.configure(state="disabled")
@@ -3960,6 +4162,7 @@ class ScraperApp:
                 self.process_should_load_results = False
                 self.process_stop_requested = False
                 self.vinted_access_warning_shown_for_process = False
+                self.vinted_login_discord_notified_for_process = False
                 self.vinted_login_prompt_open = False
                 self._set_runtime_status("Idle" if code == 0 or stop_requested else "Error")
                 self._update_vinted_profile_status()

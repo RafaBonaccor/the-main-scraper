@@ -33,7 +33,24 @@ def build_vinted_deal_discord_message(row: dict) -> str:
     if reason:
         lines.append(f"Motivo: {reason}")
     if link:
-        lines.append(link)
+        lines.append(f"Apri annuncio: <{link}>")
+    return "\n".join(lines)
+
+
+def build_vinted_login_required_discord_message(status: dict) -> str:
+    expected_alt = normalize_whitespace(str(status.get("expected_alt", "bonaccarla") or "bonaccarla"))
+    current_url = str(status.get("current_url", "") or "").strip()
+    checked_at = normalize_whitespace(str(status.get("checked_at", "") or ""))
+
+    lines = [
+        "⚠️ Login Vinted richiesto",
+        f"Marker account assente: {expected_alt}",
+    ]
+    if checked_at:
+        lines.append(f"Controllato: {checked_at}")
+    if current_url:
+        lines.append(f"URL: <{current_url}>")
+    lines.append("Apri il browser dello scraper, fai login manualmente su Vinted e poi conferma dalla GUI.")
     return "\n".join(lines)
 
 
@@ -46,7 +63,15 @@ def send_discord_webhook_message(webhook_url: str, content: str, timeout_seconds
     request = Request(
         str(webhook_url or "").strip(),
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36 TheMainScraper/1.0"
+            ),
+        },
         method="POST",
     )
     sent_at = datetime.now().isoformat(timespec="seconds")
@@ -86,4 +111,3 @@ def send_discord_webhook_message(webhook_url: str, content: str, timeout_seconds
             "sent_at": sent_at,
             "error": f"{type(exc).__name__}: {exc}",
         }
-

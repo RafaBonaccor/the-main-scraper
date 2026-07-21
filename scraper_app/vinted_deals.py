@@ -23,7 +23,7 @@ VINTED_DEAL_HUNTER_MAX_SHIPPING_PRICE = 2.99
 _FAVORITE_COUNT_PATTERN = re.compile(r"\d+")
 
 
-def normalize_vinted_deal_hunter_terms(raw_terms: object) -> list[str]:
+def normalize_vinted_deal_hunter_terms(raw_terms: object, *, use_default_when_empty: bool = True) -> list[str]:
     if isinstance(raw_terms, (list, tuple, set)):
         parts = [str(item or "").strip() for item in raw_terms]
     else:
@@ -43,7 +43,7 @@ def normalize_vinted_deal_hunter_terms(raw_terms: object) -> list[str]:
         terms.append(clean)
     if terms:
         return terms
-    return list(VINTED_DEAL_HUNTER_DEFAULT_TERMS)
+    return list(VINTED_DEAL_HUNTER_DEFAULT_TERMS) if use_default_when_empty else []
 
 
 def normalize_vinted_deal_hunter_min_favorites(value: object, default: int = 0) -> int:
@@ -107,6 +107,8 @@ def parse_vinted_relative_age_hours(published_at: object) -> float | None:
         return 24.0
     if text == "oggi":
         return 0.0
+    if text in {"un giorno fa", "una giornata fa"}:
+        return 24.0
     match = re.match(r"^(\d+)\s+([^\s]+)\s+fa$", text)
     if not match:
         return None

@@ -16,6 +16,9 @@ class VintedDealsTests(unittest.TestCase):
     def test_normalize_terms_uses_defaults_when_empty(self) -> None:
         self.assertEqual(list(VINTED_DEAL_HUNTER_DEFAULT_TERMS), normalize_vinted_deal_hunter_terms(""))
 
+    def test_normalize_terms_can_return_empty_when_requested(self) -> None:
+        self.assertEqual([], normalize_vinted_deal_hunter_terms("", use_default_when_empty=False))
+
     def test_normalize_terms_dedupes_and_splits(self) -> None:
         self.assertEqual(
             ["charm", "pandora", "collane"],
@@ -24,6 +27,7 @@ class VintedDealsTests(unittest.TestCase):
 
     def test_parse_relative_age_hours_supports_italian_values(self) -> None:
         self.assertEqual(24.0, parse_vinted_relative_age_hours("ieri"))
+        self.assertEqual(24.0, parse_vinted_relative_age_hours("un giorno fa"))
         self.assertEqual(3.0, parse_vinted_relative_age_hours("3 ore fa"))
         self.assertEqual(48.0, parse_vinted_relative_age_hours("2 giorni fa"))
 
@@ -31,6 +35,7 @@ class VintedDealsTests(unittest.TestCase):
         self.assertTrue(is_vinted_deal_hunter_candidate(70))
         self.assertTrue(is_vinted_deal_hunter_match(95, "12 ore fa", shipping_price_value=2.49))
         self.assertTrue(is_vinted_deal_hunter_match(70, "ieri", shipping_price_value=0.99))
+        self.assertTrue(is_vinted_deal_hunter_match(70, "un giorno fa", shipping_price_value=0.99))
         self.assertFalse(is_vinted_deal_hunter_match(69, "2 ore fa"))
         self.assertFalse(is_vinted_deal_hunter_match(95, "2 giorni fa", shipping_price_value=1.99))
         self.assertFalse(

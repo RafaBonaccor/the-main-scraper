@@ -59,6 +59,7 @@ VINTED_HIGH_SHIPPING_THRESHOLD = 2.99
 VINTED_PAGE_NOT_FOUND_PATTERN = re.compile(r"\b(page not found|pagina non trovata)\b", re.IGNORECASE)
 VINTED_NAVIGATION_TIMEOUT_SECONDS = 15
 VINTED_NAVIGATION_WAIT = Wait.SHORT
+VINTED_DETAIL_ITEM_TIMEOUT_SECONDS = 60
 
 
 def run_vinted_scraper(
@@ -474,6 +475,7 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
         str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH)
     )
     cached_detail_count = 0
+    detail_timeout_seconds = max(int(config.get("detail_item_timeout_seconds", VINTED_DETAIL_ITEM_TIMEOUT_SECONDS) or 0), 1)
 
     for item in config.get("items", []):
         if isinstance(item, dict):
@@ -507,39 +509,57 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
             )
             cached_detail_count += 1
             continue
-        driver.get(current_link, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
-        _wait_for_vinted_detail_page_ready(
-            driver,
-            max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-        )
-        cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
-        if cookie_action:
-            time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
-        last_access_status = wait_for_vinted_access_status(
-            driver,
-            max_wait_seconds=min(max(float(config.get("page_settle_seconds", 3.0) or 0), 0.0), 0.8),
-        )
-        emit_vinted_access_signal(last_access_status)
-        last_access_status = _wait_for_vinted_login_if_needed(
-            driver,
-            last_access_status,
-            revisit_url=current_link,
-            action_delay_seconds=float(config.get("action_delay_seconds", 1.5) or 0),
-            page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-        )
-        row = _build_vinted_detail_row(
-            driver=driver,
-            current_link=current_link,
-            search_term=search_term,
-            search_url=search_url,
-            tag=tag,
-            item_name=item_name,
-            base_row=base_row,
-            deal_hunter_min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
-            deal_hunter_max_age_hours=float(
-                config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0
-            ),
-        )
+        detail_started_at = time.monotonic()
+        try:
+            driver.get(current_link, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+            _wait_for_vinted_detail_page_ready(
+                driver,
+                max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+            )
+            cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
+            if cookie_action:
+                time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
+            last_access_status = wait_for_vinted_access_status(
+                driver,
+                max_wait_seconds=min(max(float(config.get("page_settle_seconds", 3.0) or 0), 0.0), 0.8),
+            )
+            emit_vinted_access_signal(last_access_status)
+            last_access_status = _wait_for_vinted_login_if_needed(
+                driver,
+                last_access_status,
+                revisit_url=current_link,
+                action_delay_seconds=float(config.get("action_delay_seconds", 1.5) or 0),
+                page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+            )
+            if time.monotonic() - detail_started_at > detail_timeout_seconds:
+                raise TimeoutError(f"detail timeout > {detail_timeout_seconds}s")
+            row = _build_vinted_detail_row(
+                driver=driver,
+                current_link=current_link,
+                search_term=search_term,
+                search_url=search_url,
+                tag=tag,
+                item_name=item_name,
+                base_row=base_row,
+                deal_hunter_min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
+                deal_hunter_max_age_hours=float(
+                    config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0
+                ),
+            )
+            if time.monotonic() - detail_started_at > detail_timeout_seconds:
+                raise TimeoutError(f"detail timeout > {detail_timeout_seconds}s")
+        except Exception as exc:
+            print(f"[vinted-detail] timeout/errore, salto {current_link}: {exc}", flush=True)
+            row = _build_vinted_missing_detail_row(
+                current_link=current_link,
+                search_term=search_term,
+                search_url=search_url,
+                tag=tag,
+                item_name=item_name,
+                base_row=base_row,
+                page_text=str(base_row.get("raw_text", "") or ""),
+                detail_error="detail_timeout",
+            )
         if str(row.get("detail_error", "") or "").strip() == "page_not_found":
             print(f"[vinted-detail] pagina non trovata, salto {current_link}", flush=True)
         rows.append(row)
@@ -810,11 +830,17 @@ def _normalize_vinted_items(raw_items: list[dict | str]) -> list[dict | str]:
 def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict) -> dict[str, int]:
     targets: list[dict] = []
     seen_links: set[str] = set()
+    deal_hunter_mode = bool(config.get("deal_hunter_enabled", False))
     for row in rows:
         current_link = normalize_vinted_item_url(str(row.get("link", "") or ""))
         if not current_link or current_link in seen_links:
             continue
-        if not (_should_extract_vinted_priority_row(row) or _should_extract_vinted_deal_hunter_row(row, config)):
+        should_extract = (
+            _should_extract_vinted_deal_hunter_row(row, config)
+            if deal_hunter_mode
+            else (_should_extract_vinted_priority_row(row) or _should_extract_vinted_deal_hunter_row(row, config))
+        )
+        if not should_extract:
             continue
         seen_links.add(current_link)
         targets.append(row)
@@ -825,6 +851,7 @@ def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict)
     cached_detail_rows = load_vinted_completed_detail_rows(
         str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH)
     )
+    detail_timeout_seconds = max(int(config.get("detail_item_timeout_seconds", VINTED_DETAIL_ITEM_TIMEOUT_SECONDS) or 0), 1)
     for row in targets:
         current_link = normalize_vinted_item_url(str(row.get("link", "") or ""))
         if not current_link:
@@ -861,40 +888,60 @@ def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict)
                 live_stage="detail_cached",
             )
             continue
-        driver.get(current_link, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
-        _wait_for_vinted_detail_page_ready(
-            driver,
-            max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-        )
-        cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
-        if cookie_action:
-            time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
-        access_status = wait_for_vinted_access_status(
-            driver,
-            max_wait_seconds=min(max(float(config.get("page_settle_seconds", 3.0) or 0), 0.0), 0.8),
-        )
-        emit_vinted_access_signal(access_status)
-        _wait_for_vinted_login_if_needed(
-            driver,
-            access_status,
-            revisit_url=current_link,
-            action_delay_seconds=float(config.get("action_delay_seconds", 1.5) or 0),
-            page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-        )
-        previous_label = str(row.get("evaluation_label", "") or "").strip().lower()
-        enriched_row = _build_vinted_detail_row(
-            driver=driver,
-            current_link=current_link,
-            search_term=str(row.get("search_term", "") or ""),
-            search_url=str(row.get("search_url", "") or ""),
-            tag=str(row.get("tag", "") or ""),
-            item_name=str(row.get("name", "") or ""),
-            base_row=row,
-            deal_hunter_min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
-            deal_hunter_max_age_hours=float(
-                config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0
-            ),
-        )
+        detail_started_at = time.monotonic()
+        try:
+            driver.get(current_link, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+            _wait_for_vinted_detail_page_ready(
+                driver,
+                max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+            )
+            cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
+            if cookie_action:
+                time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
+            access_status = wait_for_vinted_access_status(
+                driver,
+                max_wait_seconds=min(max(float(config.get("page_settle_seconds", 3.0) or 0), 0.0), 0.8),
+            )
+            emit_vinted_access_signal(access_status)
+            _wait_for_vinted_login_if_needed(
+                driver,
+                access_status,
+                revisit_url=current_link,
+                action_delay_seconds=float(config.get("action_delay_seconds", 1.5) or 0),
+                page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+            )
+            if time.monotonic() - detail_started_at > detail_timeout_seconds:
+                raise TimeoutError(f"detail timeout > {detail_timeout_seconds}s")
+            previous_label = str(row.get("evaluation_label", "") or "").strip().lower()
+            enriched_row = _build_vinted_detail_row(
+                driver=driver,
+                current_link=current_link,
+                search_term=str(row.get("search_term", "") or ""),
+                search_url=str(row.get("search_url", "") or ""),
+                tag=str(row.get("tag", "") or ""),
+                item_name=str(row.get("name", "") or ""),
+                base_row=row,
+                deal_hunter_min_favorites=int(config.get("deal_hunter_min_favorites", 0) or 0),
+                deal_hunter_max_age_hours=float(
+                    config.get("deal_hunter_max_age_hours", VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS) or 0
+                ),
+            )
+            if time.monotonic() - detail_started_at > detail_timeout_seconds:
+                raise TimeoutError(f"detail timeout > {detail_timeout_seconds}s")
+        except Exception as exc:
+            print(f"[vinted-detail] timeout/errore, salto {current_link}: {exc}", flush=True)
+            previous_label = str(row.get("evaluation_label", "") or "").strip().lower()
+            access_status = {}
+            enriched_row = _build_vinted_missing_detail_row(
+                current_link=current_link,
+                search_term=str(row.get("search_term", "") or ""),
+                search_url=str(row.get("search_url", "") or ""),
+                tag=str(row.get("tag", "") or ""),
+                item_name=str(row.get("name", "") or ""),
+                base_row=row,
+                page_text=str(row.get("raw_text", "") or ""),
+                detail_error="detail_timeout",
+            )
         if str(enriched_row.get("detail_error", "") or "").strip() == "page_not_found":
             print(f"[vinted-detail] pagina non trovata, salto {current_link}", flush=True)
         row.update(enriched_row)
@@ -963,7 +1010,9 @@ def _merge_cached_vinted_detail_row(
     has_ricercato_badge = bool(existing_row.get("has_ricercato_badge")) or bool(
         merged.get("has_ricercato_badge")
     ) or bool(RICERCATO_BADGE_PATTERN.search(secondary_badge_text)) or str(tag or merged.get("tag", "") or "").strip().lower() == "ricercato"
-    favorite_count = parse_vinted_favorite_count(existing_row.get("favorite_count", merged.get("favorite_count")))
+    favorite_count = parse_vinted_favorite_count(merged.get("favorite_count"))
+    if favorite_count is None:
+        favorite_count = parse_vinted_favorite_count(existing_row.get("favorite_count"))
     published_at = str(merged.get("published_at", "") or "")
     merged.update(
         {
@@ -1059,7 +1108,9 @@ def _build_vinted_detail_row(
         total_price_value = parse_vinted_price(total_price_text)
     else:
         total_price, total_price_value = _build_vinted_total(base_price_text, shipping_price)
-    favorite_count = parse_vinted_favorite_count(existing_row.get("favorite_count"))
+    favorite_count = parse_vinted_favorite_count(detail_payload.get("favorite_count_text"))
+    if favorite_count is None:
+        favorite_count = parse_vinted_favorite_count(existing_row.get("favorite_count"))
     secondary_badge_text = normalize_whitespace(str(existing_row.get("secondary_badge_text", "") or ""))
     has_ricercato_badge = bool(existing_row.get("has_ricercato_badge")) or bool(
         RICERCATO_BADGE_PATTERN.search(secondary_badge_text)

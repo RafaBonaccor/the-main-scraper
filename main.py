@@ -114,6 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum listing age in hours for deal-hunter mode.",
     )
     vinted_parser.add_argument(
+        "--deal-hunter-loop-seconds",
+        default=0,
+        type=int,
+        help="If greater than zero in deal-hunter mode, keep the same process/browser alive and repeat cycles with this pause in seconds.",
+    )
+    vinted_parser.add_argument(
         "--exclude-known-items",
         action=argparse.BooleanOptionalAction,
         default=True,

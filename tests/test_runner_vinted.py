@@ -105,6 +105,54 @@ class RunnerVintedTests(unittest.TestCase):
             partial_snapshots,
         )
 
+    @patch("scraper_app.runner.time.sleep")
+    @patch("scraper_app.runner.consume_stop_after_current_item_request")
+    @patch("scraper_app.runner._run_vinted_queries_once")
+    def test_run_vinted_queries_keeps_internal_loop_for_deal_hunter(
+        self,
+        mocked_run_once,
+        mocked_consume_stop,
+        mocked_sleep,
+    ) -> None:
+        stop_checks = {"count": 0}
+
+        def _consume_stop() -> bool:
+            stop_checks["count"] += 1
+            return stop_checks["count"] >= 8
+
+        mocked_consume_stop.side_effect = _consume_stop
+        mocked_run_once.side_effect = [
+            ScrapeOutcome(
+                source="vinted",
+                rows=[{"item_id": "1", "link": "https://www.vinted.it/items/1"}],
+                meta={"search_url": "https://www.vinted.it/catalog?search_text=charm", "deal_hunter_enabled": True},
+            ),
+            ScrapeOutcome(
+                source="vinted",
+                rows=[{"item_id": "2", "link": "https://www.vinted.it/items/2"}],
+                meta={"search_url": "https://www.vinted.it/catalog?search_text=charm", "deal_hunter_enabled": True},
+            ),
+        ]
+
+        monotonic_values = [0.0, 0.0, 0.6, 1.1, 2.0, 2.0, 2.6, 3.1, 4.0, 4.0]
+
+        def _monotonic() -> float:
+            if monotonic_values:
+                return monotonic_values.pop(0)
+            return 999.0
+
+        with patch("scraper_app.runner.time.monotonic", side_effect=_monotonic):
+            outcome = _run_vinted_queries(
+                search="charm",
+                max_results=25,
+                deal_hunter_min_favorites=70,
+                deal_hunter_loop_seconds=1,
+            )
+
+        self.assertEqual("2", outcome.rows[0]["item_id"])
+        self.assertEqual(2, mocked_run_once.call_count)
+        mocked_sleep.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()
