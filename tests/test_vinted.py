@@ -267,6 +267,29 @@ class VintedTests(unittest.TestCase):
         self.assertTrue(result["marker_present"])
         self.assertEqual(1, mocked_emit_required.call_count)
 
+    @patch("scraper_app.sources.vinted.emit_vinted_login_required_signal")
+    def test_wait_for_vinted_login_if_needed_skips_login_flow_on_page_not_found(
+        self,
+        mocked_emit_required,
+    ) -> None:
+        driver = Mock()
+
+        result = _wait_for_vinted_login_if_needed(
+            driver,
+            {
+                "marker_present": False,
+                "page_not_found": True,
+                "expected_alt": "bonaccarla",
+                "current_url": "https://www.vinted.it/items/123",
+                "checked_at": "2026-07-22T10:00:00",
+            },
+            revisit_url="https://www.vinted.it/items/123",
+        )
+
+        self.assertTrue(result["page_not_found"])
+        mocked_emit_required.assert_not_called()
+        driver.get.assert_not_called()
+
     @patch("scraper_app.sources.vinted.time.sleep")
     @patch("scraper_app.sources.vinted.click_first_matching_text", return_value="")
     @patch("scraper_app.sources.vinted.emit_vinted_login_required_signal")

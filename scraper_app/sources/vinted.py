@@ -1399,6 +1399,8 @@ def _wait_for_vinted_login_if_needed(
     action_delay_seconds: float = 1.5,
     page_settle_seconds: float = 3.0,
 ) -> dict[str, object]:
+    if bool(access_status.get("page_not_found")):
+        return access_status
     if bool(access_status.get("marker_present")):
         return access_status
     emit_vinted_login_required_signal(access_status)
@@ -1427,7 +1429,7 @@ def _wait_for_vinted_login_if_needed(
                 max_wait_seconds=min(max(float(page_settle_seconds or 0), 0.0), 1.0),
             )
             emit_vinted_access_signal(refreshed_status)
-            if bool(refreshed_status.get("marker_present")):
+            if bool(refreshed_status.get("page_not_found")) or bool(refreshed_status.get("marker_present")):
                 return refreshed_status
             emit_vinted_login_required_signal(refreshed_status)
         time.sleep(0.25)
