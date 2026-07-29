@@ -1493,6 +1493,7 @@ const isVisible = (element) => {
 const candidates = [
   ...document.querySelectorAll('[data-testid="upload-form-save-draft-button"], button, [role="button"]'),
 ];
+const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || '') : '');
 const button = candidates.find((element) => {
   if (!isVisible(element)) return false;
   const testId = normalize(element.getAttribute('data-testid') || '');
@@ -1510,6 +1511,8 @@ if (!button) {
     aria_disabled: '',
     disabled_attr: '',
     class_name: '',
+    body_text: '',
+    page_title: '',
   };
 }
   return {
@@ -1521,6 +1524,8 @@ if (!button) {
   aria_disabled: normalize(button.getAttribute('aria-disabled') || ''),
   disabled_attr: button.disabled ? 'true' : '',
     class_name: normalize(button.className || ''),
+    body_text: bodyText,
+    page_title: normalize(document.title || ''),
     page_url: normalize(window.location.href || ''),
   };
         """
@@ -1536,6 +1541,8 @@ if (!button) {
         "aria_disabled": normalize_whitespace(str(payload.get("aria_disabled", "") or "")),
         "disabled_attr": normalize_whitespace(str(payload.get("disabled_attr", "") or "")),
         "class_name": normalize_whitespace(str(payload.get("class_name", "") or "")),
+        "body_text": normalize_whitespace(str(payload.get("body_text", "") or "")),
+        "page_title": normalize_whitespace(str(payload.get("page_title", "") or "")),
         "page_url": normalize_whitespace(str(payload.get("page_url", "") or "")),
     }
 
@@ -1560,8 +1567,16 @@ def _click_vinted_upload_save_draft(
         if not last_state.get("enabled"):
             driver.sleep(1.0)
             continue
-        clicked = driver.run_js(
-            """
+        clicked = ""
+        click_errors: list[str] = []
+        try:
+            driver.click('[data-testid="upload-form-save-draft-button"]', wait=Wait.SHORT)
+            clicked = "driver.click"
+        except Exception as exc:
+            click_errors.append(f"driver.click:{type(exc).__name__}")
+        if not clicked:
+            clicked = driver.run_js(
+                """
 const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
 const isVisible = (element) => {
   const style = window.getComputedStyle(element);
@@ -1581,36 +1596,39 @@ if (!button) return '';
 if (button.disabled || normalize(button.getAttribute('aria-disabled') || '') === 'true') return '';
 try { button.scrollIntoView({ block: 'center' }); } catch {}
 try { button.focus(); } catch {}
-try {
-  button.click();
-  const rect = button.getBoundingClientRect();
-  if (rect && rect.width > 0 && rect.height > 0) {
-    const centerX = rect.left + rect.width / 2;
-    const centerY = rect.top + rect.height / 2;
-    const pointTarget = document.elementFromPoint(centerX, centerY);
-    if (pointTarget && pointTarget !== button) {
-      try { pointTarget.scrollIntoView({ block: 'center' }); } catch {}
-      try { pointTarget.focus(); } catch {}
-      try { pointTarget.click(); } catch {}
-      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-        try {
-          pointTarget.dispatchEvent(new MouseEvent(type, {
-            bubbles: true,
-            cancelable: true,
-            clientX: centerX,
-            clientY: centerY,
-            view: window,
-          }));
-        } catch {}
-      }
+try { button.click(); } catch {}
+const rect = button.getBoundingClientRect();
+if (rect && rect.width > 0 && rect.height > 0) {
+  const centerX = rect.left + rect.width / 2;
+  const centerY = rect.top + rect.height / 2;
+  const pointTarget = document.elementFromPoint(centerX, centerY);
+  if (pointTarget) {
+    try { pointTarget.scrollIntoView({ block: 'center' }); } catch {}
+    try { pointTarget.focus(); } catch {}
+    try { pointTarget.click(); } catch {}
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      try {
+        pointTarget.dispatchEvent(new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          clientX: centerX,
+          clientY: centerY,
+          view: window,
+        }));
+      } catch {}
     }
   }
-  return normalize(button.innerText || button.textContent) || 'salva bozza';
-} catch (error) {
-  return '';
 }
-            """
-        )
+return normalize(button.innerText || button.textContent) || 'salva bozza';
+                """
+            )
+        if not clicked:
+            click_errors.append("js-click")
+        if clicked:
+            print(
+                f"[vinted-upload] draft click trigger={clicked} errors={' | '.join(click_errors) or 'none'}",
+                flush=True,
+            )
         clicked_text = str(clicked or "").strip() or None
         print(
             f"[vinted-upload] draft attempt={attempt} clicked_target={clicked_text or 'none'}",
@@ -1626,6 +1644,15 @@ try {
                 f"[vinted-upload] draft attempt={attempt} tick={tick} after={_format_upload_debug(observed_state)}",
                 flush=True,
             )
+            body_text = str(observed_state.get("body_text", "") or "").lower()
+            page_title = str(observed_state.get("page_title", "") or "").lower()
+            success_markers = (
+                "bozza salvata",
+                "draft saved",
+                "saved draft",
+                "bozza creata",
+                "salvataggio completato",
+            )
             if (
                 not observed_state.get("found")
                 or not observed_state.get("visible")
@@ -1633,6 +1660,8 @@ try {
                 or observed_state.get("class_name") != last_state.get("class_name")
                 or observed_state.get("text") != last_state.get("text")
                 or observed_state.get("page_url") != last_state.get("page_url")
+                or any(marker in body_text for marker in success_markers)
+                or any(marker in page_title for marker in success_markers)
             ):
                 stable_saved = True
                 break
