@@ -2,13 +2,19 @@ import unittest
 from unittest.mock import Mock, patch
 
 from scraper_app.browser_launcher import open_browser_session
-from scraper_app.chrome_reuse import preferred_host_fragment_for_url, try_reuse_running_chrome
+from scraper_app.chrome_reuse import _build_reuse_chrome_script, preferred_host_fragment_for_url, try_reuse_running_chrome
 
 
 class ChromeReuseTests(unittest.TestCase):
     def test_preferred_host_fragment_strips_www(self) -> None:
         self.assertEqual("vinted.it", preferred_host_fragment_for_url("https://www.vinted.it/catalog"))
         self.assertEqual("maps.google.com", preferred_host_fragment_for_url("https://maps.google.com/search"))
+
+    def test_build_reuse_chrome_script_forces_target_url_on_new_tab(self) -> None:
+        script = _build_reuse_chrome_script("https://www.vinted.it/items/new", "vinted.it")
+
+        self.assertIn('set newTab to make new tab at end of tabs with properties {URL:"about:blank"}', script)
+        self.assertIn("set URL of active tab to targetUrl", script)
 
     @patch("scraper_app.chrome_reuse.sys.platform", "darwin")
     @patch("scraper_app.chrome_reuse._is_google_chrome_running", return_value=True)
@@ -39,4 +45,3 @@ class ChromeReuseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

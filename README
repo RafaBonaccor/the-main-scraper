@@ -262,7 +262,13 @@ Flusso tipico:
 16. puoi inviare offerte anche mentre il `Procacciatore affari` sta lavorando: l'offerta gira in un processo separato e il procacciatore continua il loop
 17. nell'area `Archivio database` puoi scegliere una `Ricerca salvata`, filtrarla per data/query/titolo/note, aggiornarne l'elenco e ricaricare in tabella una run specifica
 18. puoi anche rinominare la ricerca salvata, aggiungere note archivio o eliminarla senza cancellare gli articoli dal database generale
-19. se vuoi lavorare in modalita `Procacciatore affari`, usa il pannello dedicato:
+19. nella sezione `Preparazione upload articoli` puoi costruire la coda GUI per i caricamenti:
+   - compila `Titolo`, `Prezzo (€)` e `Descrizione`
+   - usa `Seleziona foto` per scegliere immagini singole oppure `Usa cartella foto` per caricare tutte le immagini di una directory
+   - premi `Aggiungi alla coda` per salvare l'articolo nel manifest condiviso
+   - la tabella sotto mostra gli articoli pronti, modificabili con `Carica in form`, `Aggiorna selezionato` e `Rimuovi selezionati`
+   - il manifest viene salvato in `data/vinted_upload_items.json` ed e pensato per essere riusato sia dalla GUI sia dal futuro flusso CLI di upload
+20. se vuoi lavorare in modalita `Procacciatore affari`, usa il pannello dedicato:
    - inserisci una lista di termini ruotati, ad esempio `charm, bracciali, pandora, collane, gioielli`
    - imposta `Like min`, `Prezzo max (€)` ed `Eta max (ore)`; il default e `70` like entro `24` ore
    - un annuncio viene confermato come `affare` solo se rispetta tutte le condizioni: soglia like, eta massima, prezzo massimo e spedizione non oltre `2,99 €`
@@ -372,6 +378,20 @@ Variabili / parametri rilevanti:
 - effort CLI: `--openai-reasoning-effort`
 
 Serve `OPENAI_API_KEY` nell'ambiente.
+
+Per Vinted upload ora c'e anche un primo blocco GUI `AI Listing Studio`:
+
+- usa una o piu foto prodotto come riferimento;
+- invia la richiesta al runtime del gioco, che usa la API key gia salvata li;
+- salva gli output in `output/vinted_ai/<timestamp>/`;
+- puo sostituire le foto correnti del listing con quelle generate.
+
+Variabili / parametri AI rilevanti:
+
+- modello GUI default: `gpt-image-2`
+- size GUI default: `1024x1536`
+- output folder GUI default: `output/vinted_ai`
+- backend: `AGENT_LAB_RUNTIME_URL` o `http://127.0.0.1:8000`
 
 ## Test e verifica
 

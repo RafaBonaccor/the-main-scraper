@@ -120,6 +120,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="If greater than zero in deal-hunter mode, keep the same process/browser alive and repeat cycles with this pause in seconds.",
     )
     vinted_parser.add_argument(
+        "--deal-hunter-terms",
+        default="",
+        help="Comma-separated rotating terms used to build deal-hunter Vinted searches when no direct search/searches-file is provided.",
+    )
+    vinted_parser.add_argument(
+        "--deal-hunter-category",
+        default="",
+        help="Saved GUI category label or catalog URL used to build deal-hunter searches when no direct search/searches-file is provided.",
+    )
+    vinted_parser.add_argument(
         "--exclude-known-items",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -135,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--discord-webhook-url",
         default="",
         help="Discord webhook URL used for Vinted deal notifications.",
+    )
+    vinted_parser.add_argument(
+        "--auto-submit-offers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow automatic offer submission workflows tied to the Vinted deal hunter runtime.",
     )
     vinted_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
     vinted_parser.add_argument(
@@ -309,6 +325,49 @@ def build_parser() -> argparse.ArgumentParser:
     _add_orchestrator_arguments(contact_vinted_parser)
     _add_browser_arguments(contact_vinted_parser)
     contact_vinted_parser.set_defaults(browser_mode="sessione_persistente")
+
+    contact_vinted_upload_parser = contact_subparsers.add_parser("vinted_upload", help="Open the Vinted listing upload flow.")
+    contact_vinted_upload_parser.add_argument(
+        "--items-file",
+        default="",
+        help="JSON file containing one or more Vinted upload items, typically data/vinted_upload_items.json.",
+    )
+    contact_vinted_upload_parser.add_argument("--title", default="", help="Listing title for a single-item upload.")
+    contact_vinted_upload_parser.add_argument("--description", default="", help="Listing description for a single-item upload.")
+    contact_vinted_upload_parser.add_argument("--price", default="", help="Listing price for a single-item upload.")
+    contact_vinted_upload_parser.add_argument("--category", default="", help="Listing category label for a single-item upload.")
+    contact_vinted_upload_parser.add_argument("--brand", default="", help="Listing brand label for a single-item upload.")
+    contact_vinted_upload_parser.add_argument("--condition", default="", help="Listing condition label for a single-item upload.")
+    contact_vinted_upload_parser.add_argument("--material", default="", help="Listing material label for a single-item upload.")
+    contact_vinted_upload_parser.add_argument(
+        "--photo-path",
+        action="append",
+        dest="photo_paths",
+        default=[],
+        help="Photo file path for a single-item upload. Repeat the flag to add more photos.",
+    )
+    contact_vinted_upload_parser.add_argument("--submit", action="store_true", help="Actually click the final publish button.")
+    contact_vinted_upload_parser.add_argument(
+        "--delay-between-seconds",
+        default=2,
+        type=int,
+        help="Delay between items when using items-file.",
+    )
+    contact_vinted_upload_parser.add_argument(
+        "--keep-browser-open",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Leave the Vinted browser open after the upload flow without waiting for a timer.",
+    )
+    contact_vinted_upload_parser.add_argument(
+        "--keep-open-seconds",
+        default=0,
+        type=int,
+        help="Seconds to keep the Vinted browser open after the upload flow. Use 0 with --keep-browser-open to wait until manual close.",
+    )
+    _add_orchestrator_arguments(contact_vinted_upload_parser)
+    _add_browser_arguments(contact_vinted_upload_parser)
+    contact_vinted_upload_parser.set_defaults(browser_mode="chrome_normale")
 
     return parser
 
@@ -537,7 +596,7 @@ def _build_status_payload() -> dict:
         "active_venv_candidate": active_venv,
         "recommended_browser_mode": "sessione_persistente",
         "supported_sources": ["google_maps", "vinted", "vinted_descriptions", "subito", "custom_site"],
-        "supported_contact_sources": ["subito", "vinted"],
+        "supported_contact_sources": ["subito", "vinted", "vinted_upload"],
         "features": {
             "gui": True,
             "browser_command": True,
@@ -739,6 +798,37 @@ def _normalize_contact_result(source: str, result: dict) -> dict:
             "source_total_price": _safe_float_or_none(result.get("source_total_price")),
             "offer_value": _safe_float_or_none(result.get("offer_value")),
             "offer_input_value": str(result.get("offer_input_value", "") or ""),
+            "current_url": str(result.get("current_url", "") or ""),
+            "results": normalized_results,
+        }
+    if source == "vinted_upload":
+        normalized_results = []
+        for item in list(result.get("results", []) or []):
+            if not isinstance(item, dict):
+                continue
+            normalized_results.append(
+                {
+                    "title": str(item.get("title", "") or ""),
+                    "price": str(item.get("price", "") or ""),
+                    "photos_count": _safe_int_or_none(item.get("photos_count")),
+                    "ok": bool(item.get("ok")),
+                    "prepared": bool(item.get("prepared")),
+                    "submitted": bool(item.get("submitted")),
+                    "error": str(item.get("error", "") or ""),
+                    "current_url": str(item.get("current_url", "") or ""),
+                }
+            )
+        return {
+            "source": source,
+            "title": str(result.get("title", "") or ""),
+            "ok": bool(result.get("ok")),
+            "prepared": bool(result.get("prepared")),
+            "submitted": bool(result.get("submitted")),
+            "items_count": _safe_int_or_none(result.get("items_count")),
+            "prepared_count": _safe_int_or_none(result.get("prepared_count")),
+            "submitted_count": _safe_int_or_none(result.get("submitted_count")),
+            "failed_count": _safe_int_or_none(result.get("failed_count")),
+            "submit_action": str(result.get("submit_action", "") or ""),
             "current_url": str(result.get("current_url", "") or ""),
             "results": normalized_results,
         }

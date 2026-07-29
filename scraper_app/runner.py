@@ -14,6 +14,7 @@ from .sources.google_maps import run_google_maps_scraper
 from .sources.subito import run_subito_scraper
 from .sources.vinted import run_vinted_description_extractor, run_vinted_scraper
 from .utils import parse_text_list
+from .vinted_gateway import build_vinted_deal_hunter_search_specs
 
 
 def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
@@ -165,6 +166,7 @@ def _run_vinted_queries_once(search_specs: list[dict], **kwargs) -> ScrapeOutcom
             exclude_known_items=bool(kwargs.get("exclude_known_items", True)),
             discord_deal_notifications=bool(kwargs.get("discord_deal_notifications", False)),
             discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
+            auto_submit_offers=bool(kwargs.get("auto_submit_offers", True)),
             db_path=kwargs.get("db_path", "data/scraper.db"),
             ui_result_json=kwargs.get("ui_result_json", ""),
             browser_mode=kwargs.get("browser_mode", "chrome_normale"),
@@ -212,6 +214,7 @@ def _run_vinted_queries_once(search_specs: list[dict], **kwargs) -> ScrapeOutcom
                 exclude_known_items=bool(kwargs.get("exclude_known_items", True)),
                 discord_deal_notifications=bool(kwargs.get("discord_deal_notifications", False)),
                 discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
+                auto_submit_offers=bool(kwargs.get("auto_submit_offers", True)),
                 db_path=kwargs.get("db_path", "data/scraper.db"),
                 ui_result_json=str(kwargs.get("ui_result_json", "") or "") if deal_hunter_enabled else "",
                 browser_mode=kwargs.get("browser_mode", "chrome_normale"),
@@ -405,6 +408,15 @@ def _resolve_vinted_search_specs(kwargs: dict) -> list[dict]:
         )
     search = str(kwargs.get("search", "") or "").strip()
     if not search:
+        deal_hunter_terms = kwargs.get("deal_hunter_terms", "")
+        deal_hunter_category = kwargs.get("deal_hunter_category", "")
+        if str(deal_hunter_terms or "").strip() or str(deal_hunter_category or "").strip():
+            return build_vinted_deal_hunter_search_specs(
+                raw_terms=deal_hunter_terms,
+                category_selection=deal_hunter_category,
+                max_results=max(int(kwargs.get("max_results", 100)), 0),
+                max_price=_parse_optional_nonnegative_float(kwargs.get("max_price")),
+            )
         return []
     return [
         {

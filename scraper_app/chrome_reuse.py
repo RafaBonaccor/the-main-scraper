@@ -85,6 +85,7 @@ tell application "Google Chrome"
     activate
     if (count of windows) is 0 then
         make new window
+        delay 0.1
         set URL of active tab of front window to targetUrl
         return "OPENED_NEW_WINDOW"
     end if
@@ -104,7 +105,10 @@ tell application "Google Chrome"
         end repeat
     end if
     tell front window
-        make new tab with properties {{URL:targetUrl}}
+        set newTab to make new tab at end of tabs with properties {{URL:"about:blank"}}
+        delay 0.1
+        set active tab index to (count of tabs)
+        set URL of active tab to targetUrl
     end tell
     return "OPENED_NEW_TAB"
 end tell

@@ -19,6 +19,7 @@ from scraper_app.sources.vinted import (
     _extract_vinted_description_from_body_text,
     _extract_vinted_base_price,
     _extract_vinted_primary_price,
+    _click_vinted_favourite_button,
     _normalize_vinted_max_price,
     _persist_vinted_progress_results,
     _read_vinted_published_text,
@@ -28,6 +29,7 @@ from scraper_app.sources.vinted import (
     _wait_for_vinted_detail_page_ready,
     _prioritize_vinted_rows,
     _read_vinted_next_page_target,
+    _read_vinted_favourite_button_state,
     _vinted_row_matches_known_item_keys,
     _vinted_row_matches_max_price,
     _wait_for_vinted_login_if_needed,
@@ -327,11 +329,61 @@ class VintedTests(unittest.TestCase):
             revisit_url="https://www.vinted.it/items/123",
         )
 
-        driver.get.assert_called_once()
-        self.assertEqual("https://www.vinted.it/items/123", driver.get.call_args.args[0])
-        self.assertEqual(Wait.SHORT, driver.get.call_args.kwargs["wait"])
-        self.assertEqual(15, driver.get.call_args.kwargs["timeout"])
+        driver.get.assert_not_called()
         self.assertTrue(result["marker_present"])
+
+    @patch("scraper_app.sources.vinted.time.sleep")
+    @patch("scraper_app.sources.vinted.click_first_matching_text", return_value="")
+    @patch("scraper_app.sources.vinted.emit_vinted_login_required_signal")
+    @patch("scraper_app.sources.vinted.emit_vinted_access_signal")
+    @patch("scraper_app.sources.vinted.wait_for_vinted_access_status")
+    @patch("scraper_app.sources.vinted.consume_stop_after_current_item_request", return_value=False)
+    @patch("scraper_app.sources.vinted.consume_vinted_login_confirmed_request", return_value=False)
+    def test_wait_for_vinted_login_auto_recovers_after_manual_login_without_gui_confirmation(
+        self,
+        _mocked_confirmed,
+        _mocked_stop,
+        mocked_wait_for_status,
+        _mocked_emit_access,
+        mocked_emit_required,
+        _mocked_cookie_click,
+        _mocked_sleep,
+    ) -> None:
+        mocked_wait_for_status.side_effect = [
+            {
+                "marker_present": True,
+                "expected_alt": "bonaccarla",
+                "current_url": "https://www.vinted.it/",
+                "checked_at": "2026-07-22T10:00:00",
+            },
+            {
+                "marker_present": True,
+                "expected_alt": "bonaccarla",
+                "current_url": "https://www.vinted.it/items/123",
+                "checked_at": "2026-07-22T10:00:01",
+            },
+        ]
+        driver = Mock()
+
+        result = _wait_for_vinted_login_if_needed(
+            driver,
+            {
+                "marker_present": False,
+                "expected_alt": "bonaccarla",
+                "current_url": "https://www.vinted.it/items/123",
+                "checked_at": "2026-07-22T09:59:00",
+            },
+            revisit_url="https://www.vinted.it/items/123",
+        )
+
+        mocked_emit_required.assert_called_once()
+        driver.get.assert_called_once_with(
+            "https://www.vinted.it/items/123",
+            wait=Wait.SHORT,
+            timeout=15,
+        )
+        self.assertTrue(result["marker_present"])
+        self.assertEqual("https://www.vinted.it/items/123", result["current_url"])
 
     def test_card_payload_extracts_name_price_and_clean_link(self) -> None:
         row = _card_payload_to_row(
@@ -740,8 +792,10 @@ class VintedTests(unittest.TestCase):
     @patch("scraper_app.sources.vinted.wait_for_vinted_access_status", return_value={"marker_present": True})
     @patch("scraper_app.sources.vinted.click_first_matching_text", return_value="")
     @patch("scraper_app.sources.vinted._wait_for_vinted_detail_page_ready")
+    @patch("scraper_app.sources.vinted._like_vinted_deal_if_needed", return_value={"favorite_clicked": True, "favorite_action": "clicked"})
     def test_priority_detail_timeout_skips_listing_without_blocking(
         self,
+        _mocked_like,
         _mocked_ready,
         _mocked_cookie,
         _mocked_access,
@@ -779,6 +833,82 @@ class VintedTests(unittest.TestCase):
         self.assertEqual(1, meta["enriched_count"])
         self.assertEqual("detail_timeout", rows[0]["detail_error"])
         self.assertFalse(rows[0].get("deal_hunter_match", False))
+        _mocked_like.assert_not_called()
+
+    @patch("scraper_app.sources.vinted._like_vinted_deal_if_needed", return_value={"favorite_clicked": True, "favorite_action": "clicked"})
+    @patch("scraper_app.sources.vinted._wait_for_vinted_login_if_needed", return_value={"marker_present": True})
+    @patch("scraper_app.sources.vinted.wait_for_vinted_access_status", return_value={"marker_present": True})
+    @patch("scraper_app.sources.vinted.click_first_matching_text", return_value="")
+    @patch("scraper_app.sources.vinted._wait_for_vinted_detail_page_ready")
+    @patch(
+        "scraper_app.sources.vinted._build_vinted_detail_row",
+        return_value={
+            "source": "vinted",
+            "item_id": "9425130935",
+            "name": "Charm Pandora",
+            "link": "https://www.vinted.it/items/9425130935-charm-pandora",
+            "favorite_count": 80,
+            "evaluation_label": "da valutare assolutamente",
+            "deal_hunter_candidate": True,
+            "deal_hunter_match": True,
+        },
+    )
+    def test_priority_detail_likes_confirmed_deal_after_extraction(
+        self,
+        _mocked_build_detail,
+        _mocked_ready,
+        _mocked_cookie,
+        _mocked_access,
+        _mocked_login,
+        mocked_like,
+    ) -> None:
+        driver = Mock()
+        rows = [
+            {
+                "source": "vinted",
+                "item_id": "9425130935",
+                "name": "Charm Pandora",
+                "link": "https://www.vinted.it/items/9425130935-charm-pandora",
+                "search_term": "charm",
+                "search_url": "https://www.vinted.it/catalog?search_text=charm",
+                "favorite_count": 80,
+                "evaluation_label": "da valutare assolutamente",
+                "deal_hunter_candidate": True,
+                "deal_hunter_match": False,
+            }
+        ]
+
+        meta = _enrich_vinted_priority_rows(
+            driver,
+            rows,
+            {
+                "db_path": ":memory:",
+                "deal_hunter_enabled": True,
+                "deal_hunter_min_favorites": 70,
+                "deal_hunter_max_age_hours": 24,
+                "detail_item_timeout_seconds": 60,
+            },
+        )
+
+        self.assertEqual(1, meta["enriched_count"])
+        mocked_like.assert_called_once()
+        self.assertTrue(rows[0]["favorite_clicked"])
+        self.assertEqual("clicked", rows[0]["favorite_action"])
+
+    def test_click_vinted_favourite_button_clicks_when_not_already_pressed(self) -> None:
+        driver = Mock()
+        driver.run_js.side_effect = [
+            {"found": True, "pressed": False, "label": "Aggiungi ai preferiti", "count": "74"},
+            True,
+            {"found": True, "pressed": True, "label": "Aggiunto ai preferiti", "count": "75"},
+        ]
+
+        result = _click_vinted_favourite_button(driver, action_delay_seconds=0)
+
+        self.assertTrue(result["favorite_button_found"])
+        self.assertTrue(result["favorite_clicked"])
+        self.assertEqual("clicked", result["favorite_action"])
+        self.assertEqual("75", result["favorite_count_text"])
 
     def test_deal_hunter_does_not_extract_hot_listing_below_min_likes(self) -> None:
         driver = Mock()

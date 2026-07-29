@@ -3,6 +3,7 @@ from pathlib import Path
 
 from .sources.subito_contact import run_subito_bulk_contact_action, run_subito_contact_action
 from .sources.vinted_offer import run_vinted_action_offer_batch, run_vinted_offer_action
+from .sources.vinted_upload import run_vinted_upload_action, run_vinted_upload_batch
 
 
 def run_contact_action(source: str, **kwargs) -> dict:
@@ -57,6 +58,38 @@ def run_contact_action(source: str, **kwargs) -> dict:
             )
         return run_vinted_action_offer_batch(
             offers=items,
+            delay_between_seconds=int(kwargs.get("delay_between_seconds", 2)),
+            **common_kwargs,
+        )
+
+    if source == "vinted_upload":
+        items = _resolve_vinted_upload_items(kwargs)
+        common_kwargs = {
+            "submit": bool(kwargs.get("submit", False)),
+            "keep_browser_open": bool(kwargs.get("keep_browser_open", True)),
+            "keep_open_seconds": int(kwargs.get("keep_open_seconds", 0)),
+            "slow_mode": bool(kwargs.get("slow_mode", False)),
+            "action_delay_seconds": float(kwargs.get("action_delay_seconds", 1.5)),
+            "page_settle_seconds": float(kwargs.get("page_settle_seconds", 3.0)),
+            "browser_mode": kwargs.get("browser_mode", "chrome_normale"),
+            "browser_user_data_dir": kwargs.get("browser_user_data_dir", ""),
+            "browser_profile_directory": kwargs.get("browser_profile_directory", "Default"),
+        }
+        if len(items) == 1:
+            item = items[0]
+            return run_vinted_upload_action(
+                title=str(item.get("title", "") or ""),
+                description=str(item.get("description", "") or ""),
+                price=item.get("price", ""),
+                category=str(item.get("category", "") or ""),
+                brand=str(item.get("brand", "") or ""),
+                condition=str(item.get("condition", "") or ""),
+                material=str(item.get("material", "") or ""),
+                photo_paths=list(item.get("photo_paths", []) or []),
+                **common_kwargs,
+            )
+        return run_vinted_upload_batch(
+            items=items,
             delay_between_seconds=int(kwargs.get("delay_between_seconds", 2)),
             **common_kwargs,
         )
@@ -144,4 +177,75 @@ def _read_vinted_offer_items_file(path: Path) -> list[dict]:
         value = line.strip()
         if value:
             items.append({"link": value, "item_id": "", "base_price": "", "base_total_price": ""})
+    return items
+
+
+def _resolve_vinted_upload_items(kwargs: dict) -> list[dict]:
+    items_file = str(kwargs.get("items_file", "") or kwargs.get("links_file", "") or "").strip()
+    title = str(kwargs.get("title", "") or "").strip()
+    description = str(kwargs.get("description", "") or "").strip()
+    price = kwargs.get("price", "")
+    category = str(kwargs.get("category", "") or "").strip()
+    brand = str(kwargs.get("brand", "") or "").strip()
+    condition = str(kwargs.get("condition", "") or "").strip()
+    material = str(kwargs.get("material", "") or "").strip()
+    photo_paths = list(kwargs.get("photo_paths", []) or [])
+
+    if items_file:
+        return _read_vinted_upload_items_file(Path(items_file))
+    if title and description and str(price or "").strip() and category and brand and condition and material and photo_paths:
+        return [{
+            "title": title,
+            "description": description,
+            "price": price,
+            "category": category,
+            "brand": brand,
+            "condition": condition,
+            "material": material,
+            "photo_paths": photo_paths,
+        }]
+
+    raise ValueError("Serve un items_file oppure titolo/descrizione/prezzo/categoria/brand/condizione/materiale/foto per l'upload Vinted.")
+
+
+def _read_vinted_upload_items_file(path: Path) -> list[dict]:
+    if not path.exists():
+        raise ValueError(f"Items file non trovato: {path}")
+
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        raise ValueError(f"Items file vuoto: {path}")
+
+    payload = json.loads(content)
+    raw_items = payload.get("items", []) if isinstance(payload, dict) else payload
+    if not isinstance(raw_items, list):
+        raise ValueError(f"Items file non valido: {path}")
+
+    items: list[dict] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        title = str(raw_item.get("title", "") or "").strip()
+        description = str(raw_item.get("description", "") or "").strip()
+        price = raw_item.get("price", "")
+        category = str(raw_item.get("category", "") or "").strip()
+        brand = str(raw_item.get("brand", "") or "").strip()
+        condition = str(raw_item.get("condition", "") or "").strip()
+        material = str(raw_item.get("material", "") or "").strip()
+        photo_paths = [str(path).strip() for path in list(raw_item.get("photo_paths", []) or []) if str(path).strip()]
+        if title and description and str(price or "").strip() and category and brand and condition and material and photo_paths:
+            items.append(
+                {
+                    "title": title,
+                    "description": description,
+                    "price": price,
+                    "category": category,
+                    "brand": brand,
+                    "condition": condition,
+                    "material": material,
+                    "photo_paths": photo_paths,
+                }
+            )
+    if not items:
+        raise ValueError(f"Items file senza articoli validi: {path}")
     return items

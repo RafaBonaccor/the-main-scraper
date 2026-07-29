@@ -69,6 +69,7 @@ def run_vinted_scraper(
     deal_hunter_min_favorites: int = 0,
     deal_hunter_max_age_hours: float = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
     exclude_known_items: bool = True,
+    auto_submit_offers: bool = True,
     db_path: str = str(DEFAULT_VINTED_DB_PATH),
     ui_result_json: str = "",
     browser_mode: str = "chrome_normale",
@@ -109,6 +110,7 @@ def run_vinted_scraper(
             normalized_deal_hunter_max_age_hours,
         ),
         "exclude_known_items": bool(exclude_known_items),
+        "auto_submit_offers": bool(auto_submit_offers),
         "db_path": db_path,
         "ui_result_json": ui_result_json,
         "browser_mode": browser_mode,
@@ -764,6 +766,154 @@ return '';
     return normalize_whitespace(str(payload or ""))
 
 
+def _read_vinted_favourite_button_state(driver: Driver) -> dict[str, object]:
+    payload = driver.run_js(
+        """
+const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+const button = document.querySelector('[data-testid="favourite-button"]');
+if (!button) {
+  return { found: false, pressed: false, label: '', count: '' };
+}
+const countNode = button.querySelector('[data-testid="favourite-count-text"]');
+return {
+  found: true,
+  pressed: String(button.getAttribute('aria-pressed') || '').toLowerCase() === 'true',
+  label: clean(button.getAttribute('aria-label') || ''),
+  count: clean(countNode ? (countNode.innerText || countNode.textContent || '') : ''),
+};
+        """
+    )
+    if not isinstance(payload, dict):
+        return {"found": False, "pressed": False, "label": "", "count": ""}
+    return {
+        "found": bool(payload.get("found", False)),
+        "pressed": bool(payload.get("pressed", False)),
+        "label": normalize_whitespace(str(payload.get("label", "") or "")),
+        "count": normalize_whitespace(str(payload.get("count", "") or "")),
+    }
+
+
+def _click_vinted_favourite_button(
+    driver: Driver,
+    action_delay_seconds: float,
+    confirm_wait_seconds: float = 1.5,
+) -> dict[str, object]:
+    before = _read_vinted_favourite_button_state(driver)
+    if not before.get("found"):
+        return {
+            "favorite_button_found": False,
+            "favorite_clicked": False,
+            "favorite_action": "button_not_found",
+            "favorite_label": "",
+            "favorite_count_text": "",
+        }
+    if before.get("pressed"):
+        return {
+            "favorite_button_found": True,
+            "favorite_clicked": False,
+            "favorite_action": "already_liked",
+            "favorite_label": str(before.get("label", "") or ""),
+            "favorite_count_text": str(before.get("count", "") or ""),
+        }
+    clicked = driver.run_js(
+        """
+const button = document.querySelector('[data-testid="favourite-button"]');
+if (!button) return false;
+try {
+  button.scrollIntoView({ block: 'center', inline: 'center' });
+} catch (_error) {}
+button.click();
+button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+return true;
+        """
+    )
+    if not bool(clicked):
+        return {
+            "favorite_button_found": True,
+            "favorite_clicked": False,
+            "favorite_action": "click_failed",
+            "favorite_label": str(before.get("label", "") or ""),
+            "favorite_count_text": str(before.get("count", "") or ""),
+        }
+    time.sleep(min(max(float(action_delay_seconds or 0), 0.0), 0.35))
+    deadline = time.monotonic() + max(_nonnegative_float(confirm_wait_seconds, 1.5), 0.1)
+    after = _read_vinted_favourite_button_state(driver)
+    while not bool(after.get("pressed")) and time.monotonic() < deadline:
+        time.sleep(0.1)
+        after = _read_vinted_favourite_button_state(driver)
+    return {
+        "favorite_button_found": True,
+        "favorite_clicked": bool(after.get("pressed")),
+        "favorite_action": "clicked" if bool(after.get("pressed")) else "click_unconfirmed",
+        "favorite_label": str(after.get("label", "") or str(before.get("label", "") or "")),
+        "favorite_count_text": str(after.get("count", "") or str(before.get("count", "") or "")),
+    }
+
+
+def _like_vinted_deal_if_needed(
+    driver: Driver,
+    row: dict,
+    *,
+    current_link: str,
+    config: dict,
+    page_already_open: bool,
+) -> dict[str, object]:
+    if not bool(row.get("deal_hunter_match")):
+        return {
+            "favorite_button_found": False,
+            "favorite_clicked": False,
+            "favorite_action": "skipped_not_deal",
+        }
+    target_url = normalize_vinted_item_url(current_link or str(row.get("link", "") or ""))
+    if not target_url:
+        return {
+            "favorite_button_found": False,
+            "favorite_clicked": False,
+            "favorite_action": "skipped_missing_link",
+        }
+    try:
+        current_url = normalize_vinted_item_url(str(current_page_url(driver) or ""))
+    except Exception:
+        current_url = ""
+    try:
+        if not page_already_open or current_url != target_url:
+            driver.get(target_url, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+            _wait_for_vinted_detail_page_ready(
+                driver,
+                max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+            )
+            cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
+            if cookie_action:
+                time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
+            access_status = wait_for_vinted_access_status(
+                driver,
+                max_wait_seconds=min(max(float(config.get("page_settle_seconds", 3.0) or 0), 0.0), 0.8),
+            )
+            emit_vinted_access_signal(access_status)
+            _wait_for_vinted_login_if_needed(
+                driver,
+                access_status,
+                revisit_url=target_url,
+                action_delay_seconds=float(config.get("action_delay_seconds", 1.5) or 0),
+                page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+            )
+        result = _click_vinted_favourite_button(
+            driver,
+            action_delay_seconds=float(config.get("action_delay_seconds", 1.5) or 0),
+        )
+        if bool(result.get("favorite_clicked")):
+            print(f"[vinted-like] preferito aggiunto per {target_url}", flush=True)
+        return result
+    except Exception as exc:
+        print(f"[vinted-like] impossibile aggiungere ai preferiti {target_url}: {exc}", flush=True)
+        return {
+            "favorite_button_found": False,
+            "favorite_clicked": False,
+            "favorite_action": "error",
+            "favorite_error": normalize_whitespace(str(exc or ""))[:240],
+        }
+
+
 def _read_vinted_published_text(driver: Driver, page_text: str = "") -> str:
     payload = driver.run_js(
         """
@@ -945,6 +1095,16 @@ def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict)
         if str(enriched_row.get("detail_error", "") or "").strip() == "page_not_found":
             print(f"[vinted-detail] pagina non trovata, salto {current_link}", flush=True)
         row.update(enriched_row)
+        if str(enriched_row.get("detail_error", "") or "").strip() == "":
+            row.update(
+                _like_vinted_deal_if_needed(
+                    driver,
+                    row,
+                    current_link=current_link,
+                    config=config,
+                    page_already_open=True,
+                )
+            )
         current_label = str(row.get("evaluation_label", "") or "").strip().lower()
         if previous_label == "da valutare assolutamente" and current_label == "da valutare":
             demoted_count += 1
@@ -1404,31 +1564,33 @@ def _wait_for_vinted_login_if_needed(
     if bool(access_status.get("marker_present")):
         return access_status
     emit_vinted_login_required_signal(access_status)
+    target_url = str(revisit_url or access_status.get("current_url", "") or "").strip()
     while True:
         if consume_stop_after_current_item_request():
             raise RuntimeError("Attesa login Vinted interrotta su richiesta dell'utente.")
-        if consume_vinted_login_confirmed_request():
-            target_url = str(revisit_url or access_status.get("current_url", "") or "").strip()
-            if target_url:
-                driver.get(target_url, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
-                if "/items/" in target_url:
-                    _wait_for_vinted_detail_page_ready(
-                        driver,
-                        max_wait_seconds=float(page_settle_seconds or 0),
-                    )
-                else:
-                    _wait_for_vinted_catalog_page_ready(
-                        driver,
-                        max_wait_seconds=float(page_settle_seconds or 0),
-                    )
-                cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
-                if cookie_action:
-                    time.sleep(min(float(action_delay_seconds or 0), 0.35))
-            refreshed_status = wait_for_vinted_access_status(
+        refreshed_status = wait_for_vinted_access_status(
+            driver,
+            max_wait_seconds=min(max(float(page_settle_seconds or 0), 0.0), 0.75),
+        )
+        emit_vinted_access_signal(refreshed_status)
+        if bool(refreshed_status.get("page_not_found")):
+            return refreshed_status
+        if bool(refreshed_status.get("marker_present")):
+            return _reopen_vinted_target_after_login(
                 driver,
-                max_wait_seconds=min(max(float(page_settle_seconds or 0), 0.0), 1.0),
+                refreshed_status,
+                target_url=target_url,
+                action_delay_seconds=action_delay_seconds,
+                page_settle_seconds=page_settle_seconds,
             )
-            emit_vinted_access_signal(refreshed_status)
+        if consume_vinted_login_confirmed_request():
+            refreshed_status = _reopen_vinted_target_after_login(
+                driver,
+                refreshed_status,
+                target_url=target_url,
+                action_delay_seconds=action_delay_seconds,
+                page_settle_seconds=page_settle_seconds,
+            )
             if bool(refreshed_status.get("page_not_found")) or bool(refreshed_status.get("marker_present")):
                 return refreshed_status
             emit_vinted_login_required_signal(refreshed_status)
@@ -1437,6 +1599,38 @@ def _wait_for_vinted_login_if_needed(
 
 def emit_vinted_login_required_signal(access_status: dict[str, object]) -> None:
     print(f"__VINTED_LOGIN_REQUIRED__:{json.dumps(access_status, ensure_ascii=False)}", flush=True)
+
+
+def _reopen_vinted_target_after_login(
+    driver: Driver,
+    access_status: dict[str, object],
+    target_url: str,
+    action_delay_seconds: float = 1.5,
+    page_settle_seconds: float = 3.0,
+) -> dict[str, object]:
+    normalized_target_url = str(target_url or "").strip()
+    current_url = str(access_status.get("current_url", "") or "").strip()
+    if normalized_target_url and current_url != normalized_target_url:
+        driver.get(normalized_target_url, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+        if "/items/" in normalized_target_url:
+            _wait_for_vinted_detail_page_ready(
+                driver,
+                max_wait_seconds=float(page_settle_seconds or 0),
+            )
+        else:
+            _wait_for_vinted_catalog_page_ready(
+                driver,
+                max_wait_seconds=float(page_settle_seconds or 0),
+            )
+        cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
+        if cookie_action:
+            time.sleep(min(float(action_delay_seconds or 0), 0.35))
+        access_status = wait_for_vinted_access_status(
+            driver,
+            max_wait_seconds=min(max(float(page_settle_seconds or 0), 0.0), 1.0),
+        )
+        emit_vinted_access_signal(access_status)
+    return access_status
 
 
 def _detach_vinted_browser_if_requested(driver: Driver, config: dict) -> None:

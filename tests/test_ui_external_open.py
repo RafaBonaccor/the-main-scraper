@@ -8,6 +8,8 @@ from scraper_app.ui import (
     build_vinted_deal_hunter_search_specs,
     build_vinted_search_target_url,
     detect_vinted_category_label_from_url,
+    normalize_vinted_upload_photo_paths,
+    normalize_vinted_upload_queue_item,
     open_external_target,
     resolve_vinted_category_url,
 )
@@ -90,6 +92,63 @@ class UiExternalOpenTests(unittest.TestCase):
             "Scarpe uomo",
             detect_vinted_category_label_from_url("https://www.vinted.it/catalog/1231-shoes?search_text=adidas"),
         )
+
+    def test_normalize_vinted_upload_photo_paths_dedupes_and_resolves(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            first = Path(temp_dir) / "1.jpg"
+            second = Path(temp_dir) / "2.jpg"
+            first.write_text("x", encoding="utf-8")
+            second.write_text("x", encoding="utf-8")
+
+            result = normalize_vinted_upload_photo_paths([first, str(first), second])
+
+        self.assertEqual(2, len(result))
+        self.assertEqual(str(first.resolve()), result[0])
+        self.assertEqual(str(second.resolve()), result[1])
+
+    def test_normalize_vinted_upload_queue_item_requires_core_fields(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_vinted_upload_queue_item({"title": "", "description": "x", "price": "10", "photo_paths": ["/tmp/x.jpg"]})
+
+        with self.assertRaises(ValueError):
+            normalize_vinted_upload_queue_item({"title": "Charm", "description": "", "price": "10", "photo_paths": ["/tmp/x.jpg"]})
+
+        with self.assertRaises(ValueError):
+            normalize_vinted_upload_queue_item({"title": "Charm", "description": "Test", "price": "", "photo_paths": ["/tmp/x.jpg"]})
+
+        with self.assertRaises(ValueError):
+            normalize_vinted_upload_queue_item({"title": "Charm", "description": "Test", "price": "10", "category": "", "brand": "No Label", "condition": "Ottime", "material": "Acciaio", "photo_paths": ["/tmp/x.jpg"]})
+
+    def test_normalize_vinted_upload_queue_item_returns_stable_payload(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            photo = Path(temp_dir) / "1.jpg"
+            photo.write_text("x", encoding="utf-8")
+
+            payload = normalize_vinted_upload_queue_item(
+                {
+                    "id": "item-1",
+                    "created_at": "2026-07-26T10:00:00",
+                    "title": "Charm Pandora",
+                    "description": "Descrizione completa",
+                    "price": "12,50",
+                    "category": "Braccialetti",
+                    "brand": "No Label",
+                    "condition": "Ottime",
+                    "material": "Acciaio",
+                    "photo_paths": [str(photo)],
+                }
+            )
+
+        self.assertEqual("item-1", payload["id"])
+        self.assertEqual("2026-07-26T10:00:00", payload["created_at"])
+        self.assertEqual("Charm Pandora", payload["title"])
+        self.assertEqual("Descrizione completa", payload["description"])
+        self.assertEqual("12,50", payload["price"])
+        self.assertEqual("Braccialetti", payload["category"])
+        self.assertEqual("No Label", payload["brand"])
+        self.assertEqual("Ottime", payload["condition"])
+        self.assertEqual("Acciaio", payload["material"])
+        self.assertEqual([str(photo.resolve())], payload["photo_paths"])
 
     def test_build_vinted_deal_hunter_search_specs_uses_category_and_dedupes_terms(self) -> None:
         specs = build_vinted_deal_hunter_search_specs(
@@ -302,6 +361,9 @@ class UiExternalOpenTests(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             app = object.__new__(ScraperApp)
             app.ui_settings_path = Path(temp_dir) / "ui_settings.json"
+            app.browser_mode_var = self._Var("sessione_persistente")
+            app.browser_user_data_dir_var = self._Var("/Users/test/Library/Application Support/Google/Chrome")
+            app.browser_profile_directory_var = self._Var("Profile 2")
             app.vinted_discord_notifications_var = self._Var(True)
             app.vinted_discord_webhook_url_var = self._Var("https://discord.com/api/webhooks/test/token")
             app._persist_ui_settings_after_id = None
@@ -312,21 +374,29 @@ class UiExternalOpenTests(unittest.TestCase):
 
         self.assertIn("https://discord.com/api/webhooks/test/token", payload)
         self.assertIn("vinted_discord_notifications_enabled", payload)
+        self.assertIn("/Users/test/Library/Application Support/Google/Chrome", payload)
+        self.assertIn("\"browser_profile_directory\": \"Profile 2\"", payload)
 
     def test_load_persisted_ui_settings_restores_discord_webhook(self) -> None:
         with TemporaryDirectory() as temp_dir:
             app = object.__new__(ScraperApp)
             app.ui_settings_path = Path(temp_dir) / "ui_settings.json"
+            app.browser_mode_var = self._Var("chrome_normale")
+            app.browser_user_data_dir_var = self._Var("")
+            app.browser_profile_directory_var = self._Var("Default")
             app.vinted_discord_notifications_var = self._Var(False)
             app.vinted_discord_webhook_url_var = self._Var("")
             app._loading_persisted_ui_settings = False
             app.ui_settings_path.write_text(
-                '{"vinted_discord_notifications_enabled": true, "vinted_discord_webhook_url": "https://discord.com/api/webhooks/test/token"}',
+                '{"browser_mode": "sessione_persistente", "browser_user_data_dir": "/Users/test/Library/Application Support/Google/Chrome", "browser_profile_directory": "Profile 2", "vinted_discord_notifications_enabled": true, "vinted_discord_webhook_url": "https://discord.com/api/webhooks/test/token"}',
                 encoding="utf-8",
             )
 
             ScraperApp._load_persisted_ui_settings(app)
 
+        self.assertEqual("sessione_persistente", app.browser_mode_var.get())
+        self.assertEqual("/Users/test/Library/Application Support/Google/Chrome", app.browser_user_data_dir_var.get())
+        self.assertEqual("Profile 2", app.browser_profile_directory_var.get())
         self.assertTrue(app.vinted_discord_notifications_var.get())
         self.assertEqual("https://discord.com/api/webhooks/test/token", app.vinted_discord_webhook_url_var.get())
 
@@ -335,6 +405,9 @@ class UiExternalOpenTests(unittest.TestCase):
             app = object.__new__(ScraperApp)
             app.root = self._Root()
             app.ui_settings_path = Path(temp_dir) / "ui_settings.json"
+            app.browser_mode_var = self._Var("sessione_persistente")
+            app.browser_user_data_dir_var = self._Var("/Users/test/Library/Application Support/Google/Chrome")
+            app.browser_profile_directory_var = self._Var("Profile 2")
             app.vinted_discord_notifications_var = self._Var(True)
             app.vinted_discord_webhook_url_var = self._Var("https://discord.com/api/webhooks/test/token")
             app._persist_ui_settings_after_id = None

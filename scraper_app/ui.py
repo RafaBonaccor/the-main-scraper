@@ -10,8 +10,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
-from urllib.parse import quote_plus
-
 from .browser_runtime import (
     browser_mode_requires_custom_dir,
     browser_mode_uses_profile,
@@ -65,6 +63,21 @@ from .vinted_deals import (
     normalize_vinted_deal_hunter_min_favorites,
     normalize_vinted_deal_hunter_terms,
     vinted_deal_hunter_enabled,
+)
+from .vinted_gateway import (
+    VINTED_CATEGORY_PRESETS,
+    build_vinted_deal_hunter_search_specs,
+    build_vinted_search_target_url,
+    detect_vinted_category_label_from_url,
+    format_vinted_search_target_label,
+    resolve_vinted_category_url,
+)
+from .vinted_ai_studio import (
+    DEFAULT_VINTED_AI_MODEL,
+    DEFAULT_VINTED_AI_OUTPUT_DIRNAME,
+    DEFAULT_VINTED_AI_SIZE,
+    VINTED_AI_SUPPORTED_SIZES,
+    generate_vinted_ai_variants,
 )
 
 
@@ -146,17 +159,6 @@ RESULT_SORT_COLUMN_MAP = {
     "company": "Azienda",
     "schedule": "Orario",
 }
-VINTED_CATEGORY_PRESETS = (
-    ("Nessuna categoria rapida", ""),
-    ("Monitoraggio", "__all_categories__"),
-    ("Accessori donna", "https://www.vinted.it/catalog/1187-accessories"),
-    ("Accessori uomo", "https://www.vinted.it/catalog/82-accessories"),
-    ("Elettronica", "https://www.vinted.it/catalog/2994-electronics"),
-    ("Gioielli donna", "https://www.vinted.it/catalog/21-jewellery"),
-    ("Scarpe donna", "https://www.vinted.it/catalog/16-shoes"),
-    ("Scarpe uomo", "https://www.vinted.it/catalog/1231-shoes"),
-)
-VINTED_CATEGORY_PRESET_LOOKUP = {label: url for label, url in VINTED_CATEGORY_PRESETS}
 VINTED_SIGNAL_FILTER_VALUES = (
     "tutti",
     "procacciatore affari",
@@ -164,31 +166,68 @@ VINTED_SIGNAL_FILTER_VALUES = (
     "da valutare",
     "da valutare assolutamente",
 )
-VINTED_MONITORING_CATEGORY_LABEL = "Monitoraggio"
-VINTED_MONITORING_DEFAULT_TERMS = (
-    "nike",
-    "adidas",
-    "jordan",
-    "new balance",
-    "apple",
-    "airpods",
-    "magsafe",
-    "pokemon",
-    "pandora",
-    "swarovski",
-    "gucci",
-    "prada",
-)
 
 
-def _iter_vinted_monitoring_categories() -> list[tuple[str, str]]:
-    return [
-        (label, url)
-        for label, url in VINTED_CATEGORY_PRESETS
-        if url and url != "__all_categories__"
-    ]
+def normalize_vinted_upload_photo_paths(paths: object) -> list[str]:
+    if isinstance(paths, (str, Path)):
+        raw_values = [paths]
+    elif isinstance(paths, (list, tuple, set)):
+        raw_values = list(paths)
+    else:
+        raw_values = []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+        resolved = str(Path(value).expanduser().resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        normalized.append(resolved)
+    return normalized
 
 
+def normalize_vinted_upload_queue_item(payload: dict[str, object]) -> dict[str, object]:
+    title = str(payload.get("title", "") or "").strip()
+    description = str(payload.get("description", "") or "").strip()
+    price = str(payload.get("price", "") or "").strip()
+    category = str(payload.get("category", "") or "").strip()
+    brand = str(payload.get("brand", "") or "").strip()
+    condition = str(payload.get("condition", "") or "").strip()
+    material = str(payload.get("material", "") or "").strip()
+    photo_paths = normalize_vinted_upload_photo_paths(payload.get("photo_paths", []))
+    if not title:
+        raise ValueError("Il titolo e obbligatorio.")
+    if not description:
+        raise ValueError("La descrizione e obbligatoria.")
+    if not price:
+        raise ValueError("Il prezzo e obbligatorio.")
+    if not category:
+        raise ValueError("La categoria e obbligatoria.")
+    if not brand:
+        raise ValueError("Il brand e obbligatorio.")
+    if not condition:
+        raise ValueError("La condizione e obbligatoria.")
+    if not material:
+        raise ValueError("Il materiale e obbligatorio.")
+    if not photo_paths:
+        raise ValueError("Seleziona almeno una foto.")
+    item_id = str(payload.get("id", "") or "").strip() or datetime.now().strftime("upload-%Y%m%d%H%M%S%f")
+    created_at = str(payload.get("created_at", "") or "").strip() or datetime.now().isoformat(timespec="seconds")
+    return {
+        "id": item_id,
+        "title": title,
+        "description": description,
+        "price": price,
+        "category": category,
+        "brand": brand,
+        "condition": condition,
+        "material": material,
+        "photo_paths": photo_paths,
+        "created_at": created_at,
+    }
 def open_external_target(target: object) -> bool:
     value = str(target or "").strip()
     if not value:
@@ -204,107 +243,6 @@ def open_external_target(target: object) -> bool:
         start_new_session=True,
     )
     return True
-
-
-def resolve_vinted_category_url(selection: object) -> str:
-    value = str(selection or "").strip()
-    if not value:
-        return ""
-    return str(VINTED_CATEGORY_PRESET_LOOKUP.get(value, value) or "").strip()
-
-
-def build_vinted_search_target_url(raw_search: object, category_selection: object = "") -> str:
-    search = str(raw_search or "").strip()
-    category_url = resolve_vinted_category_url(category_selection)
-    if search.lower().startswith(("http://", "https://")):
-        return search
-    if category_url:
-        if not search:
-            return category_url
-        separator = "&" if "?" in category_url else "?"
-        return f"{category_url}{separator}search_text={quote_plus(search)}"
-    if not search:
-        return "https://www.vinted.it/catalog"
-    return f"https://www.vinted.it/catalog?search_text={quote_plus(search)}"
-
-
-def format_vinted_search_target_label(raw_search: object, category_selection: object = "") -> str:
-    search = str(raw_search or "").strip()
-    category_label = str(category_selection or "").strip()
-    category_url = resolve_vinted_category_url(category_selection)
-    if search.lower().startswith(("http://", "https://")):
-        return search
-    if search and category_url:
-        return f"{search} | {category_label}"
-    if category_url:
-        return category_label or category_url
-    return search
-
-
-def detect_vinted_category_label_from_url(url: object) -> str:
-    value = str(url or "").strip()
-    if not value:
-        return VINTED_CATEGORY_PRESETS[0][0]
-    for label, category_url in VINTED_CATEGORY_PRESETS[1:]:
-        if category_url and value.startswith(category_url):
-            return label
-    return VINTED_CATEGORY_PRESETS[0][0]
-
-
-def build_vinted_deal_hunter_search_specs(
-    raw_terms: object,
-    category_selection: object,
-    max_results: object,
-    max_price: float | None = None,
-) -> list[dict]:
-    try:
-        normalized_max_results = max(int(max_results), 0)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Max risultati per ricerca del procacciatore affari non valido.") from exc
-    category_label = str(category_selection or "").strip() or VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL
-    normalized_terms = normalize_vinted_deal_hunter_terms(raw_terms, use_default_when_empty=False)
-    if category_label == VINTED_MONITORING_CATEGORY_LABEL:
-        if not normalized_terms:
-            normalized_terms = list(VINTED_MONITORING_DEFAULT_TERMS)
-        monitoring_specs: list[dict] = []
-        monitoring_categories = _iter_vinted_monitoring_categories()
-        for resolved_category_label, _resolved_category_url in monitoring_categories:
-            for term in normalized_terms:
-                resolved_search = build_vinted_search_target_url(term, resolved_category_label)
-                monitoring_specs.append(
-                    {
-                        "search": resolved_search,
-                        "display_search": f"{term} | {resolved_category_label} | {VINTED_MONITORING_CATEGORY_LABEL}",
-                        "category_label": VINTED_MONITORING_CATEGORY_LABEL,
-                        "max_results": normalized_max_results,
-                        "max_price": max_price,
-                    }
-                )
-        return monitoring_specs
-    if not normalized_terms:
-        resolved_search = build_vinted_search_target_url("", category_label)
-        return [
-            {
-                "search": resolved_search,
-                "display_search": format_vinted_search_target_label("", category_label) or resolved_search,
-                "category_label": category_label if resolve_vinted_category_url(category_label) else "",
-                "max_results": normalized_max_results,
-                "max_price": max_price,
-            }
-        ]
-    specs: list[dict] = []
-    for term in normalized_terms:
-        resolved_search = build_vinted_search_target_url(term, category_label)
-        specs.append(
-            {
-                "search": resolved_search,
-                "display_search": format_vinted_search_target_label(term, category_label) or resolved_search,
-                "category_label": category_label if resolve_vinted_category_url(category_label) else "",
-                "max_results": normalized_max_results,
-                "max_price": max_price,
-            }
-        )
-    return specs
 
 RESULT_SORT_DEFAULT_DESC = {
     "Prezzo Vinted": False,
@@ -482,6 +420,29 @@ class ScraperApp:
         self.vinted_search_preview_var = tk.StringVar()
         self.vinted_status_var = tk.StringVar(value="Pronto per una nuova ricerca Vinted.")
         self.vinted_deal_hunter_status_var = tk.StringVar(value="Procacciatore affari disattivato.")
+        self.vinted_upload_title_var = tk.StringVar()
+        self.vinted_upload_price_var = tk.StringVar()
+        self.vinted_upload_category_var = tk.StringVar()
+        self.vinted_upload_brand_var = tk.StringVar()
+        self.vinted_upload_condition_var = tk.StringVar()
+        self.vinted_upload_material_var = tk.StringVar()
+        self.vinted_upload_photos_var = tk.StringVar(value="Nessuna foto selezionata.")
+        self.vinted_upload_status_var = tk.StringVar(value="Coda upload Vinted pronta.")
+        self.vinted_upload_submit_var = tk.BooleanVar(value=False)
+        self.vinted_ai_model_var = tk.StringVar(value=DEFAULT_VINTED_AI_MODEL)
+        self.vinted_ai_size_var = tk.StringVar(value=DEFAULT_VINTED_AI_SIZE)
+        self.vinted_ai_variants_var = tk.StringVar(value="1")
+        self.vinted_ai_output_dir_var = tk.StringVar(
+            value=str((script_path.parent / "output" / DEFAULT_VINTED_AI_OUTPUT_DIRNAME).resolve())
+        )
+        self.vinted_ai_reference_photos_var = tk.StringVar(value="Nessuna foto AI selezionata.")
+        self.vinted_ai_generated_photos_var = tk.StringVar(value="Nessuna immagine AI generata.")
+        self.vinted_ai_status_var = tk.StringVar(value="AI Listing Studio pronto.")
+        self.vinted_ai_prompt_seed = (
+            "Create a cleaner marketplace-ready product photo for Vinted. "
+            "Keep the item identity accurate, improve lighting, remove distractions, "
+            "use a neutral background, and keep the framing suitable for a vertical fashion listing."
+        )
         self.vinted_profile_session_var = tk.StringVar(value="Controllo in corso...")
         self.vinted_profile_cookies_var = tk.StringVar(value="-")
         self.vinted_profile_last_import_var = tk.StringVar(value="-")
@@ -490,6 +451,12 @@ class ScraperApp:
         self.vinted_saved_search_terms: list[str] = []
         self.vinted_saved_runs: list[dict[str, int | str]] = []
         self.vinted_saved_run_lookup: dict[str, dict[str, int | str]] = {}
+        self.vinted_upload_manifest_path = (script_path.parent / "data" / "vinted_upload_items.json").resolve()
+        self.vinted_upload_queue: list[dict[str, object]] = []
+        self.vinted_upload_selected_photo_paths: list[str] = []
+        self.vinted_ai_reference_photo_paths: list[str] = []
+        self.vinted_ai_generated_photo_paths: list[str] = []
+        self.vinted_ai_generation_active = False
 
         self.subito_query_var = tk.StringVar()
         self.subito_region_var = tk.StringVar(value="lazio")
@@ -581,6 +548,7 @@ class ScraperApp:
         self._loading_persisted_ui_settings = False
 
         self._load_persisted_ui_settings()
+        self._load_vinted_upload_queue()
 
         self.root.title("The Main Scraper")
         self.root.geometry("1360x920")
@@ -617,9 +585,41 @@ class ScraperApp:
 
     def _persisted_ui_settings_payload(self) -> dict[str, object]:
         return {
-            "vinted_discord_notifications_enabled": bool(self.vinted_discord_notifications_var.get()),
-            "vinted_discord_webhook_url": str(self.vinted_discord_webhook_url_var.get() or "").strip(),
+            "browser_mode": self._safe_var_string("browser_mode_var"),
+            "browser_user_data_dir": self._safe_var_string("browser_user_data_dir_var"),
+            "browser_profile_directory": self._safe_var_string("browser_profile_directory_var", "Default"),
+            "vinted_deal_hunter_terms": self._safe_var_string("vinted_deal_hunter_terms_var"),
+            "vinted_deal_hunter_category": self._safe_var_string("vinted_deal_hunter_category_var"),
+            "vinted_deal_hunter_max_results": self._safe_var_string("vinted_deal_hunter_max_results_var"),
+            "vinted_deal_hunter_max_price": self._safe_var_string("vinted_deal_hunter_max_price_var"),
+            "vinted_deal_hunter_min_favorites": self._safe_var_string("vinted_deal_hunter_min_favorites_var"),
+            "vinted_deal_hunter_max_age_hours": self._safe_var_string("vinted_deal_hunter_max_age_hours_var"),
+            "vinted_deal_hunter_loop_seconds": self._safe_var_string("vinted_deal_hunter_cycle_seconds_var"),
+            "vinted_discord_notifications_enabled": self._safe_var_bool("vinted_discord_notifications_var"),
+            "vinted_discord_webhook_url": self._safe_var_string("vinted_discord_webhook_url_var"),
+            "vinted_ai_model": self._safe_var_string("vinted_ai_model_var", DEFAULT_VINTED_AI_MODEL),
+            "vinted_ai_size": self._safe_var_string("vinted_ai_size_var", DEFAULT_VINTED_AI_SIZE),
+            "vinted_ai_variants": self._safe_var_string("vinted_ai_variants_var", "1"),
+            "vinted_ai_output_dir": self._safe_var_string("vinted_ai_output_dir_var"),
+            "vinted_ai_prompt": self._current_vinted_ai_prompt_fallback(),
         }
+
+    def _safe_var_string(self, attr_name: str, default: str = "") -> str:
+        variable = getattr(self, attr_name, None)
+        if variable is None or not hasattr(variable, "get"):
+            return default
+        return str(variable.get() or "").strip()
+
+    def _safe_var_bool(self, attr_name: str, default: bool = False) -> bool:
+        variable = getattr(self, attr_name, None)
+        if variable is None or not hasattr(variable, "get"):
+            return default
+        return bool(variable.get())
+
+    def _current_vinted_ai_prompt_fallback(self) -> str:
+        if hasattr(self, "vinted_ai_prompt_widget"):
+            return str(self.vinted_ai_prompt_widget.get("1.0", "end-1c") or "").strip()
+        return str(getattr(self, "vinted_ai_prompt_seed", "") or "").strip()
 
     def _load_persisted_ui_settings(self) -> None:
         if not self.ui_settings_path.exists():
@@ -632,12 +632,57 @@ class ScraperApp:
             return
         self._loading_persisted_ui_settings = True
         try:
+            browser_mode = payload.get("browser_mode")
+            if isinstance(browser_mode, str) and browser_mode.strip():
+                self.browser_mode_var.set(browser_mode.strip())
+            browser_user_data_dir = payload.get("browser_user_data_dir")
+            if isinstance(browser_user_data_dir, str) and browser_user_data_dir.strip():
+                self.browser_user_data_dir_var.set(browser_user_data_dir.strip())
+            browser_profile_directory = payload.get("browser_profile_directory")
+            if isinstance(browser_profile_directory, str) and browser_profile_directory.strip():
+                self.browser_profile_directory_var.set(browser_profile_directory.strip())
+            deal_hunter_terms = payload.get("vinted_deal_hunter_terms")
+            if isinstance(deal_hunter_terms, str):
+                self.vinted_deal_hunter_terms_var.set(deal_hunter_terms.strip())
+            deal_hunter_category = payload.get("vinted_deal_hunter_category")
+            if isinstance(deal_hunter_category, str) and deal_hunter_category.strip():
+                self.vinted_deal_hunter_category_var.set(deal_hunter_category.strip())
+            deal_hunter_max_results = payload.get("vinted_deal_hunter_max_results")
+            if isinstance(deal_hunter_max_results, str) and deal_hunter_max_results.strip():
+                self.vinted_deal_hunter_max_results_var.set(deal_hunter_max_results.strip())
+            deal_hunter_max_price = payload.get("vinted_deal_hunter_max_price")
+            if isinstance(deal_hunter_max_price, str):
+                self.vinted_deal_hunter_max_price_var.set(deal_hunter_max_price.strip())
+            deal_hunter_min_favorites = payload.get("vinted_deal_hunter_min_favorites")
+            if isinstance(deal_hunter_min_favorites, str) and deal_hunter_min_favorites.strip():
+                self.vinted_deal_hunter_min_favorites_var.set(deal_hunter_min_favorites.strip())
+            deal_hunter_max_age_hours = payload.get("vinted_deal_hunter_max_age_hours")
+            if isinstance(deal_hunter_max_age_hours, str) and deal_hunter_max_age_hours.strip():
+                self.vinted_deal_hunter_max_age_hours_var.set(deal_hunter_max_age_hours.strip())
+            deal_hunter_loop_seconds = payload.get("vinted_deal_hunter_loop_seconds")
+            if isinstance(deal_hunter_loop_seconds, str) and deal_hunter_loop_seconds.strip():
+                self.vinted_deal_hunter_cycle_seconds_var.set(deal_hunter_loop_seconds.strip())
             webhook_url = payload.get("vinted_discord_webhook_url")
             if isinstance(webhook_url, str):
                 self.vinted_discord_webhook_url_var.set(webhook_url.strip())
             enabled = payload.get("vinted_discord_notifications_enabled")
             if isinstance(enabled, bool):
                 self.vinted_discord_notifications_var.set(enabled)
+            ai_model = payload.get("vinted_ai_model")
+            if isinstance(ai_model, str) and ai_model.strip():
+                self.vinted_ai_model_var.set(ai_model.strip())
+            ai_size = payload.get("vinted_ai_size")
+            if isinstance(ai_size, str) and ai_size.strip():
+                self.vinted_ai_size_var.set(ai_size.strip())
+            ai_variants = payload.get("vinted_ai_variants")
+            if isinstance(ai_variants, str) and ai_variants.strip():
+                self.vinted_ai_variants_var.set(ai_variants.strip())
+            ai_output_dir = payload.get("vinted_ai_output_dir")
+            if isinstance(ai_output_dir, str) and ai_output_dir.strip():
+                self.vinted_ai_output_dir_var.set(ai_output_dir.strip())
+            ai_prompt = payload.get("vinted_ai_prompt")
+            if isinstance(ai_prompt, str):
+                self.vinted_ai_prompt_seed = ai_prompt.strip()
         finally:
             self._loading_persisted_ui_settings = False
 
@@ -662,9 +707,52 @@ class ScraperApp:
         except Exception:
             return
 
+    def _load_vinted_upload_queue(self) -> None:
+        self.vinted_upload_queue = []
+        if not self.vinted_upload_manifest_path.exists():
+            return
+        try:
+            payload = json.loads(self.vinted_upload_manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        items = payload.get("items", []) if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                self.vinted_upload_queue.append(normalize_vinted_upload_queue_item(item))
+            except ValueError:
+                continue
+
+    def _save_vinted_upload_queue(self) -> None:
+        payload = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "source": "vinted_upload_gui",
+            "items": self.vinted_upload_queue,
+        }
+        self.vinted_upload_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        self.vinted_upload_manifest_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     def _install_persisted_ui_setting_watchers(self) -> None:
+        self.browser_mode_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_deal_hunter_terms_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_deal_hunter_category_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_deal_hunter_max_results_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_deal_hunter_max_price_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_deal_hunter_min_favorites_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_deal_hunter_max_age_hours_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_deal_hunter_cycle_seconds_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_discord_notifications_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_discord_webhook_url_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_ai_model_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_ai_size_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_ai_variants_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_ai_output_dir_var.trace_add("write", self._schedule_persist_ui_settings)
 
     def _handle_window_close(self) -> None:
         self._persist_ui_settings()
@@ -699,6 +787,43 @@ class ScraperApp:
         style.map("Treeview.Heading", background=[("active", "#e2e8f0")])
         style.configure("Metric.TLabel", background=PANEL_BG, foreground=ACCENT, font=("Segoe UI Semibold", 11))
         style.configure("Muted.TLabel", background=PANEL_BG, foreground=MUTED, font=("Segoe UI", 9))
+
+    def _show_toast(self, message: str, *, level: str = "info", duration_ms: int = 2800) -> None:
+        text = str(message or "").strip()
+        if not text:
+            return
+        palette = {
+            "info": ("#0f172a", "#e2e8f0"),
+            "success": ("#166534", "#dcfce7"),
+            "error": ("#991b1b", "#fee2e2"),
+        }
+        foreground, background = palette.get(level, palette["info"])
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.configure(bg=background)
+        label = tk.Label(
+            toast,
+            text=text,
+            bg=background,
+            fg=foreground,
+            justify="left",
+            wraplength=320,
+            padx=14,
+            pady=10,
+            font=("Segoe UI Semibold", 10),
+        )
+        label.pack()
+        self.root.update_idletasks()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_width = self.root.winfo_width()
+        toast.update_idletasks()
+        toast_width = toast.winfo_reqwidth()
+        x = root_x + max(root_width - toast_width - 28, 16)
+        y = root_y + 28
+        toast.geometry(f"+{x}+{y}")
+        toast.after(max(int(duration_ms), 1200), toast.destroy)
 
     def _build(self) -> None:
         container = ttk.Frame(self.root, style="App.TFrame", padding=20)
@@ -986,8 +1111,326 @@ class ScraperApp:
         search_actions.columnconfigure(0, weight=2)
         search_actions.columnconfigure(1, weight=1)
 
+        upload_frame = ttk.Frame(card, style="Panel.TFrame")
+        upload_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 8))
+        upload_frame.columnconfigure(1, weight=1)
+        ttk.Label(upload_frame, text="Preparazione upload articoli", style="Metric.TLabel").grid(
+            row=0,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            pady=(0, 6),
+        )
+        ttk.Label(
+            upload_frame,
+            text=(
+                "Qui prepari gli articoli da caricare su Vinted dalla GUI. "
+                "La coda viene salvata in JSON e resta compatibile con l'opzione CLI."
+            ),
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        ttk.Label(upload_frame, text="Titolo").grid(row=2, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(upload_frame, textvariable=self.vinted_upload_title_var, width=48).grid(
+            row=2,
+            column=1,
+            sticky="ew",
+            padx=(10, 8),
+            pady=(0, 8),
+        )
+        ttk.Label(upload_frame, text="Prezzo (€)").grid(row=2, column=2, sticky="w", pady=(0, 8))
+        ttk.Entry(upload_frame, textvariable=self.vinted_upload_price_var, width=12).grid(
+            row=2,
+            column=3,
+            sticky="w",
+            padx=(8, 0),
+            pady=(0, 8),
+        )
+        ttk.Label(upload_frame, text="Categoria").grid(row=3, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(upload_frame, textvariable=self.vinted_upload_category_var, width=24).grid(
+            row=3,
+            column=1,
+            sticky="ew",
+            padx=(10, 8),
+            pady=(0, 8),
+        )
+        ttk.Label(upload_frame, text="Brand").grid(row=3, column=2, sticky="w", pady=(0, 8))
+        ttk.Entry(upload_frame, textvariable=self.vinted_upload_brand_var, width=24).grid(
+            row=3,
+            column=3,
+            sticky="w",
+            padx=(8, 0),
+            pady=(0, 8),
+        )
+        ttk.Label(upload_frame, text="Condizione").grid(row=4, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(upload_frame, textvariable=self.vinted_upload_condition_var, width=24).grid(
+            row=4,
+            column=1,
+            sticky="ew",
+            padx=(10, 8),
+            pady=(0, 8),
+        )
+        ttk.Label(upload_frame, text="Materiale").grid(row=4, column=2, sticky="w", pady=(0, 8))
+        ttk.Entry(upload_frame, textvariable=self.vinted_upload_material_var, width=24).grid(
+            row=4,
+            column=3,
+            sticky="w",
+            padx=(8, 0),
+            pady=(0, 8),
+        )
+        ttk.Label(upload_frame, text="Descrizione").grid(row=5, column=0, sticky="nw", pady=(0, 8))
+        self.vinted_upload_description_widget = ScrolledText(
+            upload_frame,
+            wrap="word",
+            height=6,
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=8,
+            font=("Segoe UI", 10),
+        )
+        self.vinted_upload_description_widget.grid(
+            row=5,
+            column=1,
+            columnspan=3,
+            sticky="ew",
+            padx=(10, 0),
+            pady=(0, 8),
+        )
+        ttk.Label(upload_frame, text="Foto selezionate").grid(row=6, column=0, sticky="nw", pady=(0, 8))
+        ttk.Label(
+            upload_frame,
+            textvariable=self.vinted_upload_photos_var,
+            style="Hint.TLabel",
+            wraplength=620,
+            justify="left",
+        ).grid(row=6, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 8))
+        upload_photo_actions = ttk.Frame(upload_frame, style="Panel.TFrame")
+        upload_photo_actions.grid(row=7, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(0, 8))
+        ttk.Button(
+            upload_photo_actions,
+            text="Seleziona foto",
+            style="Secondary.TButton",
+            command=self._choose_vinted_upload_photos,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            upload_photo_actions,
+            text="Usa cartella foto",
+            style="Secondary.TButton",
+            command=self._choose_vinted_upload_photo_folder,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            upload_photo_actions,
+            text="Apri manifest JSON",
+            style="Secondary.TButton",
+            command=self._open_vinted_upload_manifest_folder,
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        upload_photo_actions.columnconfigure(0, weight=1)
+        upload_photo_actions.columnconfigure(1, weight=1)
+        upload_photo_actions.columnconfigure(2, weight=1)
+        ai_frame = ttk.LabelFrame(upload_frame, text="AI Listing Studio", style="Card.TLabelframe")
+        ai_frame.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(6, 10))
+        ai_frame.columnconfigure(1, weight=1)
+        ai_frame.columnconfigure(3, weight=1)
+        ttk.Label(
+            ai_frame,
+            text=(
+                "Usa le foto del prodotto come riferimento e genera una variante piu pulita per marketplace. "
+                "Richiede OPENAI_API_KEY nell'ambiente del venv."
+            ),
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        ttk.Label(ai_frame, text="Model").grid(row=1, column=0, sticky="w", pady=(0, 8))
+        ttk.Combobox(
+            ai_frame,
+            textvariable=self.vinted_ai_model_var,
+            values=(DEFAULT_VINTED_AI_MODEL,),
+            state="normal",
+            width=22,
+        ).grid(row=1, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
+        ttk.Label(ai_frame, text="Size").grid(row=1, column=2, sticky="w", pady=(0, 8))
+        ttk.Combobox(
+            ai_frame,
+            textvariable=self.vinted_ai_size_var,
+            values=VINTED_AI_SUPPORTED_SIZES,
+            state="readonly",
+            width=18,
+        ).grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=(0, 8))
+        ttk.Label(ai_frame, text="Variants").grid(row=2, column=0, sticky="w", pady=(0, 8))
+        ttk.Combobox(
+            ai_frame,
+            textvariable=self.vinted_ai_variants_var,
+            values=("1", "2", "3", "4"),
+            state="readonly",
+            width=8,
+        ).grid(row=2, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
+        ttk.Label(ai_frame, text="Output folder").grid(row=2, column=2, sticky="w", pady=(0, 8))
+        ttk.Entry(ai_frame, textvariable=self.vinted_ai_output_dir_var, width=36).grid(
+            row=2,
+            column=3,
+            sticky="ew",
+            padx=(8, 0),
+            pady=(0, 8),
+        )
+        ttk.Label(ai_frame, text="AI prompt").grid(row=3, column=0, sticky="nw", pady=(0, 8))
+        self.vinted_ai_prompt_widget = ScrolledText(
+            ai_frame,
+            wrap="word",
+            height=5,
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=8,
+            font=("Segoe UI", 10),
+        )
+        self.vinted_ai_prompt_widget.grid(
+            row=3,
+            column=1,
+            columnspan=3,
+            sticky="ew",
+            padx=(10, 0),
+            pady=(0, 8),
+        )
+        if self.vinted_ai_prompt_seed:
+            self.vinted_ai_prompt_widget.insert("1.0", self.vinted_ai_prompt_seed)
+        self.vinted_ai_prompt_widget.bind("<KeyRelease>", self._schedule_persist_ui_settings)
+        ttk.Label(ai_frame, text="Reference photos").grid(row=4, column=0, sticky="nw", pady=(0, 8))
+        ttk.Label(
+            ai_frame,
+            textvariable=self.vinted_ai_reference_photos_var,
+            style="Hint.TLabel",
+            wraplength=620,
+            justify="left",
+        ).grid(row=4, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 8))
+        ai_actions = ttk.Frame(ai_frame, style="Panel.TFrame")
+        ai_actions.grid(row=5, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(0, 8))
+        ttk.Button(
+            ai_actions,
+            text="Use listing photos",
+            style="Secondary.TButton",
+            command=self._use_listing_photos_for_vinted_ai,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            ai_actions,
+            text="Choose AI refs",
+            style="Secondary.TButton",
+            command=self._choose_vinted_ai_reference_photos,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            ai_actions,
+            text="Open output folder",
+            style="Secondary.TButton",
+            command=self._open_vinted_ai_output_folder,
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        ttk.Button(
+            ai_actions,
+            text="Generate AI variants",
+            style="Accent.TButton",
+            command=self._start_vinted_ai_generation,
+        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        for column_index in range(3):
+            ai_actions.columnconfigure(column_index, weight=1)
+        ttk.Label(ai_frame, text="Generated photos").grid(row=6, column=0, sticky="nw", pady=(0, 8))
+        ttk.Label(
+            ai_frame,
+            textvariable=self.vinted_ai_generated_photos_var,
+            style="Hint.TLabel",
+            wraplength=620,
+            justify="left",
+        ).grid(row=6, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 8))
+        ttk.Button(
+            ai_frame,
+            text="Use generated photos in listing",
+            style="Secondary.TButton",
+            command=self._use_generated_vinted_ai_photos_for_listing,
+        ).grid(row=7, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(0, 4))
+        ttk.Label(
+            ai_frame,
+            textvariable=self.vinted_ai_status_var,
+            style="Hint.TLabel",
+            wraplength=620,
+            justify="left",
+        ).grid(row=8, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(4, 0))
+        ttk.Checkbutton(
+            upload_frame,
+            text="Pubblica davvero su Vinted alla fine del prefill",
+            variable=self.vinted_upload_submit_var,
+        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        upload_actions = ttk.Frame(upload_frame, style="Panel.TFrame")
+        upload_actions.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(2, 8))
+        ttk.Button(
+            upload_actions,
+            text="Aggiungi alla coda",
+            style="Accent.TButton",
+            command=self._add_vinted_upload_queue_item_from_form,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            upload_actions,
+            text="Aggiorna selezionato",
+            style="Secondary.TButton",
+            command=self._update_selected_vinted_upload_queue_item,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            upload_actions,
+            text="Carica in form",
+            style="Secondary.TButton",
+            command=self._load_selected_vinted_upload_queue_item_into_form,
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            upload_actions,
+            text="Rimuovi selezionati",
+            style="Secondary.TButton",
+            command=self._remove_selected_vinted_upload_queue_items,
+        ).grid(row=0, column=3, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            upload_actions,
+            text="Svuota coda",
+            style="Secondary.TButton",
+            command=self._clear_vinted_upload_queue,
+        ).grid(row=0, column=4, sticky="ew", padx=(4, 0))
+        ttk.Button(
+            upload_actions,
+            text="Avvia upload coda",
+            style="Run.TButton",
+            command=self._start_vinted_upload_queue,
+        ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        for column_index in range(5):
+            upload_actions.columnconfigure(column_index, weight=1)
+        self.vinted_upload_queue_tree = ttk.Treeview(
+            upload_frame,
+            columns=("title", "price", "photos", "created_at"),
+            show="headings",
+            selectmode="extended",
+            height=5,
+        )
+        self.vinted_upload_queue_tree.heading("title", text="Titolo")
+        self.vinted_upload_queue_tree.heading("price", text="Prezzo")
+        self.vinted_upload_queue_tree.heading("photos", text="Foto")
+        self.vinted_upload_queue_tree.heading("created_at", text="Creato")
+        self.vinted_upload_queue_tree.column("title", width=340, anchor="w")
+        self.vinted_upload_queue_tree.column("price", width=90, anchor="center")
+        self.vinted_upload_queue_tree.column("photos", width=70, anchor="center")
+        self.vinted_upload_queue_tree.column("created_at", width=170, anchor="center")
+        upload_y_scroll = ttk.Scrollbar(upload_frame, orient="vertical", command=self.vinted_upload_queue_tree.yview)
+        self.vinted_upload_queue_tree.configure(yscrollcommand=upload_y_scroll.set)
+        self.vinted_upload_queue_tree.grid(row=11, column=0, columnspan=3, sticky="nsew")
+        upload_y_scroll.grid(row=11, column=3, sticky="ns")
+        upload_frame.rowconfigure(11, weight=1)
+        self._bind_treeview_scroll(self.vinted_upload_queue_tree)
+        ttk.Label(
+            upload_frame,
+            textvariable=self.vinted_upload_status_var,
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self._refresh_vinted_upload_queue_tree()
+
         deal_hunter_frame = ttk.Frame(card, style="Panel.TFrame")
-        deal_hunter_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 8))
+        deal_hunter_frame.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 8))
         deal_hunter_frame.columnconfigure(1, weight=1)
         ttk.Label(deal_hunter_frame, text="Procacciatore affari", style="Metric.TLabel").grid(
             row=0,
@@ -1112,38 +1555,38 @@ class ScraperApp:
             justify="left",
         ).grid(row=5, column=0, columnspan=8, sticky="w", pady=(8, 0))
 
-        ttk.Separator(card, orient="horizontal").grid(row=7, column=0, columnspan=3, sticky="ew", pady=(0, 10))
-        ttk.Label(card, text="Archivio database", style="Metric.TLabel").grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        self._row(card, 9, "Database SQLite", self.vinted_db_path_var)
+        ttk.Separator(card, orient="horizontal").grid(row=8, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        ttk.Label(card, text="Archivio database", style="Metric.TLabel").grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._row(card, 10, "Database SQLite", self.vinted_db_path_var)
         ttk.Button(
             card,
             text="Scegli DB",
             style="Secondary.TButton",
             command=self._choose_vinted_db_path,
-        ).grid(row=9, column=2, sticky="e", padx=(8, 0), pady=(0, 10))
-        ttk.Label(card, text="Ricerca salvata").grid(row=10, column=0, sticky="w")
+        ).grid(row=10, column=2, sticky="e", padx=(8, 0), pady=(0, 10))
+        ttk.Label(card, text="Ricerca salvata").grid(row=11, column=0, sticky="w")
         self.vinted_saved_run_box = ttk.Combobox(
             card,
             textvariable=self.vinted_saved_run_var,
             state="readonly",
             width=46,
         )
-        self.vinted_saved_run_box.grid(row=10, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
+        self.vinted_saved_run_box.grid(row=11, column=1, sticky="ew", padx=(10, 8), pady=(0, 8))
         ttk.Button(
             card,
             text="Aggiorna elenco",
             style="Secondary.TButton",
             command=self._refresh_vinted_saved_runs,
-        ).grid(row=10, column=2, sticky="e", pady=(0, 8))
-        self._row(card, 11, "Filtro archivio", self.vinted_saved_run_filter_var, 30)
+        ).grid(row=11, column=2, sticky="e", pady=(0, 8))
+        self._row(card, 12, "Filtro archivio", self.vinted_saved_run_filter_var, 30)
         ttk.Button(
             card,
             text="Filtra archivio",
             style="Secondary.TButton",
             command=self._refresh_vinted_saved_runs,
-        ).grid(row=11, column=2, sticky="e", pady=(0, 8))
-        self._row(card, 12, "Filtro ricerca nel DB", self.vinted_db_filter_var, 30)
-        ttk.Label(card, text="Filtro rapido risultati").grid(row=13, column=0, sticky="w")
+        ).grid(row=12, column=2, sticky="e", pady=(0, 8))
+        self._row(card, 13, "Filtro ricerca nel DB", self.vinted_db_filter_var, 30)
+        ttk.Label(card, text="Filtro rapido risultati").grid(row=14, column=0, sticky="w")
         vinted_signal_filter_box = ttk.Combobox(
             card,
             textvariable=self.vinted_signal_filter_var,
@@ -1151,18 +1594,18 @@ class ScraperApp:
             state="readonly",
             width=28,
         )
-        vinted_signal_filter_box.grid(row=13, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
+        vinted_signal_filter_box.grid(row=14, column=1, sticky="w", padx=(10, 8), pady=(0, 8))
         vinted_signal_filter_box.bind("<<ComboboxSelected>>", lambda _event: self._handle_vinted_signal_filter_change())
         ttk.Button(
             card,
             text="Applica",
             style="Secondary.TButton",
             command=self._handle_vinted_signal_filter_change,
-        ).grid(row=13, column=2, sticky="e", pady=(0, 8))
-        self._row(card, 14, "Limite righe DB (0 = tutte)", self.vinted_db_limit_var, 12)
+        ).grid(row=14, column=2, sticky="e", pady=(0, 8))
+        self._row(card, 15, "Limite righe DB (0 = tutte)", self.vinted_db_limit_var, 12)
 
         db_actions = ttk.Frame(card, style="Panel.TFrame")
-        db_actions.grid(row=15, column=0, columnspan=3, sticky="ew", pady=(2, 8))
+        db_actions.grid(row=16, column=0, columnspan=3, sticky="ew", pady=(2, 8))
         ttk.Button(
             db_actions,
             text="Mostra database nei risultati",
@@ -1215,7 +1658,7 @@ class ScraperApp:
             style="Metric.TLabel",
             wraplength=760,
             justify="left",
-        ).grid(row=16, column=0, columnspan=3, sticky="w", pady=(4, 8))
+        ).grid(row=17, column=0, columnspan=3, sticky="w", pady=(4, 8))
         ttk.Label(
             card,
             text="I risultati vengono mostrati automaticamente nella sezione Risultati, esportati con le impostazioni globali e salvati nel database senza duplicare gli articoli.",
@@ -2942,6 +3385,398 @@ class ScraperApp:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._open_external_target_or_error(db_path.parent.resolve(), title="Database Vinted")
 
+    def _choose_vinted_upload_photos(self) -> None:
+        selected_paths = filedialog.askopenfilenames(
+            title="Seleziona foto articolo Vinted",
+            filetypes=(
+                ("Immagini", "*.jpg *.jpeg *.png *.webp"),
+                ("Tutti i file", "*.*"),
+            ),
+        )
+        photo_paths = normalize_vinted_upload_photo_paths(selected_paths)
+        if not photo_paths:
+            return
+        self.vinted_upload_selected_photo_paths = photo_paths
+        self._update_vinted_upload_photos_summary()
+        self.vinted_upload_status_var.set(f"Selezionate {len(photo_paths)} foto per l'articolo in modifica.")
+
+    def _choose_vinted_upload_photo_folder(self) -> None:
+        selected_dir = filedialog.askdirectory(title="Seleziona cartella foto articolo Vinted")
+        if not selected_dir:
+            return
+        folder = Path(selected_dir).expanduser()
+        photo_paths = normalize_vinted_upload_photo_paths(
+            path
+            for path in sorted(folder.iterdir())
+            if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+        )
+        if not photo_paths:
+            messagebox.showerror("Nessuna foto trovata", "La cartella selezionata non contiene immagini supportate.")
+            return
+        self.vinted_upload_selected_photo_paths = photo_paths
+        self._update_vinted_upload_photos_summary()
+        self.vinted_upload_status_var.set(f"Caricate {len(photo_paths)} foto dalla cartella selezionata.")
+
+    def _choose_vinted_ai_reference_photos(self) -> None:
+        selected_paths = filedialog.askopenfilenames(
+            title="Seleziona foto riferimento AI",
+            filetypes=(
+                ("Immagini", "*.jpg *.jpeg *.png *.webp"),
+                ("Tutti i file", "*.*"),
+            ),
+        )
+        photo_paths = normalize_vinted_upload_photo_paths(selected_paths)
+        if not photo_paths:
+            return
+        self.vinted_ai_reference_photo_paths = photo_paths
+        self._update_vinted_ai_reference_photos_summary()
+        self.vinted_ai_status_var.set(f"Selezionate {len(photo_paths)} foto riferimento per AI Listing Studio.")
+        self._show_toast(f"AI refs selected: {len(photo_paths)}", level="info")
+
+    def _use_listing_photos_for_vinted_ai(self) -> None:
+        if not self.vinted_upload_selected_photo_paths:
+            messagebox.showerror("AI Listing Studio", "Seleziona prima le foto dell'articolo nel form upload.")
+            return
+        self.vinted_ai_reference_photo_paths = list(self.vinted_upload_selected_photo_paths)
+        self._update_vinted_ai_reference_photos_summary()
+        self.vinted_ai_status_var.set("Le foto dell'articolo corrente sono ora i riferimenti AI.")
+        self._show_toast("Current listing photos linked to AI Studio.", level="info")
+
+    def _open_vinted_ai_output_folder(self) -> None:
+        target = Path(self.vinted_ai_output_dir_var.get().strip() or self.script_path.parent / "output" / DEFAULT_VINTED_AI_OUTPUT_DIRNAME).expanduser()
+        target.mkdir(parents=True, exist_ok=True)
+        self._open_external_target_or_error(target.resolve(), title="AI Listing Studio")
+
+    def _update_vinted_ai_reference_photos_summary(self) -> None:
+        count = len(self.vinted_ai_reference_photo_paths)
+        if count <= 0:
+            self.vinted_ai_reference_photos_var.set("Nessuna foto AI selezionata.")
+            return
+        preview = Path(self.vinted_ai_reference_photo_paths[0]).name
+        suffix = "" if count == 1 else f" (+{count - 1})"
+        self.vinted_ai_reference_photos_var.set(f"{preview}{suffix}")
+
+    def _update_vinted_ai_generated_photos_summary(self) -> None:
+        count = len(self.vinted_ai_generated_photo_paths)
+        if count <= 0:
+            self.vinted_ai_generated_photos_var.set("Nessuna immagine AI generata.")
+            return
+        preview = Path(self.vinted_ai_generated_photo_paths[0]).name
+        suffix = "" if count == 1 else f" (+{count - 1})"
+        self.vinted_ai_generated_photos_var.set(f"{preview}{suffix}")
+
+    def _current_vinted_ai_prompt(self) -> str:
+        return self._current_vinted_ai_prompt_fallback()
+
+    def _start_vinted_ai_generation(self) -> None:
+        if self.vinted_ai_generation_active:
+            self.vinted_ai_status_var.set("Una generazione AI e gia in corso.")
+            self._show_toast("AI generation already running.", level="info")
+            return
+        prompt = self._current_vinted_ai_prompt()
+        if not prompt:
+            messagebox.showerror("AI Listing Studio", "Inserisci un prompt AI prima di generare le immagini.")
+            return
+        reference_paths = list(self.vinted_ai_reference_photo_paths)
+        if not reference_paths and self.vinted_upload_selected_photo_paths:
+            reference_paths = list(self.vinted_upload_selected_photo_paths)
+            self.vinted_ai_reference_photo_paths = reference_paths
+            self._update_vinted_ai_reference_photos_summary()
+        if not reference_paths:
+            messagebox.showerror("AI Listing Studio", "Seleziona almeno una foto riferimento per la generazione AI.")
+            return
+        model = self.vinted_ai_model_var.get().strip() or DEFAULT_VINTED_AI_MODEL
+        size = self.vinted_ai_size_var.get().strip() or DEFAULT_VINTED_AI_SIZE
+        output_dir = self.vinted_ai_output_dir_var.get().strip() or str(self.script_path.parent / "output" / DEFAULT_VINTED_AI_OUTPUT_DIRNAME)
+        variants_value = self.vinted_ai_variants_var.get().strip() or "1"
+        self.vinted_ai_generation_active = True
+        self.vinted_ai_status_var.set(
+            f"Generazione AI in corso via runtime del gioco: model={model}, size={size}, variants={variants_value}."
+        )
+        self.vinted_upload_status_var.set("AI Listing Studio ha inviato la richiesta al runtime del gioco.")
+        self._show_toast(f"AI request sent to runtime: {model} x{variants_value}", level="info")
+
+        def worker() -> None:
+            try:
+                result = generate_vinted_ai_variants(
+                    photo_paths=reference_paths,
+                    prompt=prompt,
+                    output_dir=output_dir,
+                    model=model,
+                    size=size,
+                    variants=int(variants_value),
+                )
+            except Exception as exc:
+                self.root.after(0, lambda: self._finish_vinted_ai_generation_error(exc))
+                return
+            self.root.after(0, lambda: self._finish_vinted_ai_generation_success(result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_vinted_ai_generation_error(self, exc: Exception) -> None:
+        self.vinted_ai_generation_active = False
+        error_text = str(exc)
+        if "404" in error_text or "Not Found" in error_text or "endpoint not found" in error_text.lower():
+            status_text = "Generazione AI fallita: il runtime del gioco non espone /api/vinted-ai/generate. Riavvia il gioco e riprova."
+            toast_text = "AI generation failed: runtime endpoint missing. Restart the game runtime."
+        else:
+            status_text = f"Generazione AI fallita: {exc}"
+            toast_text = f"AI generation failed: {exc}"
+        self.vinted_ai_status_var.set(status_text)
+        self.vinted_upload_status_var.set("Generazione AI fallita.")
+        self._show_toast(toast_text, level="error", duration_ms=5000)
+        messagebox.showerror("AI Listing Studio", status_text)
+
+    def _finish_vinted_ai_generation_success(self, result: dict[str, object]) -> None:
+        self.vinted_ai_generation_active = False
+        self.vinted_ai_generated_photo_paths = normalize_vinted_upload_photo_paths(result.get("generated_photo_paths", []))
+        self._update_vinted_ai_generated_photos_summary()
+        output_dir = str(result.get("output_dir", "") or "").strip()
+        log_path = str(result.get("log_path", "") or "").strip()
+        backend = str(result.get("backend", "") or "").strip() or "runtime"
+        runtime_url = str(result.get("runtime_url", "") or "").strip()
+        request_url = str(result.get("request_url", "") or "").strip()
+        generated_count = len(self.vinted_ai_generated_photo_paths)
+        self.vinted_ai_status_var.set(
+            f"Generate {generated_count} immagini AI in {output_dir}. Backend: {backend}. Request: {request_url or '-'}"
+        )
+        self.vinted_upload_status_var.set(
+            f"AI Listing Studio pronto: generate {generated_count} immagini. Puoi usarle nel listing."
+        )
+        self._show_toast(
+            f"AI generation completed: {generated_count} image(s) from {backend}{f' @ {runtime_url}' if runtime_url else ''}",
+            level="success",
+            duration_ms=3800,
+        )
+        if runtime_url:
+            self.vinted_upload_status_var.set(
+                f"AI Listing Studio pronto: generate {generated_count} immagini via {runtime_url}. Log: {log_path or '-'}"
+            )
+        self._persist_ui_settings()
+
+    def _use_generated_vinted_ai_photos_for_listing(self) -> None:
+        if not self.vinted_ai_generated_photo_paths:
+            messagebox.showerror("AI Listing Studio", "Non ci sono ancora immagini AI generate da usare nel listing.")
+            return
+        self.vinted_upload_selected_photo_paths = list(self.vinted_ai_generated_photo_paths)
+        self._update_vinted_upload_photos_summary()
+        self.vinted_upload_status_var.set("Le immagini AI generate sono ora le foto del listing corrente.")
+        self.vinted_ai_status_var.set("Le immagini AI generate sono state assegnate al listing corrente.")
+        self._show_toast("Generated AI photos applied to listing.", level="success")
+
+    def _open_vinted_upload_manifest_folder(self) -> None:
+        target = self.vinted_upload_manifest_path if self.vinted_upload_manifest_path.exists() else self.vinted_upload_manifest_path.parent
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._open_external_target_or_error(target, title="Manifest upload Vinted")
+
+    def _update_vinted_upload_photos_summary(self) -> None:
+        count = len(self.vinted_upload_selected_photo_paths)
+        if count <= 0:
+            self.vinted_upload_photos_var.set("Nessuna foto selezionata.")
+            return
+        preview = Path(self.vinted_upload_selected_photo_paths[0]).name
+        suffix = "" if count == 1 else f" (+{count - 1})"
+        self.vinted_upload_photos_var.set(f"{preview}{suffix}")
+
+    def _current_vinted_upload_description(self) -> str:
+        if not hasattr(self, "vinted_upload_description_widget"):
+            return ""
+        return str(self.vinted_upload_description_widget.get("1.0", "end-1c") or "").strip()
+
+    def _set_vinted_upload_description(self, value: str) -> None:
+        if not hasattr(self, "vinted_upload_description_widget"):
+            return
+        self.vinted_upload_description_widget.delete("1.0", "end")
+        if value:
+            self.vinted_upload_description_widget.insert("1.0", value)
+
+    def _current_vinted_upload_queue_item_from_form(self, existing_id: str = "", created_at: str = "") -> dict[str, object]:
+        return normalize_vinted_upload_queue_item(
+            {
+                "id": existing_id,
+                "created_at": created_at,
+                "title": self.vinted_upload_title_var.get(),
+                "description": self._current_vinted_upload_description(),
+                "price": self.vinted_upload_price_var.get(),
+                "category": self.vinted_upload_category_var.get(),
+                "brand": self.vinted_upload_brand_var.get(),
+                "condition": self.vinted_upload_condition_var.get(),
+                "material": self.vinted_upload_material_var.get(),
+                "photo_paths": self.vinted_upload_selected_photo_paths,
+            }
+        )
+
+    def _refresh_vinted_upload_queue_tree(self) -> None:
+        if not hasattr(self, "vinted_upload_queue_tree"):
+            return
+        for item_id in self.vinted_upload_queue_tree.get_children():
+            self.vinted_upload_queue_tree.delete(item_id)
+        for item in self.vinted_upload_queue:
+            self.vinted_upload_queue_tree.insert(
+                "",
+                "end",
+                iid=str(item.get("id", "")),
+                values=(
+                    str(item.get("title", "") or ""),
+                    str(item.get("price", "") or ""),
+                    len(item.get("photo_paths", []) or []),
+                    str(item.get("created_at", "") or ""),
+                ),
+            )
+
+    def _clear_vinted_upload_form(self) -> None:
+        self.vinted_upload_title_var.set("")
+        self.vinted_upload_price_var.set("")
+        self.vinted_upload_category_var.set("")
+        self.vinted_upload_brand_var.set("")
+        self.vinted_upload_condition_var.set("")
+        self.vinted_upload_material_var.set("")
+        self.vinted_upload_selected_photo_paths = []
+        self._set_vinted_upload_description("")
+        self._update_vinted_upload_photos_summary()
+
+    def _add_vinted_upload_queue_item_from_form(self) -> None:
+        try:
+            item = self._current_vinted_upload_queue_item_from_form()
+        except ValueError as exc:
+            messagebox.showerror("Articolo upload non valido", str(exc))
+            return
+        self.vinted_upload_queue.append(item)
+        self._save_vinted_upload_queue()
+        self._refresh_vinted_upload_queue_tree()
+        self._clear_vinted_upload_form()
+        self.vinted_upload_status_var.set(
+            f"Articolo aggiunto alla coda upload. Manifest aggiornato: {self.vinted_upload_manifest_path.name}"
+        )
+
+    def _selected_vinted_upload_queue_ids(self) -> list[str]:
+        if not hasattr(self, "vinted_upload_queue_tree"):
+            return []
+        return [str(item_id) for item_id in self.vinted_upload_queue_tree.selection()]
+
+    def _selected_vinted_upload_queue_item(self) -> dict[str, object] | None:
+        selected_ids = self._selected_vinted_upload_queue_ids()
+        if not selected_ids:
+            return None
+        selected_id = selected_ids[0]
+        for item in self.vinted_upload_queue:
+            if str(item.get("id", "")) == selected_id:
+                return item
+        return None
+
+    def _load_selected_vinted_upload_queue_item_into_form(self) -> None:
+        selected_item = self._selected_vinted_upload_queue_item()
+        if selected_item is None:
+            messagebox.showerror("Nessun articolo selezionato", "Seleziona un articolo della coda upload.")
+            return
+        self.vinted_upload_title_var.set(str(selected_item.get("title", "") or ""))
+        self.vinted_upload_price_var.set(str(selected_item.get("price", "") or ""))
+        self.vinted_upload_category_var.set(str(selected_item.get("category", "") or ""))
+        self.vinted_upload_brand_var.set(str(selected_item.get("brand", "") or ""))
+        self.vinted_upload_condition_var.set(str(selected_item.get("condition", "") or ""))
+        self.vinted_upload_material_var.set(str(selected_item.get("material", "") or ""))
+        self.vinted_upload_selected_photo_paths = normalize_vinted_upload_photo_paths(selected_item.get("photo_paths", []))
+        self._set_vinted_upload_description(str(selected_item.get("description", "") or ""))
+        self._update_vinted_upload_photos_summary()
+        self.vinted_upload_status_var.set("Articolo della coda caricato nel form.")
+
+    def _update_selected_vinted_upload_queue_item(self) -> None:
+        selected_item = self._selected_vinted_upload_queue_item()
+        if selected_item is None:
+            messagebox.showerror("Nessun articolo selezionato", "Seleziona un articolo della coda upload da aggiornare.")
+            return
+        try:
+            updated_item = self._current_vinted_upload_queue_item_from_form(
+                existing_id=str(selected_item.get("id", "") or ""),
+                created_at=str(selected_item.get("created_at", "") or ""),
+            )
+        except ValueError as exc:
+            messagebox.showerror("Articolo upload non valido", str(exc))
+            return
+        for index, item in enumerate(self.vinted_upload_queue):
+            if str(item.get("id", "")) == str(updated_item.get("id", "")):
+                self.vinted_upload_queue[index] = updated_item
+                break
+        self._save_vinted_upload_queue()
+        self._refresh_vinted_upload_queue_tree()
+        self.vinted_upload_status_var.set("Articolo upload aggiornato.")
+
+    def _remove_selected_vinted_upload_queue_items(self) -> None:
+        selected_ids = set(self._selected_vinted_upload_queue_ids())
+        if not selected_ids:
+            messagebox.showerror("Nessun articolo selezionato", "Seleziona almeno un articolo della coda upload.")
+            return
+        before = len(self.vinted_upload_queue)
+        self.vinted_upload_queue = [
+            item for item in self.vinted_upload_queue if str(item.get("id", "")) not in selected_ids
+        ]
+        removed = before - len(self.vinted_upload_queue)
+        self._save_vinted_upload_queue()
+        self._refresh_vinted_upload_queue_tree()
+        self.vinted_upload_status_var.set(f"Rimossi {removed} articoli dalla coda upload.")
+
+    def _clear_vinted_upload_queue(self) -> None:
+        if not self.vinted_upload_queue:
+            self.vinted_upload_status_var.set("La coda upload e gia vuota.")
+            return
+        if not messagebox.askyesno("Svuotare coda upload", "Vuoi rimuovere tutti gli articoli dalla coda upload Vinted?"):
+            return
+        self.vinted_upload_queue = []
+        self._save_vinted_upload_queue()
+        self._refresh_vinted_upload_queue_tree()
+        self.vinted_upload_status_var.set("Coda upload Vinted svuotata.")
+
+    def _build_vinted_upload_command(self) -> list[str]:
+        if not self.vinted_upload_queue:
+            raise ValueError("La coda upload Vinted e vuota.")
+        self._save_vinted_upload_queue()
+        cmd = [
+            sys.executable,
+            str(self.script_path),
+            "contact",
+            "vinted_upload",
+            "--items-file",
+            str(self.vinted_upload_manifest_path),
+            "--browser-mode",
+            self.browser_mode_var.get().strip() or "sessione_persistente",
+            "--browser-user-data-dir",
+            self.browser_user_data_dir_var.get().strip(),
+            "--browser-profile-directory",
+            self.browser_profile_directory_var.get().strip() or "Default",
+            "--action-delay-seconds",
+            self.action_delay_seconds_var.get().strip() or "1.5",
+            "--page-settle-seconds",
+            self.page_settle_seconds_var.get().strip() or "3.0",
+        ]
+        if self.slow_mode_var.get():
+            cmd.append("--slow-mode")
+        if self.vinted_keep_browser_open_var.get():
+            cmd.append("--keep-browser-open")
+        else:
+            cmd.append("--no-keep-browser-open")
+        keep_open_seconds = self.vinted_keep_open_seconds_var.get().strip() or "0"
+        cmd += ["--keep-open-seconds", keep_open_seconds]
+        if self.vinted_upload_submit_var.get():
+            cmd.append("--submit")
+        return cmd
+
+    def _start_vinted_upload_queue(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Upload Vinted", "Attendi la fine del processo corrente.")
+            return
+        try:
+            command = self._build_vinted_upload_command()
+        except ValueError as exc:
+            messagebox.showerror("Upload Vinted", str(exc))
+            return
+        self.vinted_upload_status_var.set(
+            f"Upload Vinted avviato su {len(self.vinted_upload_queue)} articoli."
+            + (" Modalita pubblicazione attiva." if self.vinted_upload_submit_var.get() else " Modalita prefill attiva.")
+        )
+        self.current_run_source = "vinted"
+        self._scroll_to_widget(self.log_tab)
+        self._start_process(command, kind="contact", load_results=False)
+
     def _write_vinted_links_file(self, rows: list[dict]) -> Path:
         output_dir = Path(self.output_dir_var.get()).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -2992,13 +3827,16 @@ class ScraperApp:
         self.vinted_keep_open_seconds_var.set("0")
         self.vinted_exclude_known_items_var.set(True)
         self.vinted_refresh_browser_profile_var.set(False)
+        self.vinted_upload_submit_var.set(False)
         self.vinted_search_specs.clear()
         self._refresh_vinted_search_specs_tree()
+        self._clear_vinted_upload_form()
         self._clear_vinted_saved_search_term_selection()
         self._refresh_vinted_saved_search_terms()
         self._refresh_vinted_saved_runs(quiet=True)
         self.vinted_status_var.set("Campi Vinted ripristinati.")
         self.vinted_deal_hunter_status_var.set("Procacciatore affari disattivato.")
+        self.vinted_upload_status_var.set("Coda upload Vinted pronta.")
         self._update_vinted_profile_status()
 
     def _choose_output_dir(self) -> None:
