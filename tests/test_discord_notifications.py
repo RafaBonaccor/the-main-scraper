@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scraper_app.discord_notifications import (
+    build_scraper_error_discord_message,
     build_vinted_deal_discord_message,
     build_vinted_login_required_discord_message,
     send_discord_webhook_message,
@@ -60,6 +61,19 @@ class DiscordNotificationsTests(unittest.TestCase):
         self.assertIn("2026-07-21T11:30:00", message)
         self.assertIn("<https://www.vinted.it/catalog/21-jewellery>", message)
 
+    def test_build_scraper_error_discord_message_contains_context(self) -> None:
+        message = build_scraper_error_discord_message(
+            "Offerta Vinted fallita",
+            "Il flusso si e bloccato.",
+            level="warning",
+            context={"source": "process_done", "phase": "vinted_offer_failed", "current_url": "https://www.vinted.it/items/1"},
+        )
+
+        self.assertIn("The Main Scraper warning", message)
+        self.assertIn("Offerta Vinted fallita", message)
+        self.assertIn("process_done", message)
+        self.assertIn("https://www.vinted.it/items/1", message)
+
     @patch("scraper_app.discord_notifications.urlopen", return_value=_FakeWebhookResponse())
     def test_send_discord_webhook_message_success(self, mocked_urlopen) -> None:
         result = send_discord_webhook_message(
@@ -74,6 +88,22 @@ class DiscordNotificationsTests(unittest.TestCase):
         self.assertIn("Mozilla/5.0", str(request.get_header("User-agent") or ""))
         self.assertIsNone(request.get_header("Origin"))
         self.assertIsNone(request.get_header("Referer"))
+
+    @patch("scraper_app.discord_notifications.urlopen", return_value=_FakeWebhookResponse())
+    def test_send_discord_webhook_message_supports_attachments(self, mocked_urlopen) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            screenshot = Path(temp_dir) / "screenshot.png"
+            screenshot.write_bytes(b"fake-image")
+            result = send_discord_webhook_message(
+                "https://discord.com/api/webhooks/test/token",
+                "ciao",
+                attachment_paths=[screenshot],
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([str(screenshot.resolve())], result["attachments"])
+        request = mocked_urlopen.call_args.args[0]
+        self.assertIn("multipart/form-data", str(request.get_header("Content-type") or ""))
 
     def test_save_vinted_deal_notifications_dedupes_by_webhook_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

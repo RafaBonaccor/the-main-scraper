@@ -1559,11 +1559,32 @@ def _wait_for_vinted_login_if_needed(
     action_delay_seconds: float = 1.5,
     page_settle_seconds: float = 3.0,
 ) -> dict[str, object]:
+    print(
+        "[vinted-login] check "
+        f"marker_present={bool(access_status.get('marker_present'))} "
+        f"page_not_found={bool(access_status.get('page_not_found'))} "
+        f"url={str(access_status.get('current_url', '') or '')}",
+        flush=True,
+    )
     if bool(access_status.get("page_not_found")):
         return access_status
     if bool(access_status.get("marker_present")):
         return access_status
     emit_vinted_login_required_signal(access_status)
+    access_status = _open_vinted_google_login_flow(
+        driver,
+        access_status=access_status,
+        action_delay_seconds=action_delay_seconds,
+    )
+    print(
+        "[vinted-login] after-google-flow "
+        f"marker_present={bool(access_status.get('marker_present'))} "
+        f"page_not_found={bool(access_status.get('page_not_found'))} "
+        f"url={str(access_status.get('current_url', '') or '')}",
+        flush=True,
+    )
+    if bool(access_status.get("page_not_found")) or bool(access_status.get("marker_present")):
+        return access_status
     target_url = str(revisit_url or access_status.get("current_url", "") or "").strip()
     while True:
         if consume_stop_after_current_item_request():
@@ -1571,6 +1592,13 @@ def _wait_for_vinted_login_if_needed(
         refreshed_status = wait_for_vinted_access_status(
             driver,
             max_wait_seconds=min(max(float(page_settle_seconds or 0), 0.0), 0.75),
+        )
+        print(
+            "[vinted-login] wait-loop "
+            f"marker_present={bool(refreshed_status.get('marker_present'))} "
+            f"page_not_found={bool(refreshed_status.get('page_not_found'))} "
+            f"url={str(refreshed_status.get('current_url', '') or '')}",
+            flush=True,
         )
         emit_vinted_access_signal(refreshed_status)
         if bool(refreshed_status.get("page_not_found")):
@@ -1594,11 +1622,158 @@ def _wait_for_vinted_login_if_needed(
             if bool(refreshed_status.get("page_not_found")) or bool(refreshed_status.get("marker_present")):
                 return refreshed_status
             emit_vinted_login_required_signal(refreshed_status)
+            refreshed_status = _open_vinted_google_login_flow(
+                driver,
+                access_status=refreshed_status,
+                action_delay_seconds=action_delay_seconds,
+            )
+            if bool(refreshed_status.get("page_not_found")) or bool(refreshed_status.get("marker_present")):
+                return refreshed_status
         time.sleep(0.25)
+    return access_status
 
 
 def emit_vinted_login_required_signal(access_status: dict[str, object]) -> None:
     print(f"__VINTED_LOGIN_REQUIRED__:{json.dumps(access_status, ensure_ascii=False)}", flush=True)
+
+
+def _open_vinted_google_login_flow(
+    driver: Driver,
+    *,
+    access_status: dict[str, object],
+    action_delay_seconds: float = 1.5,
+) -> dict[str, object]:
+    current_status = dict(access_status or {})
+    print(
+        "[vinted-login] google-flow-start "
+        f"marker_present={bool(current_status.get('marker_present'))} "
+        f"page_not_found={bool(current_status.get('page_not_found'))} "
+        f"url={str(current_status.get('current_url', '') or '')}",
+        flush=True,
+    )
+    if bool(current_status.get("page_not_found")):
+        return current_status
+    login_clicked = bool(
+        driver.run_js(
+            """
+const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+const isVisible = (element) => {
+  const style = window.getComputedStyle(element);
+  return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+};
+const candidates = [
+  ...document.querySelectorAll('a[data-testid="header--login-button"], a, button, [role="button"]'),
+];
+const target = candidates.find((element) => {
+  if (!isVisible(element)) return false;
+  const testId = normalize(element.getAttribute('data-testid') || '');
+  if (testId === 'header--login-button') return true;
+  const text = normalize(element.innerText || element.textContent);
+  return text.includes('iscriviti') || text.includes('accedi') || text.includes('sign up') || text.includes('log in');
+});
+if (!target) return false;
+try { target.scrollIntoView({ block: 'center' }); } catch {}
+try { target.focus(); } catch {}
+try { target.click(); return true; } catch (error) { return false; }
+            """
+        )
+    )
+    if not login_clicked:
+        current_status = wait_for_vinted_access_status(
+            driver,
+            max_wait_seconds=0.75,
+            poll_interval_seconds=0.2,
+        )
+        print(
+            "[vinted-login] header-login-missing "
+            f"marker_present={bool(current_status.get('marker_present'))} "
+            f"page_not_found={bool(current_status.get('page_not_found'))} "
+            f"url={str(current_status.get('current_url', '') or '')}",
+            flush=True,
+        )
+        return current_status
+    wait_before_google_seconds = max(float(action_delay_seconds or 0), 2.0)
+    print(
+        f"[vinted-login] waiting-before-google seconds={wait_before_google_seconds:.2f}",
+        flush=True,
+    )
+    time.sleep(wait_before_google_seconds)
+    google_button_still_visible = True
+    for attempt in range(1, 7):
+        google_clicked = bool(
+            driver.run_js(
+        """
+const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+const isVisible = (element) => {
+  const style = window.getComputedStyle(element);
+  return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+};
+const candidates = [
+  ...document.querySelectorAll('a[data-testid="google-oauth-button"], a, button, [role="button"]'),
+];
+const target = candidates.find((element) => {
+  if (!isVisible(element)) return false;
+  const testId = normalize(element.getAttribute('data-testid') || '');
+  if (testId === 'google-oauth-button') return true;
+  const text = normalize(element.innerText || element.textContent);
+  return text.includes('accedi con google') || text.includes('continue with google') || text.includes('sign in with google');
+});
+if (!target) return false;
+try { target.scrollIntoView({ block: 'center' }); } catch {}
+try { target.focus(); } catch {}
+try { target.click(); return true; } catch (error) { return false; }
+        """
+            )
+        )
+        wait_after_google_click_seconds = max(float(action_delay_seconds or 0), 4.0)
+        print(
+            f"[vinted-login] google-click attempt={attempt} clicked={google_clicked} wait_after={wait_after_google_click_seconds:.2f}",
+            flush=True,
+        )
+        time.sleep(wait_after_google_click_seconds)
+        google_button_still_visible = bool(
+            driver.run_js(
+                """
+const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+const isVisible = (element) => {
+  const style = window.getComputedStyle(element);
+  return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+};
+const candidates = [
+  ...document.querySelectorAll('a[data-testid="google-oauth-button"], a, button, [role="button"]'),
+];
+return candidates.some((element) => {
+  if (!isVisible(element)) return false;
+  const testId = normalize(element.getAttribute('data-testid') || '');
+  if (testId === 'google-oauth-button') return true;
+  const text = normalize(element.innerText || element.textContent);
+  return text.includes('accedi con google') || text.includes('continue with google') || text.includes('sign in with google');
+});
+                """
+            )
+        )
+        print(
+            f"[vinted-login] google-visibility attempt={attempt} visible={google_button_still_visible}",
+            flush=True,
+        )
+        if not google_button_still_visible:
+            break
+        if not google_clicked:
+            break
+    current_status = wait_for_vinted_access_status(
+        driver,
+        max_wait_seconds=2.5,
+        poll_interval_seconds=0.25,
+    )
+    print(
+        "[vinted-login] google-flow-end "
+        f"marker_present={bool(current_status.get('marker_present'))} "
+        f"page_not_found={bool(current_status.get('page_not_found'))} "
+        f"url={str(current_status.get('current_url', '') or '')}",
+        flush=True,
+    )
+    emit_vinted_access_signal(current_status)
+    return current_status
 
 
 def _reopen_vinted_target_after_login(

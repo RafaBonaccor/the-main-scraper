@@ -4,6 +4,7 @@ from pathlib import Path
 from .sources.subito_contact import run_subito_bulk_contact_action, run_subito_contact_action
 from .sources.vinted_offer import run_vinted_action_offer_batch, run_vinted_offer_action
 from .sources.vinted_upload import run_vinted_upload_action, run_vinted_upload_batch
+from .vinted_upload_worker import enqueue_vinted_upload_job, wait_for_vinted_upload_job_result
 
 
 def run_contact_action(source: str, **kwargs) -> dict:
@@ -75,6 +76,24 @@ def run_contact_action(source: str, **kwargs) -> dict:
             "browser_user_data_dir": kwargs.get("browser_user_data_dir", ""),
             "browser_profile_directory": kwargs.get("browser_profile_directory", "Default"),
         }
+        reuse_browser_session = bool(kwargs.get("reuse_browser_session", True))
+        if reuse_browser_session and bool(common_kwargs.get("keep_browser_open", True)):
+            queued = enqueue_vinted_upload_job(
+                items=items,
+                delay_between_seconds=int(kwargs.get("delay_between_seconds", 2)),
+                **common_kwargs,
+            )
+            if not bool(queued.get("ok")):
+                return queued
+            job_id = str(queued.get("job_id", "") or "").strip()
+            result = wait_for_vinted_upload_job_result(
+                job_id,
+                timeout_seconds=max(int(kwargs.get("worker_wait_timeout_seconds", 1800) or 0), 30),
+            )
+            result["worker_job_id"] = job_id
+            result["worker_pid"] = queued.get("worker_pid")
+            result["worker_log_file"] = queued.get("worker_log_file")
+            return result
         if len(items) == 1:
             item = items[0]
             return run_vinted_upload_action(
@@ -86,6 +105,8 @@ def run_contact_action(source: str, **kwargs) -> dict:
                 condition=str(item.get("condition", "") or ""),
                 material=str(item.get("material", "") or ""),
                 photo_paths=list(item.get("photo_paths", []) or []),
+                openai_used=bool(item.get("openai_used", False)),
+                openai_model=str(item.get("openai_model", "") or ""),
                 **common_kwargs,
             )
         return run_vinted_upload_batch(
@@ -193,7 +214,7 @@ def _resolve_vinted_upload_items(kwargs: dict) -> list[dict]:
 
     if items_file:
         return _read_vinted_upload_items_file(Path(items_file))
-    if title and description and str(price or "").strip() and category and brand and condition and material and photo_paths:
+    if title and str(price or "").strip() and photo_paths:
         return [{
             "title": title,
             "description": description,
@@ -205,7 +226,7 @@ def _resolve_vinted_upload_items(kwargs: dict) -> list[dict]:
             "photo_paths": photo_paths,
         }]
 
-    raise ValueError("Serve un items_file oppure titolo/descrizione/prezzo/categoria/brand/condizione/materiale/foto per l'upload Vinted.")
+    raise ValueError("Serve un items_file oppure almeno titolo/prezzo/foto per l'upload Vinted.")
 
 
 def _read_vinted_upload_items_file(path: Path) -> list[dict]:
@@ -218,6 +239,8 @@ def _read_vinted_upload_items_file(path: Path) -> list[dict]:
 
     payload = json.loads(content)
     raw_items = payload.get("items", []) if isinstance(payload, dict) else payload
+    manifest_openai_used = bool(payload.get("openai_used", False)) if isinstance(payload, dict) else False
+    manifest_openai_model = str(payload.get("openai_model", "") or "").strip() if isinstance(payload, dict) else ""
     if not isinstance(raw_items, list):
         raise ValueError(f"Items file non valido: {path}")
 
@@ -233,7 +256,7 @@ def _read_vinted_upload_items_file(path: Path) -> list[dict]:
         condition = str(raw_item.get("condition", "") or "").strip()
         material = str(raw_item.get("material", "") or "").strip()
         photo_paths = [str(path).strip() for path in list(raw_item.get("photo_paths", []) or []) if str(path).strip()]
-        if title and description and str(price or "").strip() and category and brand and condition and material and photo_paths:
+        if title and str(price or "").strip() and photo_paths:
             items.append(
                 {
                     "title": title,
@@ -244,6 +267,8 @@ def _read_vinted_upload_items_file(path: Path) -> list[dict]:
                     "condition": condition,
                     "material": material,
                     "photo_paths": photo_paths,
+                    "openai_used": bool(raw_item.get("openai_used", manifest_openai_used)),
+                    "openai_model": str(raw_item.get("openai_model", manifest_openai_model) or "").strip(),
                 }
             )
     if not items:

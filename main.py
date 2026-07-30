@@ -19,6 +19,7 @@ from scraper_app.openai_screening import DEFAULT_REASONING_EFFORT, DEFAULT_SCREE
 from scraper_app.runner import run_scraper
 from scraper_app.ui import launch_gui
 from scraper_app.vinted_database import annotate_rows_with_vinted_offer_history
+from scraper_app.vinted_upload_worker import run_vinted_upload_worker_loop
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -365,9 +366,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Seconds to keep the Vinted browser open after the upload flow. Use 0 with --keep-browser-open to wait until manual close.",
     )
+    contact_vinted_upload_parser.add_argument(
+        "--reuse-browser-session",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse a persistent Vinted upload browser across separate runs instead of starting a new Chrome each time.",
+    )
     _add_orchestrator_arguments(contact_vinted_upload_parser)
     _add_browser_arguments(contact_vinted_upload_parser)
     contact_vinted_upload_parser.set_defaults(browser_mode="chrome_normale")
+
+    vinted_upload_worker_parser = subparsers.add_parser("vinted-upload-worker", help=argparse.SUPPRESS)
+    vinted_upload_worker_parser.add_argument("--idle-timeout-seconds", default=900, type=int)
+    _add_orchestrator_arguments(vinted_upload_worker_parser)
+    _add_browser_arguments(vinted_upload_worker_parser)
+    vinted_upload_worker_parser.set_defaults(browser_mode="chrome_normale")
 
     return parser
 
@@ -467,6 +480,25 @@ def main() -> int:
             return 0 if result.get("ok") else 1
         except Exception as exc:
             return _handle_runtime_error(exc, command="contact", source=source, stdout_json=stdout_json, quiet=quiet)
+
+    if args.command == "vinted-upload-worker":
+        payload = vars(args).copy()
+        payload.pop("command", None)
+        payload.pop("stdout_json", None)
+        payload.pop("quiet", None)
+        try:
+            result = run_vinted_upload_worker_loop(**payload)
+            response_payload = {
+                "ok": bool(result.get("ok")),
+                "schema_version": "1.1",
+                "command": "vinted-upload-worker",
+                "generated_at": _now_iso(),
+                "result": result,
+            }
+            _emit_payload(response_payload, stdout_json=stdout_json, quiet=quiet)
+            return 0 if result.get("ok") else 1
+        except Exception as exc:
+            return _handle_runtime_error(exc, command="vinted-upload-worker", stdout_json=stdout_json, quiet=quiet)
 
     payload = vars(args).copy()
     source = payload.pop("source")
@@ -814,7 +846,12 @@ def _normalize_contact_result(source: str, result: dict) -> dict:
                     "ok": bool(item.get("ok")),
                     "prepared": bool(item.get("prepared")),
                     "submitted": bool(item.get("submitted")),
+                    "saved_draft": bool(item.get("saved_draft")),
                     "error": str(item.get("error", "") or ""),
+                    "save_draft_action": str(item.get("save_draft_action", "") or ""),
+                    "submit_action": str(item.get("submit_action", "") or ""),
+                    "openai_used": bool(item.get("openai_used", False)),
+                    "openai_model": str(item.get("openai_model", "") or ""),
                     "current_url": str(item.get("current_url", "") or ""),
                 }
             )
@@ -824,11 +861,16 @@ def _normalize_contact_result(source: str, result: dict) -> dict:
             "ok": bool(result.get("ok")),
             "prepared": bool(result.get("prepared")),
             "submitted": bool(result.get("submitted")),
+            "saved_draft": bool(result.get("saved_draft")),
             "items_count": _safe_int_or_none(result.get("items_count")),
             "prepared_count": _safe_int_or_none(result.get("prepared_count")),
             "submitted_count": _safe_int_or_none(result.get("submitted_count")),
+            "saved_draft_count": _safe_int_or_none(result.get("saved_draft_count")),
             "failed_count": _safe_int_or_none(result.get("failed_count")),
             "submit_action": str(result.get("submit_action", "") or ""),
+            "save_draft_action": str(result.get("save_draft_action", "") or ""),
+            "openai_used": bool(result.get("openai_used", False)),
+            "openai_model": str(result.get("openai_model", "") or ""),
             "current_url": str(result.get("current_url", "") or ""),
             "results": normalized_results,
         }

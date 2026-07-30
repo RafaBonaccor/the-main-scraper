@@ -88,6 +88,8 @@ class ContactRunnerVintedTests(unittest.TestCase):
                     "condition": "Ottime",
                     "material": "Acciaio",
                     "photo_paths": [str(photo)],
+                    "openai_used": False,
+                    "openai_model": "",
                 }
             ],
             items,

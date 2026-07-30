@@ -1,4 +1,7 @@
 import json
+import mimetypes
+import uuid
+from pathlib import Path
 from datetime import datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -54,17 +57,54 @@ def build_vinted_login_required_discord_message(status: dict) -> str:
     return "\n".join(lines)
 
 
-def send_discord_webhook_message(webhook_url: str, content: str, timeout_seconds: float = 10.0) -> dict[str, object]:
+def build_scraper_error_discord_message(
+    title: str,
+    message: str,
+    *,
+    level: str = "error",
+    context: dict[str, object] | None = None,
+) -> str:
+    lines = [
+        "⚠️ The Main Scraper alert" if str(level).lower() != "warning" else "⚠️ The Main Scraper warning",
+        normalize_whitespace(str(title or "Errore scraper") or "Errore scraper"),
+        normalize_whitespace(str(message or "Errore sconosciuto") or "Errore sconosciuto"),
+    ]
+    payload = context if isinstance(context, dict) else {}
+    for key in ("source", "phase", "current_url", "checked_at", "job_kind"):
+        value = normalize_whitespace(str(payload.get(key, "") or ""))
+        if value:
+            lines.append(f"{key}: {value}")
+    return "\n".join(lines)
+
+
+def send_discord_webhook_message(
+    webhook_url: str,
+    content: str,
+    timeout_seconds: float = 10.0,
+    *,
+    attachment_paths: list[str | Path] | None = None,
+) -> dict[str, object]:
     payload = {
         "content": str(content or "").strip(),
         "allowed_mentions": {"parse": []},
     }
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    attachments = [
+        Path(path).expanduser().resolve()
+        for path in (attachment_paths or [])
+        if str(path or "").strip()
+    ]
+    if attachments:
+        boundary = f"----TheMainScraperBoundary{uuid.uuid4().hex}"
+        data = _multipart_webhook_payload(payload, attachments, boundary)
+        content_type = f"multipart/form-data; boundary={boundary}"
+    else:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        content_type = "application/json"
     request = Request(
         str(webhook_url or "").strip(),
         data=data,
         headers={
-            "Content-Type": "application/json",
+            "Content-Type": content_type,
             "Accept": "application/json, text/plain, */*",
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -85,6 +125,7 @@ def send_discord_webhook_message(webhook_url: str, content: str, timeout_seconds
             "response_body": response_body,
             "sent_at": sent_at,
             "error": "",
+            "attachments": [str(path) for path in attachments],
         }
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -94,6 +135,7 @@ def send_discord_webhook_message(webhook_url: str, content: str, timeout_seconds
             "response_body": body,
             "sent_at": sent_at,
             "error": f"HTTP {exc.code}: {body or exc.reason}",
+            "attachments": [str(path) for path in attachments],
         }
     except URLError as exc:
         return {
@@ -102,6 +144,7 @@ def send_discord_webhook_message(webhook_url: str, content: str, timeout_seconds
             "response_body": "",
             "sent_at": sent_at,
             "error": f"URL error: {exc.reason}",
+            "attachments": [str(path) for path in attachments],
         }
     except Exception as exc:  # pragma: no cover - defensive fallback
         return {
@@ -110,4 +153,32 @@ def send_discord_webhook_message(webhook_url: str, content: str, timeout_seconds
             "response_body": "",
             "sent_at": sent_at,
             "error": f"{type(exc).__name__}: {exc}",
+            "attachments": [str(path) for path in attachments],
         }
+
+
+def _multipart_webhook_payload(payload: dict[str, object], attachments: list[Path], boundary: str) -> bytes:
+    chunks: list[bytes] = []
+
+    def add_text(name: str, value: str, *, content_type: str = "text/plain; charset=utf-8") -> None:
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(
+            f'Content-Disposition: form-data; name="{name}"\r\nContent-Type: {content_type}\r\n\r\n'.encode("utf-8")
+        )
+        chunks.append(value.encode("utf-8"))
+        chunks.append(b"\r\n")
+
+    add_text("payload_json", json.dumps(payload, ensure_ascii=False), content_type="application/json")
+    for index, path in enumerate(attachments):
+        mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(
+            (
+                f'Content-Disposition: form-data; name="files[{index}]"; filename="{path.name}"\r\n'
+                f"Content-Type: {mime_type}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        chunks.append(path.read_bytes())
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks)

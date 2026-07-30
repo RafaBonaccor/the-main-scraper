@@ -160,8 +160,10 @@ def _run_vinted_upload_batch_task(driver: Driver, config: dict) -> dict:
     submitted_count = sum(1 for item in results if item.get("submitted"))
     saved_draft_count = sum(1 for item in results if item.get("saved_draft"))
     failed_count = sum(1 for item in results if not item.get("ok"))
+    all_succeeded = failed_count == 0 and len(results) == len(items) and len(items) > 0
+    expected_success_count = submitted_count if bool(config.get("submit", False)) else saved_draft_count
     return {
-        "ok": submitted_count > 0 if bool(config.get("submit", False)) else saved_draft_count > 0,
+        "ok": all_succeeded and expected_success_count == len(items),
         "items_count": len(items),
         "prepared_count": prepared_count,
         "submitted_count": submitted_count,
@@ -303,21 +305,23 @@ def _upload_single_vinted_item(driver: Driver, config: dict) -> dict:
         "field.title",
         f"ok={title_filled} | value={item['title']} | dom={_format_upload_debug(_collect_vinted_upload_text_field_debug(driver, '#title[data-testid=\"title--input\"]'))}",
     )
-    description_filled = _fill_textarea_input(driver, '#description[data-testid="description--input"]', str(item["description"]))
+    description_value = str(item["description"] or "")
+    description_filled = True if not description_value.strip() else _fill_textarea_input(driver, '#description[data-testid="description--input"]', description_value)
     _append_upload_step(
         steps,
         "field.description",
-        f"ok={description_filled} | value={item['description']} | dom={_format_upload_debug(_collect_vinted_upload_text_field_debug(driver, '#description[data-testid=\"description--input\"]'))}",
+        f"ok={description_filled} | value={item['description']} | optional={not description_value.strip()} | dom={_format_upload_debug(_collect_vinted_upload_text_field_debug(driver, '#description[data-testid=\"description--input\"]'))}",
     )
+    category_value = str(item["category"] or "")
     category_before = _collect_vinted_upload_picker_debug(
         driver,
         'input#category[data-testid="catalog-select-dropdown-input"][name="category"]',
-        str(item["category"]),
+        category_value,
     )
-    category_selected = _select_vinted_picker_option(
+    category_selected = True if not category_value.strip() else _select_vinted_picker_option(
         driver,
         'input#category[data-testid="catalog-select-dropdown-input"][name="category"]',
-        str(item["category"]),
+        category_value,
         list_selector='ul[data-testid="category-list"]',
         option_title_selector='.web_ui__Cell__title',
         clickable_option_selector='[role="button"]',
@@ -325,72 +329,75 @@ def _upload_single_vinted_item(driver: Driver, config: dict) -> dict:
     category_after = _collect_vinted_upload_picker_debug(
         driver,
         'input#category[data-testid="catalog-select-dropdown-input"][name="category"]',
-        str(item["category"]),
+        category_value,
     )
     _append_upload_step(
         steps,
         "field.category",
-        f"ok={category_selected} | value={item['category']} | before={_format_upload_debug(category_before)} | after={_format_upload_debug(category_after)}",
+        f"ok={category_selected} | value={item['category']} | optional={not category_value.strip()} | before={_format_upload_debug(category_before)} | after={_format_upload_debug(category_after)}",
     )
+    brand_value = str(item["brand"] or "")
     brand_before = _collect_vinted_upload_picker_debug(
         driver,
         'input#brand[data-testid="brand-select-dropdown-input"][name="brand"]',
-        str(item["brand"]),
+        brand_value,
     )
-    brand_selected = _select_vinted_picker_option(
+    brand_selected = True if not brand_value.strip() else _select_vinted_picker_option(
         driver,
         'input#brand[data-testid="brand-select-dropdown-input"][name="brand"]',
-        str(item["brand"]),
+        brand_value,
     )
     brand_after = _collect_vinted_upload_picker_debug(
         driver,
         'input#brand[data-testid="brand-select-dropdown-input"][name="brand"]',
-        str(item["brand"]),
+        brand_value,
     )
     _append_upload_step(
         steps,
         "field.brand",
-        f"ok={brand_selected} | value={item['brand']} | before={_format_upload_debug(brand_before)} | after={_format_upload_debug(brand_after)}",
+        f"ok={brand_selected} | value={item['brand']} | optional={not brand_value.strip()} | before={_format_upload_debug(brand_before)} | after={_format_upload_debug(brand_after)}",
     )
+    condition_value = str(item["condition"] or "")
     condition_before = _collect_vinted_upload_picker_debug(
         driver,
         'input#condition[data-testid="category-condition-single-list-input"][name="condition"]',
-        str(item["condition"]),
+        condition_value,
     )
-    condition_selected = _select_vinted_picker_option(
+    condition_selected = True if not condition_value.strip() else _select_vinted_picker_option(
         driver,
         'input#condition[data-testid="category-condition-single-list-input"][name="condition"]',
-        str(item["condition"]),
+        condition_value,
     )
     condition_after = _collect_vinted_upload_picker_debug(
         driver,
         'input#condition[data-testid="category-condition-single-list-input"][name="condition"]',
-        str(item["condition"]),
+        condition_value,
     )
     _append_upload_step(
         steps,
         "field.condition",
-        f"ok={condition_selected} | value={item['condition']} | before={_format_upload_debug(condition_before)} | after={_format_upload_debug(condition_after)}",
+        f"ok={condition_selected} | value={item['condition']} | optional={not condition_value.strip()} | before={_format_upload_debug(condition_before)} | after={_format_upload_debug(condition_after)}",
     )
+    material_value = str(item["material"] or "")
     material_before = _collect_vinted_upload_picker_debug(
         driver,
         'input#material[data-testid="category-material-multi-list-input"][name="material"]',
-        str(item["material"]),
+        material_value,
     )
-    material_selected = _select_vinted_picker_option(
+    material_selected = True if not material_value.strip() else _select_vinted_picker_option(
         driver,
         'input#material[data-testid="category-material-multi-list-input"][name="material"]',
-        str(item["material"]),
+        material_value,
     )
     material_after = _collect_vinted_upload_picker_debug(
         driver,
         'input#material[data-testid="category-material-multi-list-input"][name="material"]',
-        str(item["material"]),
+        material_value,
     )
     _append_upload_step(
         steps,
         "field.material",
-        f"ok={material_selected} | value={item['material']} | before={_format_upload_debug(material_before)} | after={_format_upload_debug(material_after)}",
+        f"ok={material_selected} | value={item['material']} | optional={not material_value.strip()} | before={_format_upload_debug(material_before)} | after={_format_upload_debug(material_after)}",
     )
     price_filled = _fill_vinted_price_input(driver, '#price[data-testid="price-input--input"]', str(item["price"]))
     _append_upload_step(
@@ -404,25 +411,12 @@ def _upload_single_vinted_item(driver: Driver, config: dict) -> dict:
         "fields.snapshot",
         " | ".join(f"{key}={value}" for key, value in field_debug.items()),
     )
-    prepared = bool(
-        title_filled
-        and description_filled
-        and category_selected
-        and brand_selected
-        and condition_selected
-        and material_selected
-        and price_filled
-    )
+    prepared = bool(title_filled and price_filled)
     if not prepared:
         failed = [
             name
             for name, ok in (
                 ("title", title_filled),
-                ("description", description_filled),
-                ("category", category_selected),
-                ("brand", brand_selected),
-                ("condition", condition_selected),
-                ("material", material_selected),
                 ("price", price_filled),
             )
             if not ok
@@ -435,12 +429,12 @@ def _upload_single_vinted_item(driver: Driver, config: dict) -> dict:
             f"material_after={_format_upload_debug(material_after)}",
         ]
         raise RuntimeError(
-            "Impossibile compilare tutti i campi richiesti dell'annuncio Vinted."
+            "Impossibile compilare i campi minimi richiesti dell'annuncio Vinted."
             + (f" Failed: {', '.join(failed)}." if failed else "")
             + (f" DOM: {' | '.join(debug_parts)}" if debug_parts else "")
             + (f" Picker debug: {' || '.join(part for part in picker_debug_parts if part)}" if picker_debug_parts else "")
         )
-    _append_upload_step(steps, "fields.ready", "all required fields compiled")
+    _append_upload_step(steps, "fields.ready", "minimum required fields compiled; optional empty fields allowed")
 
     submit_action = ""
     save_draft_action = ""
@@ -454,7 +448,11 @@ def _upload_single_vinted_item(driver: Driver, config: dict) -> dict:
         if not submitted:
             raise RuntimeError("Pulsante finale di pubblicazione Vinted non trovato o non cliccabile.")
         _sleep_if_needed(driver, max(action_delay_seconds, 1.5))
-        close_tab_action = _close_vinted_active_tab_after_completion()
+        if bool(config.get("preserve_active_tab", False)):
+            close_tab_action = "skipped-preserve-active-tab"
+            print("[vinted-upload] tab close skipped after submit because preserve_active_tab=true", flush=True)
+        else:
+            close_tab_action = _close_vinted_active_tab_after_completion()
         _append_upload_step(steps, "tab.close", f"mode=submit | action={close_tab_action}")
     else:
         _sleep_if_needed(driver, 3.0)
@@ -470,10 +468,19 @@ def _upload_single_vinted_item(driver: Driver, config: dict) -> dict:
             "draft.click",
             f"ok={saved_draft} | action={save_draft_action or 'none'} | debug={save_draft_debug or 'none'}",
         )
+        print(
+            f"[vinted-upload] draft-check result ok={saved_draft} "
+            f"action={save_draft_action or 'none'} debug={save_draft_debug or 'none'}",
+            flush=True,
+        )
         if not saved_draft:
             raise RuntimeError("Pulsante 'Salva bozza' non trovato o non cliccabile.")
         _sleep_if_needed(driver, max(action_delay_seconds, 1.2))
-        close_tab_action = _close_vinted_active_tab_after_completion()
+        if bool(config.get("preserve_active_tab", False)):
+            close_tab_action = "skipped-preserve-active-tab"
+            print("[vinted-upload] tab close skipped after save draft because preserve_active_tab=true", flush=True)
+        else:
+            close_tab_action = _close_vinted_active_tab_after_completion()
         _append_upload_step(steps, "tab.close", f"mode=draft | action={close_tab_action}")
 
     return {
@@ -2047,18 +2054,8 @@ def _normalize_upload_item(item: dict) -> dict[str, object]:
     photo_paths = [str(Path(path).expanduser().resolve()) for path in raw_photo_paths if str(path or "").strip()]
     if not title:
         raise ValueError("Titolo Vinted mancante.")
-    if not description:
-        raise ValueError("Descrizione Vinted mancante.")
     if not price:
         raise ValueError("Prezzo Vinted mancante.")
-    if not category:
-        raise ValueError("Categoria Vinted mancante.")
-    if not brand:
-        raise ValueError("Brand Vinted mancante.")
-    if not condition:
-        raise ValueError("Condizione Vinted mancante.")
-    if not material:
-        raise ValueError("Materiale Vinted mancante.")
     if not photo_paths:
         raise ValueError("Foto Vinted mancanti.")
     for path in photo_paths:

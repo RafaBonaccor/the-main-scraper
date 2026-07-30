@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -39,6 +40,19 @@ class UiExternalOpenTests(unittest.TestCase):
 
         def destroy(self):
             self.destroy_called = True
+
+    class _TextWidget:
+        def __init__(self, value: str = ""):
+            self.value = value
+
+        def get(self, *_args, **_kwargs):
+            return self.value
+
+        def delete(self, *_args, **_kwargs):
+            self.value = ""
+
+        def insert(self, *_args):
+            self.value = _args[-1]
 
     @patch("scraper_app.ui.os.startfile", create=True)
     @patch("scraper_app.ui.os.name", "nt")
@@ -149,6 +163,195 @@ class UiExternalOpenTests(unittest.TestCase):
         self.assertEqual("Ottime", payload["condition"])
         self.assertEqual("Acciaio", payload["material"])
         self.assertEqual([str(photo.resolve())], payload["photo_paths"])
+
+    def test_parse_vinted_ai_discord_payload_supports_json(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            photo = Path(temp_dir) / "photo.png"
+            photo.write_text("x", encoding="utf-8")
+            app = object.__new__(ScraperApp)
+
+            payload = ScraperApp._parse_vinted_ai_discord_payload(
+                app,
+                (
+                    "{"
+                    f"\"title\": \"Charm Pandora\", "
+                    f"\"description\": \"Silver charm\", "
+                    f"\"price\": \"12.50\", "
+                    f"\"photo_paths\": [\"{photo}\"]"
+                    "}"
+                ),
+            )
+
+        self.assertEqual("Charm Pandora", payload["title"])
+        self.assertEqual("Silver charm", payload["description"])
+        self.assertEqual("12.50", payload["price"])
+        self.assertEqual([str(photo.resolve())], payload["photo_paths"])
+
+    def test_import_vinted_ai_discord_payload_updates_form_and_references(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            photo = Path(temp_dir) / "photo.png"
+            photo.write_text("x", encoding="utf-8")
+            app = object.__new__(ScraperApp)
+            app.vinted_ai_discord_payload_widget = self._TextWidget(
+                "\n".join(
+                    [
+                        "title: Charm Pandora",
+                        "description: Silver charm with stones",
+                        "price: 12.50",
+                        "category: Braccialetti",
+                        "brand: No Label",
+                        "condition: Ottime",
+                        "material: Acciaio",
+                        f"photo_paths: {photo}",
+                    ]
+                )
+            )
+            app.vinted_upload_title_var = self._Var("")
+            app.vinted_upload_price_var = self._Var("")
+            app.vinted_upload_category_var = self._Var("")
+            app.vinted_upload_brand_var = self._Var("")
+            app.vinted_upload_condition_var = self._Var("")
+            app.vinted_upload_material_var = self._Var("")
+            app.vinted_upload_description_widget = self._TextWidget("")
+            app.vinted_upload_selected_photo_paths = []
+            app.vinted_ai_reference_photo_paths = []
+            app.vinted_ai_discord_context = ""
+            app.vinted_ai_status_var = self._Var("")
+            app.vinted_upload_status_var = self._Var("")
+            app._update_vinted_upload_photos_summary = Mock()
+            app._update_vinted_ai_reference_photos_summary = Mock()
+            app._show_toast = Mock()
+
+            ScraperApp._import_vinted_ai_discord_payload(app)
+
+        self.assertEqual("Charm Pandora", app.vinted_upload_title_var.get())
+        self.assertEqual("12.50", app.vinted_upload_price_var.get())
+        self.assertEqual("Braccialetti", app.vinted_upload_category_var.get())
+        self.assertEqual("No Label", app.vinted_upload_brand_var.get())
+        self.assertEqual("Ottime", app.vinted_upload_condition_var.get())
+        self.assertEqual("Acciaio", app.vinted_upload_material_var.get())
+        self.assertEqual("Silver charm with stones", app.vinted_upload_description_widget.get())
+        self.assertEqual([str(photo.resolve())], app.vinted_upload_selected_photo_paths)
+        self.assertEqual([str(photo.resolve())], app.vinted_ai_reference_photo_paths)
+        self.assertIn("Title: Charm Pandora", app.vinted_ai_discord_context)
+        self.assertIn("Description: Silver charm with stones", app.vinted_ai_discord_context)
+        app._update_vinted_upload_photos_summary.assert_called_once()
+        app._update_vinted_ai_reference_photos_summary.assert_called_once()
+        app._show_toast.assert_called_once()
+
+    def test_import_vinted_ai_discord_payload_completes_partial_json_with_ai(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            photo = Path(temp_dir) / "photo.png"
+            photo.write_text("x", encoding="utf-8")
+            app = object.__new__(ScraperApp)
+            app.vinted_ai_discord_payload_widget = self._TextWidget(
+                json.dumps({"title": "Charm Pandora", "description": "Silver charm", "photo_paths": [str(photo)]})
+            )
+            app.vinted_upload_title_var = self._Var("")
+            app.vinted_upload_price_var = self._Var("")
+            app.vinted_upload_category_var = self._Var("")
+            app.vinted_upload_brand_var = self._Var("")
+            app.vinted_upload_condition_var = self._Var("")
+            app.vinted_upload_material_var = self._Var("")
+            app.vinted_upload_description_widget = self._TextWidget("")
+            app.vinted_upload_selected_photo_paths = []
+            app.vinted_ai_reference_photo_paths = []
+            app.vinted_ai_discord_context = ""
+            app.vinted_ai_status_var = self._Var("")
+            app.vinted_upload_status_var = self._Var("")
+            app._update_vinted_upload_photos_summary = Mock()
+            app._update_vinted_ai_reference_photos_summary = Mock()
+            app._show_toast = Mock()
+            app._structure_vinted_upload_payload_with_ai = Mock(
+                return_value={
+                    "title": "Charm Pandora",
+                    "description": "Silver charm",
+                    "price": "12.50",
+                    "category": "Braccialetti",
+                    "brand": "No Label",
+                    "condition": "Ottime",
+                    "material": "Acciaio",
+                    "photo_paths": [str(photo.resolve())],
+                }
+            )
+
+            ScraperApp._import_vinted_ai_discord_payload(app)
+
+        app._structure_vinted_upload_payload_with_ai.assert_called_once()
+        self.assertEqual("12.50", app.vinted_upload_price_var.get())
+        self.assertEqual("Braccialetti", app.vinted_upload_category_var.get())
+        self.assertEqual([str(photo.resolve())], app.vinted_upload_selected_photo_paths)
+
+    def test_import_vinted_ai_discord_payload_reports_ai_error_when_ai_is_unavailable(self) -> None:
+        app = object.__new__(ScraperApp)
+        app.vinted_ai_discord_payload_widget = self._TextWidget(
+            json.dumps({"title": "Charm Pandora", "description": "Silver charm"})
+        )
+        app.vinted_upload_title_var = self._Var("")
+        app.vinted_upload_price_var = self._Var("")
+        app.vinted_upload_category_var = self._Var("")
+        app.vinted_upload_brand_var = self._Var("")
+        app.vinted_upload_condition_var = self._Var("")
+        app.vinted_upload_material_var = self._Var("")
+        app.vinted_upload_description_widget = self._TextWidget("")
+        app.vinted_upload_selected_photo_paths = []
+        app.vinted_ai_reference_photo_paths = []
+        app.vinted_ai_discord_context = ""
+        app.vinted_ai_status_var = self._Var("")
+        app.vinted_upload_status_var = self._Var("")
+        app._update_vinted_upload_photos_summary = Mock()
+        app._update_vinted_ai_reference_photos_summary = Mock()
+        app._show_toast = Mock()
+        app._structure_vinted_upload_payload_with_ai = Mock(
+            side_effect=ValueError("OPENAI_API_KEY non trovato nell'ambiente o nel secret project store.")
+        )
+
+        with patch("scraper_app.ui.messagebox.showerror") as mocked_showerror:
+            ScraperApp._import_vinted_ai_discord_payload(app)
+
+        mocked_showerror.assert_called_once()
+        self.assertIn("OPENAI_API_KEY", mocked_showerror.call_args.args[1])
+        self.assertIn("Discord AI structuring failed", app.vinted_ai_status_var.get())
+        app._show_toast.assert_called_once()
+
+    def test_clean_vinted_ai_discord_text_strips_command_prefix(self) -> None:
+        app = object.__new__(ScraperApp)
+
+        cleaned = ScraperApp._clean_vinted_ai_discord_text(
+            app,
+            "\n".join(
+                [
+                    "!upload researcher",
+                    "Nome testing",
+                    "Descrizione un test fico",
+                    "Prezzo 10 euro",
+                ]
+            ),
+        )
+
+        self.assertEqual("Nome testing\nDescrizione un test fico\nPrezzo 10 euro", cleaned)
+
+    def test_parse_vinted_ai_discord_payload_supports_free_text(self) -> None:
+        app = object.__new__(ScraperApp)
+
+        payload = ScraperApp._parse_vinted_ai_discord_payload(
+            app,
+            "\n".join(
+                [
+                    "upload researcher",
+                    "Nome testing descrizione un test fico prezzo 10 euro materiale acciaio categoria gioielli",
+                    "Immagine",
+                ]
+            ),
+        )
+
+        self.assertEqual("testing", payload["title"])
+        self.assertEqual("un test fico", payload["description"])
+        self.assertEqual("10 euro", payload["price"])
+        self.assertEqual("gioielli", payload["category"])
+        self.assertEqual("No Label", payload["brand"])
+        self.assertEqual("Ottime", payload["condition"])
+        self.assertEqual("acciaio", payload["material"])
 
     def test_build_vinted_deal_hunter_search_specs_uses_category_and_dedupes_terms(self) -> None:
         specs = build_vinted_deal_hunter_search_specs(
@@ -356,6 +559,54 @@ class UiExternalOpenTests(unittest.TestCase):
         self.assertEqual(1, mocked_send.call_count)
         self.assertTrue(app.vinted_login_discord_notified_for_process)
         self.assertTrue(any("notifica login Vinted inviata" in line for line in logs))
+        self.assertIn("attachment_paths", mocked_send.call_args.kwargs)
+
+    @patch("scraper_app.ui.send_discord_webhook_message", return_value={"ok": True})
+    def test_notify_scraper_issue_on_discord_sends_attachments_and_dedupes(self, mocked_send) -> None:
+        with TemporaryDirectory() as temp_dir:
+            screenshot = Path(temp_dir) / "screenshot.png"
+            screenshot.write_bytes(b"image")
+            app = object.__new__(ScraperApp)
+            app.vinted_discord_notifications_var = self._Var(True)
+            app.vinted_discord_webhook_url_var = self._Var("https://discord.com/api/webhooks/test/token")
+            app.process_kind = "scrape"
+            app.current_run_source = "vinted"
+            app._discord_error_notification_cache = {}
+            app._append_log = lambda _text: None
+            app._collect_recent_error_report_attachments = lambda: [str(screenshot.resolve())]
+
+            first = ScraperApp._notify_scraper_issue_on_discord(
+                app,
+                "Ricerca Vinted fallita",
+                "Errore durante il processo.",
+                dedupe_key="scrape-failed",
+            )
+            second = ScraperApp._notify_scraper_issue_on_discord(
+                app,
+                "Ricerca Vinted fallita",
+                "Errore durante il processo.",
+                dedupe_key="scrape-failed",
+            )
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        mocked_send.assert_called_once()
+        self.assertEqual([str(screenshot.resolve())], mocked_send.call_args.kwargs["attachment_paths"])
+
+    @patch("scraper_app.ui.send_discord_webhook_message", return_value={"ok": True})
+    def test_notify_scraper_issue_on_discord_respects_disabled_notifications(self, mocked_send) -> None:
+        app = object.__new__(ScraperApp)
+        app.vinted_discord_notifications_var = self._Var(False)
+        app.vinted_discord_webhook_url_var = self._Var("https://discord.com/api/webhooks/test/token")
+        app.process_kind = ""
+        app.current_run_source = ""
+        app._discord_error_notification_cache = {}
+        app._append_log = lambda _text: None
+
+        result = ScraperApp._notify_scraper_issue_on_discord(app, "Errore", "Messaggio")
+
+        self.assertFalse(result)
+        mocked_send.assert_not_called()
 
     def test_persisted_ui_settings_store_discord_webhook(self) -> None:
         with TemporaryDirectory() as temp_dir:
