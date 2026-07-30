@@ -298,9 +298,22 @@ def _upload_single_vinted_item(driver: Driver, config: dict) -> dict:
         )
 
     title_filled = _fill_text_input(driver, '#title[data-testid="title--input"]', str(item["title"]))
-    _append_upload_step(steps, "field.title", f"ok={title_filled} | value={item['title']}")
+    _append_upload_step(
+        steps,
+        "field.title",
+        f"ok={title_filled} | value={item['title']} | dom={_format_upload_debug(_collect_vinted_upload_text_field_debug(driver, '#title[data-testid=\"title--input\"]'))}",
+    )
     description_filled = _fill_textarea_input(driver, '#description[data-testid="description--input"]', str(item["description"]))
-    _append_upload_step(steps, "field.description", f"ok={description_filled} | value={item['description']}")
+    _append_upload_step(
+        steps,
+        "field.description",
+        f"ok={description_filled} | value={item['description']} | dom={_format_upload_debug(_collect_vinted_upload_text_field_debug(driver, '#description[data-testid=\"description--input\"]'))}",
+    )
+    category_before = _collect_vinted_upload_picker_debug(
+        driver,
+        'input#category[data-testid="catalog-select-dropdown-input"][name="category"]',
+        str(item["category"]),
+    )
     category_selected = _select_vinted_picker_option(
         driver,
         'input#category[data-testid="catalog-select-dropdown-input"][name="category"]',
@@ -309,27 +322,82 @@ def _upload_single_vinted_item(driver: Driver, config: dict) -> dict:
         option_title_selector='.web_ui__Cell__title',
         clickable_option_selector='[role="button"]',
     )
-    _append_upload_step(steps, "field.category", f"ok={category_selected} | value={item['category']}")
+    category_after = _collect_vinted_upload_picker_debug(
+        driver,
+        'input#category[data-testid="catalog-select-dropdown-input"][name="category"]',
+        str(item["category"]),
+    )
+    _append_upload_step(
+        steps,
+        "field.category",
+        f"ok={category_selected} | value={item['category']} | before={_format_upload_debug(category_before)} | after={_format_upload_debug(category_after)}",
+    )
+    brand_before = _collect_vinted_upload_picker_debug(
+        driver,
+        'input#brand[data-testid="brand-select-dropdown-input"][name="brand"]',
+        str(item["brand"]),
+    )
     brand_selected = _select_vinted_picker_option(
         driver,
         'input#brand[data-testid="brand-select-dropdown-input"][name="brand"]',
         str(item["brand"]),
     )
-    _append_upload_step(steps, "field.brand", f"ok={brand_selected} | value={item['brand']}")
+    brand_after = _collect_vinted_upload_picker_debug(
+        driver,
+        'input#brand[data-testid="brand-select-dropdown-input"][name="brand"]',
+        str(item["brand"]),
+    )
+    _append_upload_step(
+        steps,
+        "field.brand",
+        f"ok={brand_selected} | value={item['brand']} | before={_format_upload_debug(brand_before)} | after={_format_upload_debug(brand_after)}",
+    )
+    condition_before = _collect_vinted_upload_picker_debug(
+        driver,
+        'input#condition[data-testid="category-condition-single-list-input"][name="condition"]',
+        str(item["condition"]),
+    )
     condition_selected = _select_vinted_picker_option(
         driver,
         'input#condition[data-testid="category-condition-single-list-input"][name="condition"]',
         str(item["condition"]),
     )
-    _append_upload_step(steps, "field.condition", f"ok={condition_selected} | value={item['condition']}")
+    condition_after = _collect_vinted_upload_picker_debug(
+        driver,
+        'input#condition[data-testid="category-condition-single-list-input"][name="condition"]',
+        str(item["condition"]),
+    )
+    _append_upload_step(
+        steps,
+        "field.condition",
+        f"ok={condition_selected} | value={item['condition']} | before={_format_upload_debug(condition_before)} | after={_format_upload_debug(condition_after)}",
+    )
+    material_before = _collect_vinted_upload_picker_debug(
+        driver,
+        'input#material[data-testid="category-material-multi-list-input"][name="material"]',
+        str(item["material"]),
+    )
     material_selected = _select_vinted_picker_option(
         driver,
         'input#material[data-testid="category-material-multi-list-input"][name="material"]',
         str(item["material"]),
     )
-    _append_upload_step(steps, "field.material", f"ok={material_selected} | value={item['material']}")
+    material_after = _collect_vinted_upload_picker_debug(
+        driver,
+        'input#material[data-testid="category-material-multi-list-input"][name="material"]',
+        str(item["material"]),
+    )
+    _append_upload_step(
+        steps,
+        "field.material",
+        f"ok={material_selected} | value={item['material']} | before={_format_upload_debug(material_before)} | after={_format_upload_debug(material_after)}",
+    )
     price_filled = _fill_vinted_price_input(driver, '#price[data-testid="price-input--input"]', str(item["price"]))
-    _append_upload_step(steps, "field.price", f"ok={price_filled} | value={item['price']}")
+    _append_upload_step(
+        steps,
+        "field.price",
+        f"ok={price_filled} | value={item['price']} | dom={_format_upload_debug(_collect_vinted_upload_text_field_debug(driver, '#price[data-testid=\"price-input--input\"]'))}",
+    )
     field_debug = _collect_vinted_upload_field_debug(driver)
     _append_upload_step(
         steps,
@@ -360,10 +428,17 @@ def _upload_single_vinted_item(driver: Driver, config: dict) -> dict:
             if not ok
         ]
         debug_parts = [f"{key}={value}" for key, value in field_debug.items() if value]
+        picker_debug_parts = [
+            f"category_after={_format_upload_debug(category_after)}",
+            f"brand_after={_format_upload_debug(brand_after)}",
+            f"condition_after={_format_upload_debug(condition_after)}",
+            f"material_after={_format_upload_debug(material_after)}",
+        ]
         raise RuntimeError(
             "Impossibile compilare tutti i campi richiesti dell'annuncio Vinted."
             + (f" Failed: {', '.join(failed)}." if failed else "")
             + (f" DOM: {' | '.join(debug_parts)}" if debug_parts else "")
+            + (f" Picker debug: {' || '.join(part for part in picker_debug_parts if part)}" if picker_debug_parts else "")
         )
     _append_upload_step(steps, "fields.ready", "all required fields compiled")
 
@@ -1271,6 +1346,105 @@ return {
     return {str(key): normalize_whitespace(str(value or "")) for key, value in payload.items()}
 
 
+def _collect_vinted_upload_text_field_debug(driver: Driver, selector: str) -> dict[str, str | bool]:
+    payload = driver.run_js(
+        """
+const element = document.querySelector(args.selector);
+if (!element) {
+  return {
+    found: false,
+    value: '',
+    placeholder: '',
+    disabled: false,
+    aria_disabled: '',
+    tag: '',
+    page_url: String(window.location.href || ''),
+  };
+}
+return {
+  found: true,
+  value: String(element.value || element.getAttribute('value') || element.textContent || '').replace(/\\s+/g, ' ').trim(),
+  placeholder: String(element.getAttribute('placeholder') || '').replace(/\\s+/g, ' ').trim(),
+  disabled: !!element.disabled,
+  aria_disabled: String(element.getAttribute('aria-disabled') || '').replace(/\\s+/g, ' ').trim(),
+  tag: String(element.tagName || '').toLowerCase(),
+  page_url: String(window.location.href || ''),
+};
+        """,
+        {"selector": selector},
+    )
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "found": bool(payload.get("found")),
+        "value": normalize_whitespace(str(payload.get("value", "") or "")),
+        "placeholder": normalize_whitespace(str(payload.get("placeholder", "") or "")),
+        "disabled": bool(payload.get("disabled")),
+        "aria_disabled": normalize_whitespace(str(payload.get("aria_disabled", "") or "")),
+        "tag": normalize_whitespace(str(payload.get("tag", "") or "")),
+        "page_url": normalize_whitespace(str(payload.get("page_url", "") or "")),
+    }
+
+
+def _collect_vinted_upload_picker_debug(driver: Driver, input_selector: str, target_value: str = "") -> dict[str, str | bool]:
+    payload = driver.run_js(
+        """
+const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+const normalizeLower = (value) => normalize(value).toLowerCase();
+const isVisible = (element) => {
+  if (!element) return false;
+  const style = window.getComputedStyle(element);
+  return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+};
+const input = document.querySelector(args.selector);
+const target = normalizeLower(args.target || '');
+const visibleCandidates = [
+  ...document.querySelectorAll('[role="option"], [role="button"], li, button, div, span'),
+].filter((element) => isVisible(element));
+const optionTexts = visibleCandidates
+  .map((element) => normalize(element.innerText || element.textContent || element.value || ''))
+  .filter(Boolean);
+const matchedExact = optionTexts.find((text) => normalizeLower(text) === target) || '';
+const matchedLoose = optionTexts.find((text) => target && normalizeLower(text).includes(target)) || '';
+const searchInput =
+  document.querySelector('#catalog-search-input, input[name="catalog-search-input"], .input-dropdown input[type="text"]');
+return {
+  found: !!input,
+  input_value: input ? normalize(input.value || input.getAttribute('value') || input.textContent || '') : '',
+  placeholder: input ? normalize(input.getAttribute('placeholder') || '') : '',
+  aria_expanded: input ? normalize(input.getAttribute('aria-expanded') || '') : '',
+  aria_disabled: input ? normalize(input.getAttribute('aria-disabled') || '') : '',
+  disabled: input ? !!input.disabled : false,
+  page_url: normalize(window.location.href || ''),
+  visible_options_count: String(optionTexts.length),
+  visible_options_preview: optionTexts.slice(0, 8).join(' || '),
+  matched_exact: matchedExact,
+  matched_loose: matchedLoose,
+  search_input_value: searchInput ? normalize(searchInput.value || '') : '',
+  target: normalize(args.target || ''),
+};
+        """,
+        {"selector": input_selector, "target": target_value},
+    )
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "found": bool(payload.get("found")),
+        "input_value": normalize_whitespace(str(payload.get("input_value", "") or "")),
+        "placeholder": normalize_whitespace(str(payload.get("placeholder", "") or "")),
+        "aria_expanded": normalize_whitespace(str(payload.get("aria_expanded", "") or "")),
+        "aria_disabled": normalize_whitespace(str(payload.get("aria_disabled", "") or "")),
+        "disabled": bool(payload.get("disabled")),
+        "page_url": normalize_whitespace(str(payload.get("page_url", "") or "")),
+        "visible_options_count": normalize_whitespace(str(payload.get("visible_options_count", "") or "")),
+        "visible_options_preview": normalize_whitespace(str(payload.get("visible_options_preview", "") or "")),
+        "matched_exact": normalize_whitespace(str(payload.get("matched_exact", "") or "")),
+        "matched_loose": normalize_whitespace(str(payload.get("matched_loose", "") or "")),
+        "search_input_value": normalize_whitespace(str(payload.get("search_input_value", "") or "")),
+        "target": normalize_whitespace(str(payload.get("target", "") or "")),
+    }
+
+
 def _wait_for_vinted_uploaded_photo(driver: Driver, max_wait_seconds: float = 8.0) -> dict[str, str | bool]:
     attempts = max(1, int(max_wait_seconds / 0.5))
     for _ in range(attempts):
@@ -1553,10 +1727,25 @@ def _click_vinted_upload_save_draft(
     max_wait_seconds: float = 12.0,
     action_delay_seconds: float = 1.5,
 ) -> tuple[str | None, str]:
+    def dom_signature(state: dict[str, str | bool]) -> str:
+        return " | ".join(
+            [
+                str(state.get("found", "")),
+                str(state.get("visible", "")),
+                str(state.get("enabled", "")),
+                str(state.get("text", "") or ""),
+                str(state.get("class_name", "") or ""),
+                str(state.get("page_url", "") or ""),
+                str(state.get("page_title", "") or ""),
+                str(state.get("body_text", "") or ""),
+            ]
+        )
+
     attempts = min(3, max(2, int(max_wait_seconds / 2.0)))
     last_state: dict[str, str | bool] = {}
     for attempt in range(1, attempts + 1):
         last_state = _read_vinted_upload_save_draft_state(driver)
+        before_signature = dom_signature(last_state)
         print(
             f"[vinted-upload] draft attempt={attempt} before={_format_upload_debug(last_state)}",
             flush=True,
@@ -1636,12 +1825,15 @@ return normalize(button.innerText || button.textContent) || 'salva bozza';
         )
         stable_saved = False
         observed_state: dict[str, str | bool] = last_state
+        dom_changed = False
         post_click_waits = max(3, int(max(action_delay_seconds, 1.0) * 2))
         for tick in range(1, post_click_waits + 1):
             driver.sleep(0.5)
             observed_state = _read_vinted_upload_save_draft_state(driver)
+            after_signature = dom_signature(observed_state)
+            dom_changed = after_signature != before_signature
             print(
-                f"[vinted-upload] draft attempt={attempt} tick={tick} after={_format_upload_debug(observed_state)}",
+                f"[vinted-upload] draft attempt={attempt} tick={tick} dom_changed={dom_changed} after={_format_upload_debug(observed_state)}",
                 flush=True,
             )
             body_text = str(observed_state.get("body_text", "") or "").lower()
@@ -1654,6 +1846,8 @@ return normalize(button.innerText || button.textContent) || 'salva bozza';
                 "salvataggio completato",
             )
             if (
+                dom_changed
+                or
                 not observed_state.get("found")
                 or not observed_state.get("visible")
                 or not observed_state.get("enabled")
@@ -1665,9 +1859,38 @@ return normalize(button.innerText || button.textContent) || 'salva bozza';
             ):
                 stable_saved = True
                 break
+        if not stable_saved:
+            driver.sleep(2.0)
+            observed_state = _read_vinted_upload_save_draft_state(driver)
+            dom_changed = dom_signature(observed_state) != before_signature
+            print(
+                f"[vinted-upload] draft attempt={attempt} final-check dom_changed={dom_changed} after={_format_upload_debug(observed_state)}",
+                flush=True,
+            )
+            body_text = str(observed_state.get("body_text", "") or "").lower()
+            page_title = str(observed_state.get("page_title", "") or "").lower()
+            success_markers = (
+                "bozza salvata",
+                "draft saved",
+                "saved draft",
+                "bozza creata",
+                "salvataggio completato",
+            )
+            if (
+                dom_changed
+                or not observed_state.get("found")
+                or not observed_state.get("visible")
+                or not observed_state.get("enabled")
+                or observed_state.get("class_name") != last_state.get("class_name")
+                or observed_state.get("text") != last_state.get("text")
+                or observed_state.get("page_url") != last_state.get("page_url")
+                or any(marker in body_text for marker in success_markers)
+                or any(marker in page_title for marker in success_markers)
+            ):
+                stable_saved = True
         debug = (
             f"attempt={attempt} | before={_format_upload_debug(last_state)} | "
-            f"after={_format_upload_debug(observed_state)}"
+            f"dom_changed={dom_changed} | after={_format_upload_debug(observed_state)}"
         )
         if clicked_text and stable_saved:
             print(f"[vinted-upload] draft saved attempt={attempt}", flush=True)
@@ -1678,6 +1901,17 @@ return normalize(button.innerText || button.textContent) || 'salva bozza';
 
 
 def _build_vinted_upload_error_result(driver: Driver, item: dict, *, error: str) -> dict:
+    field_debug = _collect_vinted_upload_field_debug(driver)
+    material_picker_debug = _collect_vinted_upload_picker_debug(
+        driver,
+        'input#material[data-testid="category-material-multi-list-input"][name="material"]',
+        str(item.get("material", "") or ""),
+    )
+    brand_picker_debug = _collect_vinted_upload_picker_debug(
+        driver,
+        'input#brand[data-testid="brand-select-dropdown-input"][name="brand"]',
+        str(item.get("brand", "") or ""),
+    )
     return {
         "ok": False,
         "prepared": False,
@@ -1691,11 +1925,29 @@ def _build_vinted_upload_error_result(driver: Driver, item: dict, *, error: str)
         "photos_count": len(list(item.get("photo_paths", []) or [])),
         "current_url": current_page_url(driver),
         "error": error,
+        "field_debug": field_debug,
+        "material_picker_debug": material_picker_debug,
+        "brand_picker_debug": brand_picker_debug,
         "steps": [
             {
                 "at": datetime.now().isoformat(timespec="seconds"),
                 "stage": "error.result",
-                "message": error,
+                "message": error
+                + (
+                    f" | fields={_format_upload_debug(field_debug)}"
+                    if field_debug
+                    else ""
+                )
+                + (
+                    f" | material={_format_upload_debug(material_picker_debug)}"
+                    if material_picker_debug
+                    else ""
+                )
+                + (
+                    f" | brand={_format_upload_debug(brand_picker_debug)}"
+                    if brand_picker_debug
+                    else ""
+                ),
             }
         ],
     }
@@ -1728,11 +1980,36 @@ def _format_upload_debug(payload: dict[str, str | bool]) -> str:
         "remove_controls",
         "input_file_count",
         "input_file_names",
+        "found",
+        "value",
+        "input_value",
+        "placeholder",
+        "tag",
+        "text",
+        "target",
+        "matched_exact",
+        "matched_loose",
+        "visible_options_count",
+        "visible_options_preview",
+        "search_input_value",
+        "aria_expanded",
+        "aria_disabled",
+        "disabled",
+        "page_title",
+        "page_url",
+        "body_text",
     )
     parts: list[str] = []
+    seen: set[str] = set()
     for key in ordered_keys:
         if key not in payload:
             continue
+        seen.add(key)
+        value = normalize_whitespace(str(payload.get(key, "") or ""))
+        if not value:
+            continue
+        parts.append(f"{key}={value}")
+    for key in sorted(str(item) for item in payload.keys() if str(item) not in seen):
         value = normalize_whitespace(str(payload.get(key, "") or ""))
         if not value:
             continue
@@ -1741,15 +2018,31 @@ def _format_upload_debug(payload: dict[str, str | bool]) -> str:
 
 
 def _normalize_upload_item(item: dict) -> dict[str, object]:
+    def strip_noise(value: str) -> str:
+        cleaned = normalize_whitespace(str(value or ""))
+        cleaned = re.sub(
+            r"\bvarianti?\s*\d+\b",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\b(?:con\s+)?(?:una|un|due|tre|quattro|one|two|three|four)\s+varianti?\b",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        return normalize_whitespace(cleaned).strip(" ,;-")
+
     if not isinstance(item, dict):
         raise ValueError("Upload item Vinted non valido.")
     title = normalize_whitespace(str(item.get("title", "") or ""))
     description = normalize_whitespace(str(item.get("description", "") or ""))
     price = normalize_whitespace(str(item.get("price", "") or ""))
-    category = normalize_whitespace(str(item.get("category", "") or ""))
-    brand = normalize_whitespace(str(item.get("brand", "") or ""))
-    condition = normalize_whitespace(str(item.get("condition", "") or ""))
-    material = normalize_whitespace(str(item.get("material", "") or ""))
+    category = strip_noise(str(item.get("category", "") or ""))
+    brand = strip_noise(str(item.get("brand", "") or ""))
+    condition = strip_noise(str(item.get("condition", "") or ""))
+    material = strip_noise(str(item.get("material", "") or ""))
     raw_photo_paths = list(item.get("photo_paths", []) or [])
     photo_paths = [str(Path(path).expanduser().resolve()) for path in raw_photo_paths if str(path or "").strip()]
     if not title:
