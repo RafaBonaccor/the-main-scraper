@@ -478,8 +478,14 @@ class ScraperApp:
         self.vinted_ai_status_var = tk.StringVar(value="AI Listing Studio pronto.")
         self.vinted_ai_prompt_seed = (
             "Create a cleaner marketplace-ready product photo for Vinted. "
-            "Keep the item identity accurate, improve lighting, remove distractions, "
-            "use a neutral background, and keep the framing suitable for a vertical fashion listing."
+            "Keep the item identity accurate, with true colors, materials, and details. If the photo "
+            "contains packaging, boxes, bags, tags, wrapping, branded packaging, shipping materials, or "
+            "display supports, remove them completely unless they are physically part of the product. "
+            "Only the product for sale must remain visible. Improve lighting and clarity while keeping "
+            "the image realistic. Use a simple home-style background that is not empty, softly matched "
+            "to the item, minimal, believable, and not studio-like. Remove distractions, keep the "
+            "framing natural and vertical, and make the result look authentic and ready for sale on "
+            "Vinted."
         )
         self.vinted_profile_session_var = tk.StringVar(value="Controllo in corso...")
         self.vinted_profile_cookies_var = tk.StringVar(value="-")
@@ -2100,6 +2106,16 @@ class ScraperApp:
             wraplength=460,
             justify="left",
         ).grid(row=17, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        subito_actions = ttk.Frame(card, style="Panel.TFrame")
+        subito_actions.grid(row=18, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        self.subito_run_button = ttk.Button(
+            subito_actions,
+            text="Avvia ricerca Subito",
+            style="Run.TButton",
+            command=self._start_scrape,
+        )
+        self.subito_run_button.grid(row=0, column=0, sticky="ew")
+        subito_actions.columnconfigure(0, weight=1)
 
     def _build_custom_tab(self) -> None:
         self.custom_scroll = VerticalScrolledFrame(self.custom_tab, background=APP_BG)
@@ -2425,6 +2441,13 @@ class ScraperApp:
         self.contact_selected_button.grid(row=5, column=1, sticky="ew", pady=(12, 0), padx=(6, 6))
         self.contact_accepted_button = ttk.Button(contact_card, text="Invia CV a tutti i consigliati", style="Accent.TButton", command=self._start_batch_contact_accepted)
         self.contact_accepted_button.grid(row=5, column=2, sticky="ew", pady=(12, 0))
+        self.subito_export_selected_button = ttk.Button(
+            contact_card,
+            text="Esporta URL TXT",
+            style="Secondary.TButton",
+            command=self._export_selected_subito_links_txt,
+        )
+        self.subito_export_selected_button.grid(row=6, column=1, sticky="ew", pady=(10, 0), padx=(6, 6))
         self.subito_open_selected_button = ttk.Button(contact_card, text="Apri annuncio", style="Secondary.TButton", command=self._open_selected_link)
         self.subito_open_selected_button.grid(row=6, column=2, sticky="ew", pady=(10, 0))
         contact_card.columnconfigure(1, weight=1)
@@ -2845,8 +2868,11 @@ class ScraperApp:
         has_website = row is not None and bool(str(row.get("website", "") or "").strip())
         is_subito = has_row and str(row.get("source", "") or "").strip().lower() == "subito"
         is_vinted = has_row and str(row.get("source", "") or "").strip().lower() == "vinted"
+        selected_subito_rows = [item for item in selected_rows if str(item.get("source", "") or "").strip().lower() == "subito"]
         self.open_selected_button.configure(state="normal" if has_row else "disabled")
         self.subito_open_selected_button.configure(state="normal" if has_row else "disabled")
+        if hasattr(self, "subito_export_selected_button"):
+            self.subito_export_selected_button.configure(state="normal" if selected_subito_rows else "disabled")
         self.open_website_button.configure(state="normal" if has_website else "disabled")
         self.export_links_button.configure(state="normal" if selected_rows_with_links else "disabled")
         self.vinted_offer_button.configure(
@@ -4758,6 +4784,8 @@ class ScraperApp:
         self.run_button.configure(state="disabled")
         self.open_browser_button.configure(state="disabled")
         self.vinted_run_button.configure(state="disabled")
+        if hasattr(self, "subito_run_button"):
+            self.subito_run_button.configure(state="disabled")
         self._set_stop_process_buttons_state("normal")
         if kind == "contact":
             self.contact_button.configure(state="disabled")
@@ -5557,6 +5585,8 @@ class ScraperApp:
                 self.run_button.configure(state="normal")
                 self.open_browser_button.configure(state="normal")
                 self.vinted_run_button.configure(state="normal")
+                if hasattr(self, "subito_run_button"):
+                    self.subito_run_button.configure(state="normal")
                 self._set_stop_process_buttons_state("disabled")
                 self._update_result_actions()
                 if stop_requested:
@@ -6718,6 +6748,33 @@ class ScraperApp:
         else:
             destination.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
         messagebox.showinfo("Esporta link", f"Esportati {len(items)} link in:\n\n{destination}")
+
+    def _export_selected_subito_links_txt(self) -> None:
+        selected_rows = [
+            row for row in self._get_selected_rows()
+            if str(row.get("source", "") or "").strip().lower() == "subito"
+        ]
+        items = self._build_selected_link_export_items(selected_rows)
+        if not items:
+            messagebox.showerror("Esporta URL Subito", "Seleziona almeno un annuncio Subito con un link valido.")
+            return
+        output_dir = Path(self.output_dir_var.get().strip() or self.script_path.parent / "output").resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        selected_path = filedialog.asksaveasfilename(
+            initialdir=str(output_dir),
+            initialfile="subito_selected_urls.txt",
+            defaultextension=".txt",
+            filetypes=(
+                ("Text links", "*.txt"),
+                ("Tutti i file", "*.*"),
+            ),
+        )
+        if not selected_path:
+            return
+        destination = Path(selected_path).expanduser()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("\n".join(item["link"] for item in items) + "\n", encoding="utf-8")
+        messagebox.showinfo("Esporta URL Subito", f"Esportati {len(items)} URL in:\n\n{destination}")
 
     def _get_accepted_subito_rows(self) -> list[dict]:
         rows: list[dict] = []
