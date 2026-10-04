@@ -13,6 +13,7 @@ from .sources.custom_site import run_custom_site_scraper
 from .sources.google_maps import run_google_maps_scraper
 from .sources.subito import run_subito_scraper
 from .sources.vinted import run_vinted_description_extractor, run_vinted_scraper
+from .sources.vinted_profile import run_vinted_profile_monitor
 from .utils import parse_text_list
 from .vinted_gateway import build_vinted_deal_hunter_search_specs
 
@@ -44,6 +45,27 @@ def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
     if source == "vinted_descriptions":
         return run_vinted_description_extractor(
             items=_resolve_vinted_items(kwargs),
+            db_path=kwargs.get("db_path", "data/scraper.db"),
+            ui_result_json=kwargs.get("ui_result_json", ""),
+            browser_mode=kwargs.get("browser_mode", "chrome_normale"),
+            browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
+            browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
+            keep_browser_open=bool(kwargs.get("keep_browser_open", True)),
+            refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
+            keep_open_seconds=int(kwargs.get("keep_open_seconds", 0)),
+            slow_mode=bool(kwargs.get("slow_mode", False)),
+            action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
+            page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
+            discord_profile_report=bool(kwargs.get("discord_profile_report", False)),
+            discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
+        )
+
+    if source == "vinted_profile":
+        return run_vinted_profile_monitor(
+            profile_url=kwargs.get("profile_url", kwargs.get("url", "")),
+            profile_urls=_resolve_vinted_profile_urls(kwargs),
+            max_items=int(kwargs.get("max_items", kwargs.get("max_results", 0)) or 0),
+            interval_seconds=int(kwargs.get("interval_seconds", 0) or 0),
             db_path=kwargs.get("db_path", "data/scraper.db"),
             ui_result_json=kwargs.get("ui_result_json", ""),
             browser_mode=kwargs.get("browser_mode", "chrome_normale"),
@@ -113,6 +135,31 @@ def _resolve_vinted_items(kwargs: dict) -> list[dict | str]:
     return []
 
 
+def _resolve_vinted_profile_urls(kwargs: dict) -> list[str]:
+    profiles_file = str(kwargs.get("profiles_file", "") or "").strip()
+    if profiles_file:
+        path = Path(profiles_file).expanduser()
+        if not path.exists():
+            raise ValueError(f"File profili Vinted non trovato: {path}")
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            return []
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(item or "").strip() for item in parsed if str(item or "").strip()]
+        return [line.strip() for line in content.replace(";", "\n").splitlines() if line.strip()]
+    raw_profile_urls = kwargs.get("profile_urls")
+    if isinstance(raw_profile_urls, list):
+        return [str(item or "").strip() for item in raw_profile_urls if str(item or "").strip()]
+    if raw_profile_urls:
+        return [str(raw_profile_urls)]
+    single_profile = str(kwargs.get("profile_url", kwargs.get("url", "")) or "").strip()
+    return [single_profile] if single_profile else []
+
+
 def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
     search_specs = _resolve_vinted_search_specs(kwargs)
     if not search_specs:
@@ -160,12 +207,14 @@ def _run_vinted_queries_once(search_specs: list[dict], **kwargs) -> ScrapeOutcom
         return run_vinted_scraper(
             search=spec["search"],
             max_results=int(spec.get("max_results", 100)),
+            min_price=_parse_optional_nonnegative_float(kwargs.get("deal_hunter_min_price")),
             max_price=spec.get("max_price"),
             deal_hunter_min_favorites=int(kwargs.get("deal_hunter_min_favorites", 0) or 0),
             deal_hunter_max_age_hours=float(kwargs.get("deal_hunter_max_age_hours", 24.0) or 0),
             exclude_known_items=bool(kwargs.get("exclude_known_items", True)),
             discord_deal_notifications=bool(kwargs.get("discord_deal_notifications", False)),
             discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
+            deal_hunter_url_only_discord=bool(kwargs.get("deal_hunter_url_only_discord", False)),
             auto_submit_offers=bool(kwargs.get("auto_submit_offers", True)),
             db_path=kwargs.get("db_path", "data/scraper.db"),
             ui_result_json=kwargs.get("ui_result_json", ""),
@@ -208,12 +257,14 @@ def _run_vinted_queries_once(search_specs: list[dict], **kwargs) -> ScrapeOutcom
             outcome = run_vinted_scraper(
                 search=spec["search"],
                 max_results=int(spec.get("max_results", 100)),
+                min_price=_parse_optional_nonnegative_float(kwargs.get("deal_hunter_min_price")),
                 max_price=spec.get("max_price"),
                 deal_hunter_min_favorites=int(kwargs.get("deal_hunter_min_favorites", 0) or 0),
                 deal_hunter_max_age_hours=float(kwargs.get("deal_hunter_max_age_hours", 24.0) or 0),
                 exclude_known_items=bool(kwargs.get("exclude_known_items", True)),
                 discord_deal_notifications=bool(kwargs.get("discord_deal_notifications", False)),
                 discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
+                deal_hunter_url_only_discord=bool(kwargs.get("deal_hunter_url_only_discord", False)),
                 auto_submit_offers=bool(kwargs.get("auto_submit_offers", True)),
                 db_path=kwargs.get("db_path", "data/scraper.db"),
                 ui_result_json=str(kwargs.get("ui_result_json", "") or "") if deal_hunter_enabled else "",
@@ -362,10 +413,12 @@ def _build_vinted_batch_outcome(
             "deal_hunter_enabled": bool(last_meta.get("deal_hunter_enabled", False)),
             "deal_hunter_min_favorites": int(kwargs.get("deal_hunter_min_favorites", 0) or 0),
             "deal_hunter_max_age_hours": float(kwargs.get("deal_hunter_max_age_hours", 24.0) or 0),
+            "deal_hunter_min_price": _parse_optional_nonnegative_float(kwargs.get("deal_hunter_min_price")),
             "deal_hunter_candidates": deal_hunter_candidates,
             "deal_hunter_matches": deal_hunter_matches,
             "discord_deal_notifications": bool(kwargs.get("discord_deal_notifications", False)),
             "discord_webhook_url_configured": bool(str(kwargs.get("discord_webhook_url", "") or "").strip()),
+            "deal_hunter_url_only_discord": bool(kwargs.get("deal_hunter_url_only_discord", False)),
             "search_errors": search_errors,
             "keep_browser_open": bool(kwargs.get("keep_browser_open", True)),
             "keep_open_seconds": int(kwargs.get("keep_open_seconds", 0)),

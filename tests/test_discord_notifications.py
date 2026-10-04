@@ -7,6 +7,7 @@ from scraper_app.discord_notifications import (
     build_scraper_error_discord_message,
     build_vinted_deal_discord_message,
     build_vinted_login_required_discord_message,
+    build_vinted_profile_report_discord_message,
     send_discord_webhook_message,
 )
 from scraper_app.vinted_database import load_vinted_notified_deal_keys, save_vinted_deal_notifications
@@ -61,6 +62,31 @@ class DiscordNotificationsTests(unittest.TestCase):
         self.assertIn("2026-07-21T11:30:00", message)
         self.assertIn("<https://www.vinted.it/catalog/21-jewellery>", message)
 
+    def test_build_vinted_profile_report_includes_sold_after_duration(self) -> None:
+        message = build_vinted_profile_report_discord_message(
+            {
+                "profile_url": "https://www.vinted.it/member/262102939",
+                "profile_item_count": 1,
+                "profile_new_count": 0,
+                "profile_gone_count": 1,
+                "profile_still_count": 1,
+                "profile_checked_at": "2026-10-04T10:00:00",
+            },
+            [
+                {
+                    "profile_item_status": "gone",
+                    "name": "Charm cuore",
+                    "price": "10,00 €",
+                    "profile_sold_after_text": "2g 3h",
+                    "link": "https://www.vinted.it/items/100-charm",
+                }
+            ],
+        )
+
+        self.assertIn("Report profilo Vinted", message)
+        self.assertIn("Spariti/venduti/rimossi: 1", message)
+        self.assertIn("venduto/sparito dopo 2g 3h", message)
+
     def test_build_scraper_error_discord_message_contains_context(self) -> None:
         message = build_scraper_error_discord_message(
             "Offerta Vinted fallita",
@@ -79,12 +105,14 @@ class DiscordNotificationsTests(unittest.TestCase):
         result = send_discord_webhook_message(
             "https://discord.com/api/webhooks/test/token",
             "ciao",
+            embeds=[{"image": {"url": "https://images1.vinted.net/t/test.webp"}}],
         )
 
         self.assertTrue(result["ok"])
         self.assertEqual(204, result["status_code"])
         request = mocked_urlopen.call_args.args[0]
         self.assertEqual("application/json", request.get_header("Content-type"))
+        self.assertIn("https://images1.vinted.net/t/test.webp", request.data.decode("utf-8"))
         self.assertIn("Mozilla/5.0", str(request.get_header("User-agent") or ""))
         self.assertIsNone(request.get_header("Origin"))
         self.assertIsNone(request.get_header("Referer"))

@@ -50,6 +50,21 @@ def build_vinted_item_identity_key(item_id: object = "", link: object = "") -> s
     return keys[0] if keys else ""
 
 
+def normalize_vinted_member_id(profile_url: object) -> str:
+    raw_url = str(profile_url or "").strip()
+    if not raw_url:
+        return ""
+    try:
+        parsed = urlsplit(raw_url)
+    except ValueError:
+        return ""
+    match = re.search(r"/member/(\d+)", parsed.path)
+    if match:
+        return match.group(1)
+    match = re.search(r"\b(\d{4,})\b", raw_url)
+    return match.group(1) if match else ""
+
+
 def load_vinted_known_item_keys(db_path: str | Path = DEFAULT_VINTED_DB_PATH) -> set[str]:
     path = Path(db_path).expanduser().resolve()
     ensure_vinted_database(path)
@@ -959,6 +974,257 @@ def delete_vinted_search_run(
     }
 
 
+def save_vinted_profile_snapshot(
+    profile_url: str,
+    rows: list[dict],
+    db_path: str | Path = DEFAULT_VINTED_DB_PATH,
+) -> dict[str, object]:
+    path = Path(db_path).expanduser().resolve()
+    ensure_vinted_database(path)
+    normalized_profile_url = str(profile_url or "").strip()
+    member_id = normalize_vinted_member_id(normalized_profile_url)
+    snapshot_at = datetime.now().isoformat(timespec="seconds")
+    normalized_rows: list[dict] = []
+    seen_links: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        link = str(row.get("link", "") or "").strip()
+        if not link or link in seen_links:
+            continue
+        seen_links.add(link)
+        item_id = str(row.get("item_id", "") or "").strip() or extract_vinted_item_id_from_link(link)
+        normalized = dict(row)
+        normalized["link"] = link
+        normalized["item_id"] = item_id
+        normalized["profile_url"] = normalized_profile_url
+        normalized["member_id"] = member_id
+        normalized_rows.append(normalized)
+    current_links = {str(row.get("link", "") or "") for row in normalized_rows}
+    current_links.discard("")
+
+    try:
+        with closing(sqlite3.connect(path)) as connection:
+            connection.row_factory = sqlite3.Row
+            _create_schema(connection)
+            previous_snapshot = connection.execute(
+                """
+                SELECT id
+                FROM vinted_profile_snapshots
+                WHERE member_id = ? AND profile_url = ?
+                ORDER BY checked_at DESC, id DESC
+                LIMIT 1
+                """,
+                (member_id, normalized_profile_url),
+            ).fetchone()
+            previous_links: set[str] = set()
+            if previous_snapshot is not None:
+                previous_links = {
+                    str(record[0] or "")
+                    for record in connection.execute(
+                        """
+                        SELECT item_link
+                        FROM vinted_profile_snapshot_items
+                        WHERE snapshot_id = ? AND present = 1
+                        """,
+                        (int(previous_snapshot["id"]),),
+                    ).fetchall()
+                    if str(record[0] or "")
+                }
+
+            new_links = current_links - previous_links
+            gone_links = previous_links - current_links
+            still_links = current_links & previous_links
+            history_by_link = _load_vinted_profile_item_history(
+                connection,
+                member_id=member_id,
+                profile_url=normalized_profile_url,
+                links=current_links | gone_links,
+                sold_at=snapshot_at,
+            )
+
+            snapshot = connection.execute(
+                """
+                INSERT INTO vinted_profile_snapshots (
+                    member_id, profile_url, checked_at, item_count,
+                    new_count, gone_count, still_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    member_id,
+                    normalized_profile_url,
+                    snapshot_at,
+                    len(current_links),
+                    len(new_links),
+                    len(gone_links),
+                    len(still_links),
+                ),
+            )
+            snapshot_id = int(snapshot.lastrowid)
+
+            current_by_link = {str(row.get("link", "") or ""): row for row in normalized_rows}
+            all_links = sorted(current_links | gone_links)
+            for link in all_links:
+                row = current_by_link.get(link, {})
+                status = "new" if link in new_links else "gone" if link in gone_links else "still_active"
+                history = history_by_link.get(link, {})
+                if status == "gone":
+                    row = {
+                        "source": "vinted_profile",
+                        "profile_url": normalized_profile_url,
+                        "member_id": member_id,
+                        "link": link,
+                        "item_id": extract_vinted_item_id_from_link(link),
+                        "name": str(history.get("item_name", "") or ""),
+                        "price": str(history.get("price_text", "") or ""),
+                        "image_url": str(history.get("image_url", "") or ""),
+                        "profile_item_status": "gone",
+                        "profile_first_seen_at": str(history.get("first_seen_at", "") or ""),
+                        "profile_last_seen_at": str(history.get("last_seen_at", "") or ""),
+                        "profile_sold_after_seconds": history.get("sold_after_seconds"),
+                        "profile_sold_after_text": str(history.get("sold_after_text", "") or ""),
+                        "extracted_at": snapshot_at,
+                    }
+                connection.execute(
+                    """
+                    INSERT INTO vinted_profile_snapshot_items (
+                        snapshot_id, member_id, profile_url, item_link, item_id,
+                        item_name, price_text, image_url, status, present, snapshot_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        member_id,
+                        normalized_profile_url,
+                        link,
+                        str(row.get("item_id", "") or extract_vinted_item_id_from_link(link)),
+                        str(row.get("name", "") or ""),
+                        str(row.get("price", "") or ""),
+                        str(row.get("image_url", "") or ""),
+                        status,
+                        0 if status == "gone" else 1,
+                        json.dumps(row, ensure_ascii=False),
+                    ),
+                )
+            connection.commit()
+    except sqlite3.Error as exc:
+        raise ValueError(f"Database Vinted non valido: {exc}") from exc
+
+    for row in normalized_rows:
+        link = str(row.get("link", "") or "")
+        history = history_by_link.get(link, {})
+        row["profile_item_status"] = "new" if link in new_links else "still_active"
+        row["profile_first_seen_at"] = str(history.get("first_seen_at", "") or snapshot_at)
+        row["profile_last_seen_at"] = snapshot_at
+    gone_rows = [
+        {
+            "source": "vinted_profile",
+            "profile_url": normalized_profile_url,
+            "member_id": member_id,
+            "link": link,
+            "item_id": extract_vinted_item_id_from_link(link),
+            "name": str(history_by_link.get(link, {}).get("item_name", "") or ""),
+            "price": str(history_by_link.get(link, {}).get("price_text", "") or ""),
+            "image_url": str(history_by_link.get(link, {}).get("image_url", "") or ""),
+            "profile_item_status": "gone",
+            "profile_first_seen_at": str(history_by_link.get(link, {}).get("first_seen_at", "") or ""),
+            "profile_last_seen_at": str(history_by_link.get(link, {}).get("last_seen_at", "") or ""),
+            "profile_sold_after_seconds": history_by_link.get(link, {}).get("sold_after_seconds"),
+            "profile_sold_after_text": str(history_by_link.get(link, {}).get("sold_after_text", "") or ""),
+            "extracted_at": snapshot_at,
+        }
+        for link in sorted(gone_links)
+    ]
+    return {
+        "db_path": str(path),
+        "profile_snapshot_id": snapshot_id,
+        "profile_checked_at": snapshot_at,
+        "profile_member_id": member_id,
+        "profile_item_count": len(current_links),
+        "profile_new_count": len(new_links),
+        "profile_gone_count": len(gone_links),
+        "profile_still_count": len(still_links),
+        "profile_current_rows": normalized_rows,
+        "profile_gone_rows": gone_rows,
+        "db_saved_live": True,
+    }
+
+
+def _load_vinted_profile_item_history(
+    connection: sqlite3.Connection,
+    *,
+    member_id: str,
+    profile_url: str,
+    links: set[str],
+    sold_at: str,
+) -> dict[str, dict[str, object]]:
+    history_by_link: dict[str, dict[str, object]] = {}
+    for link in links:
+        records = connection.execute(
+            """
+            SELECT
+                psi.item_name,
+                psi.price_text,
+                psi.image_url,
+                s.checked_at
+            FROM vinted_profile_snapshot_items psi
+            JOIN vinted_profile_snapshots s ON s.id = psi.snapshot_id
+            WHERE psi.member_id = ?
+              AND psi.profile_url = ?
+              AND psi.item_link = ?
+              AND psi.present = 1
+            ORDER BY s.checked_at ASC, s.id ASC
+            """,
+            (member_id, profile_url, link),
+        ).fetchall()
+        if not records:
+            continue
+        first_seen_at = str(records[0]["checked_at"] or "")
+        last_record = records[-1]
+        last_seen_at = str(last_record["checked_at"] or "")
+        sold_after_seconds = _seconds_between_iso(first_seen_at, sold_at)
+        history_by_link[link] = {
+            "item_name": str(last_record["item_name"] or ""),
+            "price_text": str(last_record["price_text"] or ""),
+            "image_url": str(last_record["image_url"] or ""),
+            "first_seen_at": first_seen_at,
+            "last_seen_at": last_seen_at,
+            "sold_after_seconds": sold_after_seconds,
+            "sold_after_text": _format_duration_seconds(sold_after_seconds),
+        }
+    return history_by_link
+
+
+def _seconds_between_iso(start: str, end: str) -> int | None:
+    try:
+        start_dt = datetime.fromisoformat(str(start or ""))
+        end_dt = datetime.fromisoformat(str(end or ""))
+    except ValueError:
+        return None
+    return max(int((end_dt - start_dt).total_seconds()), 0)
+
+
+def _format_duration_seconds(seconds: object) -> str:
+    if seconds in (None, ""):
+        return ""
+    try:
+        total_seconds = max(int(seconds), 0)
+    except (TypeError, ValueError):
+        return ""
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _seconds = divmod(remainder, 60)
+    if days:
+        return f"{days}g {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return "meno di 1m"
+
+
 def _create_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -1068,6 +1334,43 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_vinted_deal_notifications_item_id
         ON vinted_deal_notifications(item_id);
+
+        CREATE TABLE IF NOT EXISTS vinted_profile_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            member_id TEXT NOT NULL DEFAULT '',
+            profile_url TEXT NOT NULL DEFAULT '',
+            checked_at TEXT NOT NULL,
+            item_count INTEGER NOT NULL DEFAULT 0,
+            new_count INTEGER NOT NULL DEFAULT 0,
+            gone_count INTEGER NOT NULL DEFAULT 0,
+            still_count INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vinted_profile_snapshots_profile
+        ON vinted_profile_snapshots(member_id, profile_url, checked_at DESC);
+
+        CREATE TABLE IF NOT EXISTS vinted_profile_snapshot_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            member_id TEXT NOT NULL DEFAULT '',
+            profile_url TEXT NOT NULL DEFAULT '',
+            item_link TEXT NOT NULL DEFAULT '',
+            item_id TEXT NOT NULL DEFAULT '',
+            item_name TEXT NOT NULL DEFAULT '',
+            price_text TEXT NOT NULL DEFAULT '',
+            image_url TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            present INTEGER NOT NULL DEFAULT 1,
+            snapshot_json TEXT NOT NULL DEFAULT '',
+            UNIQUE(snapshot_id, item_link),
+            FOREIGN KEY(snapshot_id) REFERENCES vinted_profile_snapshots(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vinted_profile_snapshot_items_profile
+        ON vinted_profile_snapshot_items(member_id, profile_url, item_link);
+
+        CREATE INDEX IF NOT EXISTS idx_vinted_profile_snapshot_items_status
+        ON vinted_profile_snapshot_items(snapshot_id, status);
         """
     )
     _ensure_vinted_search_hits_tag_column(connection)

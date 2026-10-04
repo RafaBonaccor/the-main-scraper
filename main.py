@@ -103,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum item price to keep for this Vinted search. Leave empty for no price cap.",
     )
     vinted_parser.add_argument(
+        "--deal-hunter-min-price",
+        default="",
+        help="Minimum item price required before a Vinted deal-hunter result can be notified on Discord.",
+    )
+    vinted_parser.add_argument(
         "--deal-hunter-min-favorites",
         default=0,
         type=int,
@@ -148,6 +153,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Discord webhook URL used for Vinted deal notifications.",
     )
     vinted_parser.add_argument(
+        "--deal-hunter-url-only-discord",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="In deal-hunter mode, skip Vinted login/detail extraction and send public catalog candidate URLs to Discord.",
+    )
+    vinted_parser.add_argument(
         "--auto-submit-offers",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -174,6 +185,55 @@ def build_parser() -> argparse.ArgumentParser:
     _add_orchestrator_arguments(vinted_parser)
     _add_browser_arguments(vinted_parser)
     _add_export_arguments(vinted_parser)
+
+    vinted_profile_parser = run_subparsers.add_parser("vinted_profile", help="Monitor one or more Vinted seller profiles and track listed/sold/removed items.")
+    vinted_profile_parser.add_argument("--profile-url", "--url", dest="profile_url", default="", help="Single Vinted member URL, e.g. https://www.vinted.it/member/262102939")
+    vinted_profile_parser.add_argument("--profile-urls", default="", help="Newline-separated Vinted member URLs. Commas/semicolons and numeric IDs are also accepted.")
+    vinted_profile_parser.add_argument("--profiles-file", default="", help="UTF-8 text or JSON file containing multiple Vinted member URLs.")
+    vinted_profile_parser.add_argument(
+        "--max-items",
+        default=0,
+        type=int,
+        help="Maximum profile items to keep. Use 0 to scroll until no new items are found.",
+    )
+    vinted_profile_parser.add_argument(
+        "--interval-seconds",
+        default=0,
+        type=int,
+        help="If greater than zero, keep monitoring the profile with this pause between checks. Use 3600 for hourly checks.",
+    )
+    vinted_profile_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
+    vinted_profile_parser.add_argument(
+        "--keep-browser-open",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Leave the Vinted browser open between profile checks.",
+    )
+    vinted_profile_parser.add_argument(
+        "--refresh-browser-profile",
+        action="store_true",
+        help="Refresh the persistent profile from the source Chrome data before monitoring Vinted.",
+    )
+    vinted_profile_parser.add_argument(
+        "--keep-open-seconds",
+        default=0,
+        type=int,
+        help="Seconds to keep the browser open after a one-shot profile check.",
+    )
+    vinted_profile_parser.add_argument(
+        "--discord-profile-report",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Send every Vinted profile snapshot report to a Discord webhook.",
+    )
+    vinted_profile_parser.add_argument(
+        "--discord-webhook-url",
+        default="",
+        help="Discord webhook URL used for Vinted profile reports.",
+    )
+    _add_orchestrator_arguments(vinted_profile_parser)
+    _add_browser_arguments(vinted_profile_parser)
+    _add_export_arguments(vinted_profile_parser)
 
     vinted_details_parser = run_subparsers.add_parser(
         "vinted_descriptions",
@@ -670,6 +730,15 @@ def _normalize_meta_summary(source: str, meta: dict) -> dict:
             "row_count": int(meta.get("row_count", 0) or 0),
             "db_path": str(meta.get("db_path", "") or ""),
         }
+    if source == "vinted_profile":
+        return {
+            "profile_url": str(meta.get("profile_url", "") or ""),
+            "member_id": str(meta.get("member_id", "") or meta.get("profile_member_id", "") or ""),
+            "current_items": int(meta.get("profile_item_count", 0) or 0),
+            "new_items": int(meta.get("profile_new_count", 0) or 0),
+            "gone_items": int(meta.get("profile_gone_count", 0) or 0),
+            "db_path": str(meta.get("db_path", "") or ""),
+        }
     if source == "subito":
         return {
             "query": str(meta.get("query", "") or ""),
@@ -714,6 +783,22 @@ def _normalize_row(source: str, row: dict) -> dict:
             "offer_last_value": _safe_float_or_none(row.get("offer_last_value")),
             "first_seen_at": str(row.get("first_seen_at", "") or ""),
             "last_seen_at": str(row.get("last_seen_at", row.get("extracted_at", "")) or ""),
+        }
+    if source == "vinted_profile":
+        return {
+            "id": str(row.get("item_id", "") or ""),
+            "title": str(row.get("name", "") or ""),
+            "link": str(row.get("link", "") or ""),
+            "profile_url": str(row.get("profile_url", "") or ""),
+            "member_id": str(row.get("member_id", "") or ""),
+            "status": str(row.get("profile_item_status", "") or ""),
+            "price_text": str(row.get("price", "") or ""),
+            "image_url": str(row.get("image_url", "") or ""),
+            "first_seen_at": str(row.get("profile_first_seen_at", "") or ""),
+            "last_profile_seen_at": str(row.get("profile_last_seen_at", "") or ""),
+            "sold_after_seconds": _safe_float_or_none(row.get("profile_sold_after_seconds")),
+            "sold_after_text": str(row.get("profile_sold_after_text", "") or ""),
+            "last_seen_at": str(row.get("extracted_at", "") or ""),
         }
     if source == "subito":
         return {

@@ -42,6 +42,7 @@ from scraper_app.sources.vinted import (
     parse_vinted_favorite_count,
     parse_vinted_price,
 )
+from scraper_app.sources.vinted_profile import normalize_vinted_profile_urls
 from scraper_app.vinted_database import (
     annotate_rows_with_vinted_offer_history,
     build_vinted_item_identity_keys,
@@ -51,6 +52,7 @@ from scraper_app.vinted_database import (
     load_vinted_known_item_keys,
     load_vinted_submitted_offer_keys,
     load_vinted_rows,
+    save_vinted_profile_snapshot,
     save_vinted_offer_results,
     save_vinted_rows,
     update_vinted_search_run,
@@ -58,6 +60,48 @@ from scraper_app.vinted_database import (
 
 
 class VintedTests(unittest.TestCase):
+    def test_normalize_vinted_profile_urls_accepts_multiple_formats(self) -> None:
+        self.assertEqual(
+            [
+                "https://www.vinted.it/member/262102939",
+                "https://www.vinted.it/member/123456789",
+            ],
+            normalize_vinted_profile_urls("262102939\nhttps://www.vinted.it/member/123456789,262102939"),
+        )
+
+    def test_save_vinted_profile_snapshot_tracks_new_and_gone_items(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            profile_url = "https://www.vinted.it/member/262102939"
+
+            first = save_vinted_profile_snapshot(
+                profile_url,
+                [
+                    {"link": "https://www.vinted.it/items/100-a", "name": "A", "price": "10,00 €"},
+                    {"link": "https://www.vinted.it/items/200-b", "name": "B", "price": "20,00 €"},
+                ],
+                db_path=db_path,
+            )
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute("UPDATE vinted_profile_snapshots SET checked_at = '2026-01-01T10:00:00'")
+                connection.commit()
+            second_rows = [
+                {"link": "https://www.vinted.it/items/200-b", "name": "B", "price": "20,00 €"},
+                {"link": "https://www.vinted.it/items/300-c", "name": "C", "price": "30,00 €"},
+            ]
+            second = save_vinted_profile_snapshot(profile_url, second_rows, db_path=db_path)
+
+        self.assertEqual(2, first["profile_new_count"])
+        self.assertEqual(0, first["profile_gone_count"])
+        self.assertEqual(1, second["profile_new_count"])
+        self.assertEqual(1, second["profile_gone_count"])
+        self.assertEqual("still_active", second["profile_current_rows"][0]["profile_item_status"])
+        self.assertEqual("new", second["profile_current_rows"][1]["profile_item_status"])
+        self.assertEqual("100", second["profile_gone_rows"][0]["item_id"])
+        self.assertEqual("A", second["profile_gone_rows"][0]["name"])
+        self.assertGreater(second["profile_gone_rows"][0]["profile_sold_after_seconds"], 0)
+        self.assertTrue(second["profile_gone_rows"][0]["profile_sold_after_text"])
+
     def test_search_url_and_term(self) -> None:
         url = build_vinted_search_url("macbook pro")
 

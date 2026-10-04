@@ -63,6 +63,7 @@ from .vinted_deals import (
     normalize_vinted_deal_hunter_max_age_hours,
     normalize_vinted_deal_hunter_max_price,
     normalize_vinted_deal_hunter_min_favorites,
+    normalize_vinted_deal_hunter_min_price,
     normalize_vinted_deal_hunter_terms,
     vinted_deal_hunter_enabled,
 )
@@ -438,12 +439,19 @@ class ScraperApp:
         self.vinted_deal_hunter_terms_var = tk.StringVar(value=", ".join(VINTED_DEAL_HUNTER_DEFAULT_TERMS))
         self.vinted_deal_hunter_category_var = tk.StringVar(value=VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL)
         self.vinted_deal_hunter_max_results_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH))
+        self.vinted_deal_hunter_min_price_var = tk.StringVar(value="")
         self.vinted_deal_hunter_max_price_var = tk.StringVar(value="")
         self.vinted_deal_hunter_min_favorites_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES))
         self.vinted_deal_hunter_max_age_hours_var = tk.StringVar(value=str(int(VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS)))
         self.vinted_deal_hunter_cycle_seconds_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_LOOP_SECONDS))
         self.vinted_discord_notifications_var = tk.BooleanVar(value=False)
+        self.vinted_deal_hunter_url_only_discord_var = tk.BooleanVar(value=False)
         self.vinted_discord_webhook_url_var = tk.StringVar(value="")
+        self.vinted_profile_monitor_interval_seconds_var = tk.StringVar(value="3600")
+        self.vinted_profile_monitor_max_items_var = tk.StringVar(value="0")
+        self.vinted_profile_monitor_discord_report_var = tk.BooleanVar(value=True)
+        self.vinted_profile_monitor_status_var = tk.StringVar(value="Monitor profili Vinted disattivato.")
+        self.vinted_profile_monitor_urls_seed = "https://www.vinted.it/member/262102939"
         self.vinted_db_path_var = tk.StringVar(value=str((script_path.parent / "data" / "scraper.db").resolve()))
         self.vinted_db_filter_var = tk.StringVar()
         self.vinted_db_limit_var = tk.StringVar(value="500")
@@ -641,12 +649,19 @@ class ScraperApp:
             "vinted_deal_hunter_terms": self._safe_var_string("vinted_deal_hunter_terms_var"),
             "vinted_deal_hunter_category": self._safe_var_string("vinted_deal_hunter_category_var"),
             "vinted_deal_hunter_max_results": self._safe_var_string("vinted_deal_hunter_max_results_var"),
+            "vinted_deal_hunter_min_price": self._safe_var_string("vinted_deal_hunter_min_price_var"),
             "vinted_deal_hunter_max_price": self._safe_var_string("vinted_deal_hunter_max_price_var"),
             "vinted_deal_hunter_min_favorites": self._safe_var_string("vinted_deal_hunter_min_favorites_var"),
             "vinted_deal_hunter_max_age_hours": self._safe_var_string("vinted_deal_hunter_max_age_hours_var"),
             "vinted_deal_hunter_loop_seconds": self._safe_var_string("vinted_deal_hunter_cycle_seconds_var"),
             "vinted_discord_notifications_enabled": self._safe_var_bool("vinted_discord_notifications_var"),
+            "vinted_deal_hunter_url_only_discord": self._safe_var_bool("vinted_deal_hunter_url_only_discord_var"),
             "vinted_discord_webhook_url": self._safe_var_string("vinted_discord_webhook_url_var"),
+            "vinted_profile_monitor_interval_seconds": self._safe_var_string("vinted_profile_monitor_interval_seconds_var"),
+            "vinted_profile_monitor_max_items": self._safe_var_string("vinted_profile_monitor_max_items_var"),
+            "vinted_profile_monitor_discord_report": self._safe_var_bool("vinted_profile_monitor_discord_report_var"),
+            "vinted_profile_monitor_urls": self._current_vinted_profile_monitor_urls_text(),
+            "vinted_db_path": self._safe_var_string("vinted_db_path_var"),
             "vinted_ai_model": self._safe_var_string("vinted_ai_model_var", DEFAULT_VINTED_AI_MODEL),
             "vinted_ai_size": self._safe_var_string("vinted_ai_size_var", DEFAULT_VINTED_AI_SIZE),
             "vinted_ai_variants": self._safe_var_string("vinted_ai_variants_var", "1"),
@@ -670,6 +685,11 @@ class ScraperApp:
         if hasattr(self, "vinted_ai_prompt_widget"):
             return str(self.vinted_ai_prompt_widget.get("1.0", "end-1c") or "").strip()
         return str(getattr(self, "vinted_ai_prompt_seed", "") or "").strip()
+
+    def _current_vinted_profile_monitor_urls_text(self) -> str:
+        if hasattr(self, "vinted_profile_monitor_urls_text"):
+            return str(self.vinted_profile_monitor_urls_text.get("1.0", "end-1c") or "").strip()
+        return str(getattr(self, "vinted_profile_monitor_urls_seed", "https://www.vinted.it/member/262102939") or "").strip()
 
     def _load_persisted_ui_settings(self) -> None:
         if not self.ui_settings_path.exists():
@@ -700,6 +720,9 @@ class ScraperApp:
             deal_hunter_max_results = payload.get("vinted_deal_hunter_max_results")
             if isinstance(deal_hunter_max_results, str) and deal_hunter_max_results.strip():
                 self.vinted_deal_hunter_max_results_var.set(deal_hunter_max_results.strip())
+            deal_hunter_min_price = payload.get("vinted_deal_hunter_min_price")
+            if isinstance(deal_hunter_min_price, str):
+                self.vinted_deal_hunter_min_price_var.set(deal_hunter_min_price.strip())
             deal_hunter_max_price = payload.get("vinted_deal_hunter_max_price")
             if isinstance(deal_hunter_max_price, str):
                 self.vinted_deal_hunter_max_price_var.set(deal_hunter_max_price.strip())
@@ -718,6 +741,24 @@ class ScraperApp:
             enabled = payload.get("vinted_discord_notifications_enabled")
             if isinstance(enabled, bool):
                 self.vinted_discord_notifications_var.set(enabled)
+            url_only_discord = payload.get("vinted_deal_hunter_url_only_discord")
+            if isinstance(url_only_discord, bool):
+                self.vinted_deal_hunter_url_only_discord_var.set(url_only_discord)
+            profile_monitor_interval_seconds = payload.get("vinted_profile_monitor_interval_seconds")
+            if isinstance(profile_monitor_interval_seconds, str) and profile_monitor_interval_seconds.strip():
+                self.vinted_profile_monitor_interval_seconds_var.set(profile_monitor_interval_seconds.strip())
+            profile_monitor_max_items = payload.get("vinted_profile_monitor_max_items")
+            if isinstance(profile_monitor_max_items, str) and profile_monitor_max_items.strip():
+                self.vinted_profile_monitor_max_items_var.set(profile_monitor_max_items.strip())
+            profile_monitor_discord_report = payload.get("vinted_profile_monitor_discord_report")
+            if isinstance(profile_monitor_discord_report, bool):
+                self.vinted_profile_monitor_discord_report_var.set(profile_monitor_discord_report)
+            profile_monitor_urls = payload.get("vinted_profile_monitor_urls")
+            if isinstance(profile_monitor_urls, str) and profile_monitor_urls.strip():
+                self.vinted_profile_monitor_urls_seed = profile_monitor_urls.strip()
+            vinted_db_path = payload.get("vinted_db_path")
+            if isinstance(vinted_db_path, str) and vinted_db_path.strip():
+                self.vinted_db_path_var.set(vinted_db_path.strip())
             ai_model = payload.get("vinted_ai_model")
             if isinstance(ai_model, str) and ai_model.strip():
                 self.vinted_ai_model_var.set(ai_model.strip())
@@ -793,12 +834,18 @@ class ScraperApp:
         self.vinted_deal_hunter_terms_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_deal_hunter_category_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_deal_hunter_max_results_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_deal_hunter_min_price_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_deal_hunter_max_price_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_deal_hunter_min_favorites_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_deal_hunter_max_age_hours_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_deal_hunter_cycle_seconds_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_discord_notifications_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_deal_hunter_url_only_discord_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_discord_webhook_url_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_profile_monitor_interval_seconds_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_profile_monitor_max_items_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_profile_monitor_discord_report_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_db_path_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_ai_model_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_ai_size_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_ai_variants_var.trace_add("write", self._schedule_persist_ui_settings)
@@ -1665,7 +1712,7 @@ class ScraperApp:
                 "Loop Vinted che ruota i termini, controlla i candidati con almeno N like "
                 "e tiene come affari solo gli annunci entro le ultime ore impostate, "
                 f"con spedizione <= {VINTED_DEAL_HUNTER_MAX_SHIPPING_PRICE:.2f} € "
-                "e sotto il prezzo massimo del procacciatore."
+                "e dentro i limiti prezzo del procacciatore."
             ),
             style="Hint.TLabel",
             wraplength=760,
@@ -1704,37 +1751,50 @@ class ScraperApp:
             padx=(8, 8),
             pady=(0, 8),
         )
-        ttk.Label(deal_hunter_frame, text="Prezzo max (€)").grid(row=3, column=4, sticky="w")
-        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_max_price_var, width=8).grid(
+        ttk.Label(deal_hunter_frame, text="Prezzo min Discord (€)").grid(row=3, column=4, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_min_price_var, width=8).grid(
             row=3,
             column=5,
             sticky="w",
             padx=(8, 8),
             pady=(0, 8),
         )
-        ttk.Label(deal_hunter_frame, text="Eta max (ore)").grid(row=3, column=6, sticky="w")
-        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_max_age_hours_var, width=8).grid(
+        ttk.Label(deal_hunter_frame, text="Prezzo max (€)").grid(row=3, column=6, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_max_price_var, width=8).grid(
             row=3,
             column=7,
             sticky="w",
             padx=(8, 8),
             pady=(0, 8),
         )
-        ttk.Label(deal_hunter_frame, text="Pausa loop (s)").grid(row=3, column=8, sticky="w")
-        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_cycle_seconds_var, width=8).grid(
+        ttk.Label(deal_hunter_frame, text="Eta max (ore)").grid(row=3, column=8, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_max_age_hours_var, width=8).grid(
             row=3,
             column=9,
             sticky="w",
             padx=(8, 0),
             pady=(0, 8),
         )
+        ttk.Label(deal_hunter_frame, text="Pausa loop (s)").grid(row=4, column=0, sticky="w")
+        ttk.Entry(deal_hunter_frame, textvariable=self.vinted_deal_hunter_cycle_seconds_var, width=8).grid(
+            row=4,
+            column=1,
+            sticky="w",
+            padx=(10, 8),
+            pady=(0, 8),
+        )
         discord_frame = ttk.Frame(deal_hunter_frame, style="Panel.TFrame")
-        discord_frame.grid(row=4, column=0, columnspan=10, sticky="ew", pady=(0, 8))
+        discord_frame.grid(row=5, column=0, columnspan=10, sticky="ew", pady=(0, 8))
         ttk.Checkbutton(
             discord_frame,
             text="Invia ogni nuovo affare su Discord",
             variable=self.vinted_discord_notifications_var,
         ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            discord_frame,
+            text="Modalita URL Discord senza login Vinted",
+            variable=self.vinted_deal_hunter_url_only_discord_var,
+        ).grid(row=0, column=1, sticky="w", padx=(18, 0))
         ttk.Label(discord_frame, text="Webhook URL").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(discord_frame, textvariable=self.vinted_discord_webhook_url_var, width=88).grid(
             row=1,
@@ -1773,10 +1833,130 @@ class ScraperApp:
             style="Hint.TLabel",
             wraplength=760,
             justify="left",
-        ).grid(row=5, column=0, columnspan=8, sticky="w", pady=(8, 0))
+        ).grid(row=6, column=0, columnspan=8, sticky="w", pady=(8, 0))
+
+        profile_monitor_section = CollapsibleSection(card, "Monitor profili Vinted", expanded=False)
+        profile_monitor_section.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        profile_monitor_frame = profile_monitor_section.body
+        profile_monitor_frame.columnconfigure(1, weight=1)
+        ttk.Label(profile_monitor_frame, text="Monitor profili Vinted", style="Metric.TLabel").grid(
+            row=0,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            pady=(0, 6),
+        )
+        ttk.Label(
+            profile_monitor_frame,
+            text=(
+                "Controlla uno o piu profili venditore, salva snapshot nel DB e calcola nuovi articoli, "
+                "articoli spariti e dopo quanto tempo sono stati venduti/spariti. Inserisci un profilo per riga; "
+                "puoi incollare anche solo l'ID numerico del profilo."
+            ),
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        ttk.Label(profile_monitor_frame, text="URL profili (uno per riga)").grid(row=2, column=0, sticky="nw")
+        profile_urls_frame = ttk.Frame(profile_monitor_frame, style="Panel.TFrame")
+        profile_urls_frame.grid(row=2, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(0, 8))
+        self.vinted_profile_monitor_urls_text = tk.Text(
+            profile_urls_frame,
+            height=4,
+            wrap="word",
+            bg="#ffffff",
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="solid",
+            borderwidth=1,
+        )
+        self.vinted_profile_monitor_urls_text.insert("1.0", self._current_vinted_profile_monitor_urls_text())
+        self.vinted_profile_monitor_urls_text.bind("<KeyRelease>", self._schedule_persist_ui_settings)
+        profile_urls_scroll = ttk.Scrollbar(profile_urls_frame, orient="vertical", command=self.vinted_profile_monitor_urls_text.yview)
+        self.vinted_profile_monitor_urls_text.configure(yscrollcommand=profile_urls_scroll.set)
+        self.vinted_profile_monitor_urls_text.grid(row=0, column=0, sticky="nsew")
+        profile_urls_scroll.grid(row=0, column=1, sticky="ns")
+        profile_urls_frame.columnconfigure(0, weight=1)
+        ttk.Label(profile_monitor_frame, text="Database SQLite").grid(row=3, column=0, sticky="w")
+        ttk.Entry(profile_monitor_frame, textvariable=self.vinted_db_path_var, width=72).grid(
+            row=3,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            padx=(10, 8),
+            pady=(0, 8),
+        )
+        ttk.Button(
+            profile_monitor_frame,
+            text="Scegli DB",
+            style="Secondary.TButton",
+            command=self._choose_vinted_db_path,
+        ).grid(row=3, column=3, sticky="ew", pady=(0, 8))
+        ttk.Label(profile_monitor_frame, text="Intervallo (s)").grid(row=4, column=0, sticky="w")
+        ttk.Entry(profile_monitor_frame, textvariable=self.vinted_profile_monitor_interval_seconds_var, width=10).grid(
+            row=4,
+            column=1,
+            sticky="w",
+            padx=(10, 8),
+            pady=(0, 8),
+        )
+        ttk.Label(profile_monitor_frame, text="Max articoli / profilo").grid(row=4, column=2, sticky="w")
+        ttk.Entry(profile_monitor_frame, textvariable=self.vinted_profile_monitor_max_items_var, width=10).grid(
+            row=4,
+            column=3,
+            sticky="w",
+            padx=(10, 0),
+            pady=(0, 8),
+        )
+        ttk.Checkbutton(
+            profile_monitor_frame,
+            text="Invia resoconto Discord",
+            variable=self.vinted_profile_monitor_discord_report_var,
+        ).grid(row=5, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(profile_monitor_frame, textvariable=self.vinted_discord_webhook_url_var, width=72).grid(
+            row=5,
+            column=1,
+            columnspan=3,
+            sticky="ew",
+            padx=(10, 0),
+            pady=(0, 8),
+        )
+        profile_monitor_actions = ttk.Frame(profile_monitor_frame, style="Panel.TFrame")
+        profile_monitor_actions.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(2, 0))
+        self.vinted_profile_monitor_start_button = ttk.Button(
+            profile_monitor_actions,
+            text="Avvia monitor profili",
+            style="Accent.TButton",
+            command=self._start_vinted_profile_monitor,
+        )
+        self.vinted_profile_monitor_start_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.vinted_profile_monitor_check_now_button = ttk.Button(
+            profile_monitor_actions,
+            text="Controllo al volo",
+            style="Secondary.TButton",
+            command=self._run_vinted_profile_check_now,
+        )
+        self.vinted_profile_monitor_check_now_button.grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        self.vinted_profile_monitor_stop_button = ttk.Button(
+            profile_monitor_actions,
+            text="Ferma monitor profili",
+            style="Secondary.TButton",
+            command=self._stop_vinted_profile_monitor,
+        )
+        self.vinted_profile_monitor_stop_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        profile_monitor_actions.columnconfigure(0, weight=1)
+        profile_monitor_actions.columnconfigure(1, weight=1)
+        profile_monitor_actions.columnconfigure(2, weight=1)
+        ttk.Label(
+            profile_monitor_frame,
+            textvariable=self.vinted_profile_monitor_status_var,
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         archive_section = CollapsibleSection(card, "Archivio database", expanded=False)
-        archive_section.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        archive_section.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(0, 10))
         archive_card = archive_section.body
         ttk.Label(archive_card, text="Archivio database", style="Metric.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         self._row(archive_card, 1, "Database SQLite", self.vinted_db_path_var)
@@ -2482,6 +2662,18 @@ class ScraperApp:
                 ("extracted_at", "Ultima volta", 140, "center"),
                 ("link", "Link Vinted", 420, "w"),
             )
+        elif source == "vinted_profile":
+            column_config = (
+                ("profile_item_status", "Stato", 110, "center"),
+                ("member_id", "Profilo", 110, "center"),
+                ("name", "Nome prodotto", 300, "w"),
+                ("price", "Prezzo", 90, "center"),
+                ("profile_sold_after_text", "Tempo vendita", 125, "center"),
+                ("profile_first_seen_at", "Prima vista", 140, "center"),
+                ("profile_last_seen_at", "Ultima vista", 140, "center"),
+                ("item_id", "ID articolo", 110, "center"),
+                ("link", "Link Vinted", 420, "w"),
+            )
         else:
             column_config = (
                 ("screening_decision", "Candidatura", 105, "center"),
@@ -2528,7 +2720,7 @@ class ScraperApp:
                 self.contact_section.collapse()
             if hasattr(self, "lead_section"):
                 self.lead_section.expand()
-            if source == "vinted":
+            if source in {"vinted", "vinted_profile"}:
                 self.lead_card.configure(text="Azioni prodotto")
                 self._update_vinted_offer_ui_copy()
                 self.open_selected_button.configure(text="Apri annuncio Vinted")
@@ -3148,7 +3340,7 @@ class ScraperApp:
 
     def _validated_vinted_discord_webhook_url(self) -> str:
         webhook_url = str(self.vinted_discord_webhook_url_var.get() or "").strip()
-        if not self.vinted_discord_notifications_var.get():
+        if not self.vinted_discord_notifications_var.get() and not self.vinted_deal_hunter_url_only_discord_var.get():
             return webhook_url
         if not webhook_url:
             raise ValueError("Inserisci il webhook Discord del procacciatore oppure disattiva le notifiche.")
@@ -3208,6 +3400,8 @@ class ScraperApp:
         searches_file = self._write_vinted_searches_file(specs)
         min_favorites = self._parse_vinted_deal_hunter_min_favorites()
         max_age_hours = self._parse_vinted_deal_hunter_max_age_hours()
+        min_price_raw = self.vinted_deal_hunter_min_price_var.get().strip()
+        min_price = self._parse_vinted_max_price_value(min_price_raw)
         discord_webhook_url = self._validated_vinted_discord_webhook_url()
 
         cmd = [
@@ -3226,11 +3420,18 @@ class ScraperApp:
             "--deal-hunter-loop-seconds",
             str(self._parse_vinted_deal_hunter_cycle_seconds()),
         ]
-        if self.vinted_discord_notifications_var.get():
+        if min_price is not None:
+            cmd += ["--deal-hunter-min-price", str(min_price)]
+        if self.vinted_discord_notifications_var.get() or self.vinted_deal_hunter_url_only_discord_var.get():
             cmd.append("--discord-deal-notifications")
             cmd += ["--discord-webhook-url", discord_webhook_url]
         else:
             cmd.append("--no-discord-deal-notifications")
+        cmd.append(
+            "--deal-hunter-url-only-discord"
+            if self.vinted_deal_hunter_url_only_discord_var.get()
+            else "--no-deal-hunter-url-only-discord"
+        )
         if self.vinted_keep_browser_open_var.get():
             if int(keep_open_seconds) == 0:
                 cmd.append("--keep-browser-open")
@@ -3258,6 +3459,151 @@ class ScraperApp:
             cmd += ["--filename", self.filename_var.get().strip()]
         return cmd
 
+    def _current_vinted_profile_monitor_urls(self) -> list[str]:
+        raw_text = self._current_vinted_profile_monitor_urls_text()
+        parts = [
+            part.strip()
+            for chunk in raw_text.replace("\r", "\n").replace(";", "\n").split("\n")
+            for part in chunk.split(",")
+        ]
+        urls: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            if not part:
+                continue
+            if "/member/" not in part and not part.isdigit():
+                continue
+            value = f"https://www.vinted.it/member/{part}" if part.isdigit() else part
+            if value in seen:
+                continue
+            seen.add(value)
+            urls.append(value)
+        if not urls:
+            raise ValueError("Inserisci almeno un profilo Vinted valido, uno per riga.")
+        return urls
+
+    def _write_vinted_profile_urls_file(self, urls: list[str]) -> Path:
+        output_dir = Path(self.output_dir_var.get()).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        profiles_file = output_dir / "_ui_vinted_profile_urls.json"
+        profiles_file.write_text(json.dumps(urls, ensure_ascii=False, indent=2), encoding="utf-8")
+        return profiles_file
+
+    def _parse_vinted_profile_monitor_interval_seconds(self) -> int:
+        raw_value = self.vinted_profile_monitor_interval_seconds_var.get().strip() or "3600"
+        try:
+            seconds = int(raw_value)
+        except ValueError as exc:
+            raise ValueError("Intervallo monitor profili non valido.") from exc
+        if seconds < 0:
+            raise ValueError("Intervallo monitor profili deve essere maggiore o uguale a zero.")
+        return seconds
+
+    def _parse_vinted_profile_monitor_max_items(self) -> int:
+        raw_value = self.vinted_profile_monitor_max_items_var.get().strip() or "0"
+        try:
+            max_items = int(raw_value)
+        except ValueError as exc:
+            raise ValueError("Max articoli / profilo non valido.") from exc
+        if max_items < 0:
+            raise ValueError("Max articoli / profilo deve essere maggiore o uguale a zero.")
+        return max_items
+
+    def _build_vinted_profile_monitor_command(self, *, interval_seconds_override: int | None = None) -> list[str]:
+        db_path = self.vinted_db_path_var.get().strip()
+        if not db_path:
+            raise ValueError("Inserisci il percorso del database SQLite.")
+        urls = self._current_vinted_profile_monitor_urls()
+        profiles_file = self._write_vinted_profile_urls_file(urls)
+        cmd = [
+            sys.executable,
+            str(self.script_path),
+            "run",
+            "vinted_profile",
+            "--db-path",
+            db_path,
+            "--profiles-file",
+            str(profiles_file),
+            "--interval-seconds",
+            str(self._parse_vinted_profile_monitor_interval_seconds() if interval_seconds_override is None else interval_seconds_override),
+            "--max-items",
+            str(self._parse_vinted_profile_monitor_max_items()),
+            "--keep-browser-open",
+        ]
+        if self.vinted_profile_monitor_discord_report_var.get():
+            webhook_url = str(self.vinted_discord_webhook_url_var.get() or "").strip()
+            if not webhook_url:
+                raise ValueError("Inserisci il webhook Discord oppure disattiva il resoconto Discord.")
+            cmd += ["--discord-profile-report", "--discord-webhook-url", webhook_url]
+        else:
+            cmd.append("--no-discord-profile-report")
+        if self.vinted_refresh_browser_profile_var.get():
+            cmd.append("--refresh-browser-profile")
+        cmd += self._browser_command_args(
+            action_delay_override="0.15",
+            page_settle_override="0.8",
+            slow_mode_override=False,
+        )
+        cmd += [
+            "--format",
+            self.output_format_var.get().strip(),
+            "--output-dir",
+            self.output_dir_var.get().strip(),
+            "--ui-result-json",
+            str(self.ui_result_json_path),
+        ]
+        return cmd
+
+    def _start_vinted_profile_monitor(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Monitor profili Vinted", "Attendi la fine del processo corrente.")
+            return
+        try:
+            command = self._build_vinted_profile_monitor_command()
+            urls = self._current_vinted_profile_monitor_urls()
+            interval_seconds = self._parse_vinted_profile_monitor_interval_seconds()
+        except ValueError as exc:
+            messagebox.showerror("Monitor profili Vinted", str(exc))
+            return
+        self._stop_auto_monitor()
+        self._stop_vinted_deal_hunter(quiet=True, stop_process=False)
+        self._clear_results()
+        self.current_run_source = "vinted_profile"
+        self.vinted_profile_monitor_status_var.set(
+            f"Monitor profili attivo: {len(urls)} profili, intervallo {interval_seconds}s."
+        )
+        self.vinted_status_var.set("Monitor profili Vinted avviato in job separato.")
+        self._append_log(f"[vinted-profile] Avvio monitor: {len(urls)} profili, intervallo {interval_seconds}s.\n")
+        self._start_process(command, kind="vinted_profile_monitor", load_results=True)
+
+    def _run_vinted_profile_check_now(self) -> None:
+        if self.process is not None:
+            messagebox.showinfo("Monitor profili Vinted", "Attendi la fine del processo corrente.")
+            return
+        try:
+            command = self._build_vinted_profile_monitor_command(interval_seconds_override=0)
+            urls = self._current_vinted_profile_monitor_urls()
+        except ValueError as exc:
+            messagebox.showerror("Monitor profili Vinted", str(exc))
+            return
+        self._stop_auto_monitor()
+        self._stop_vinted_deal_hunter(quiet=True, stop_process=False)
+        self._clear_results()
+        self.current_run_source = "vinted_profile"
+        self.vinted_profile_monitor_status_var.set(
+            f"Controllo al volo avviato: {len(urls)} profili, nessun timer."
+        )
+        self.vinted_status_var.set("Controllo profili Vinted al volo avviato.")
+        self._append_log(f"[vinted-profile] Controllo al volo: {len(urls)} profili, intervallo 0s.\n")
+        self._start_process(command, kind="vinted_profile_check", load_results=True)
+
+    def _stop_vinted_profile_monitor(self) -> None:
+        if self.process is not None and self.process_kind in {"vinted_profile_monitor", "vinted_profile_check"}:
+            self._stop_current_process()
+            self.vinted_profile_monitor_status_var.set("Stop monitor profili richiesto.")
+            return
+        messagebox.showinfo("Monitor profili Vinted", "Il monitor profili Vinted non e attivo.")
+
     def _start_vinted_deal_hunter(self) -> None:
         if self.process is not None:
             messagebox.showinfo("Procacciatore affari", "Attendi la fine del processo corrente.")
@@ -3280,13 +3626,20 @@ class ScraperApp:
         self.vinted_deal_hunter_interval_ms = max(cycle_seconds * 1000, 1_000)
         self._cancel_vinted_deal_hunter_timer()
         self.current_run_source = "vinted"
-        self.vinted_status_var.set("Procacciatore affari avviato. Controllo candidati 70+ e conferma 24h in corso...")
+        url_only_mode = bool(self.vinted_deal_hunter_url_only_discord_var.get())
+        if url_only_mode:
+            self.vinted_status_var.set("Procacciatore URL Discord avviato. Non verra richiesto login Vinted.")
+        else:
+            self.vinted_status_var.set("Procacciatore affari avviato. Controllo candidati 70+ e conferma 24h in corso...")
         self.vinted_deal_hunter_status_var.set(
             f"Procacciatore attivo: {len(specs)} ricerche in rotazione, pausa {cycle_seconds}s tra i cicli."
+            + (" Modalita URL Discord senza login." if url_only_mode else "")
         )
         self._append_log(
             f"[deal-hunter] Avvio loop Vinted: {len(specs)} ricerche, pausa {cycle_seconds}s, "
-            f"like min {self._parse_vinted_deal_hunter_min_favorites()}, eta max {self._parse_vinted_deal_hunter_max_age_hours():g}h.\n"
+            f"like min {self._parse_vinted_deal_hunter_min_favorites()}, eta max {self._parse_vinted_deal_hunter_max_age_hours():g}h"
+            f", prezzo min Discord {self.vinted_deal_hunter_min_price_var.get().strip() or '-'}"
+            f"{', URL Discord senza login' if url_only_mode else ''}.\n"
         )
         self._start_process(list(command), kind="scrape", load_results=True)
 
@@ -4386,11 +4739,13 @@ class ScraperApp:
         self.vinted_deal_hunter_terms_var.set(", ".join(VINTED_DEAL_HUNTER_DEFAULT_TERMS))
         self.vinted_deal_hunter_category_var.set(VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL)
         self.vinted_deal_hunter_max_results_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH))
+        self.vinted_deal_hunter_min_price_var.set("")
         self.vinted_deal_hunter_max_price_var.set("")
         self.vinted_deal_hunter_min_favorites_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES))
         self.vinted_deal_hunter_max_age_hours_var.set(str(int(VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS)))
         self.vinted_deal_hunter_cycle_seconds_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_LOOP_SECONDS))
         self.vinted_discord_notifications_var.set(False)
+        self.vinted_deal_hunter_url_only_discord_var.set(False)
         self.vinted_discord_webhook_url_var.set("")
         self.vinted_offer_discount_percent_var.set("15")
         self.vinted_db_path_var.set(str((self.script_path.parent / "data" / "scraper.db").resolve()))
@@ -4784,12 +5139,16 @@ class ScraperApp:
         self.run_button.configure(state="disabled")
         self.open_browser_button.configure(state="disabled")
         self.vinted_run_button.configure(state="disabled")
+        if hasattr(self, "vinted_profile_monitor_start_button"):
+            self.vinted_profile_monitor_start_button.configure(state="disabled")
+        if hasattr(self, "vinted_profile_monitor_check_now_button"):
+            self.vinted_profile_monitor_check_now_button.configure(state="disabled")
         if hasattr(self, "subito_run_button"):
             self.subito_run_button.configure(state="disabled")
         self._set_stop_process_buttons_state("normal")
         if kind == "contact":
             self.contact_button.configure(state="disabled")
-        if kind == "scrape":
+        if kind in {"scrape", "vinted_profile_monitor", "vinted_profile_check"}:
             ui_result_json = self._command_argument_value(command, "--ui-result-json")
             if ui_result_json:
                 self.ui_result_json_path = Path(ui_result_json).resolve()
@@ -5585,6 +5944,10 @@ class ScraperApp:
                 self.run_button.configure(state="normal")
                 self.open_browser_button.configure(state="normal")
                 self.vinted_run_button.configure(state="normal")
+                if hasattr(self, "vinted_profile_monitor_start_button"):
+                    self.vinted_profile_monitor_start_button.configure(state="normal")
+                if hasattr(self, "vinted_profile_monitor_check_now_button"):
+                    self.vinted_profile_monitor_check_now_button.configure(state="normal")
                 if hasattr(self, "subito_run_button"):
                     self.subito_run_button.configure(state="normal")
                 self._set_stop_process_buttons_state("disabled")
@@ -5611,6 +5974,14 @@ class ScraperApp:
                     continue
                 if code == 0 and should_load_results:
                     self._load_results()
+                if completed_kind in {"vinted_profile_monitor", "vinted_profile_check"}:
+                    if code == 0 or stop_requested:
+                        if completed_kind == "vinted_profile_check" and not stop_requested:
+                            self.vinted_profile_monitor_status_var.set("Controllo al volo completato.")
+                        else:
+                            self.vinted_profile_monitor_status_var.set("Monitor profili Vinted fermato.")
+                    else:
+                        self.vinted_profile_monitor_status_var.set("Monitor profili Vinted terminato con errore. Controlla il log.")
                 if completed_kind == "scrape" and self.auto_monitor_enabled:
                     self._schedule_next_auto_run(code=code)
                 elif completed_kind == "scrape" and self.vinted_deal_hunter_enabled and self.current_run_source == "vinted":
@@ -5682,7 +6053,7 @@ class ScraperApp:
     def _maybe_load_live_results(self) -> None:
         if self.process is None:
             return
-        if self.process_kind != "scrape" or not self.process_should_load_results:
+        if self.process_kind not in {"scrape", "vinted_profile_monitor", "vinted_profile_check"} or not self.process_should_load_results:
             return
         if not self.ui_result_json_path.exists():
             return
@@ -5704,7 +6075,7 @@ class ScraperApp:
     def _selected_vinted_signal_filter(self) -> str:
         return str(self.vinted_signal_filter_var.get() or "tutti").strip().lower() or "tutti"
 
-    def _active_vinted_deal_hunter_thresholds(self, meta: dict | None = None) -> tuple[int, float, float | None]:
+    def _active_vinted_deal_hunter_thresholds(self, meta: dict | None = None) -> tuple[int, float, float | None, float | None]:
         payload = meta or self.current_result_meta
         min_favorites = normalize_vinted_deal_hunter_min_favorites(
             payload.get("deal_hunter_min_favorites", self.vinted_deal_hunter_min_favorites_var.get()),
@@ -5714,16 +6085,20 @@ class ScraperApp:
             payload.get("deal_hunter_max_age_hours", self.vinted_deal_hunter_max_age_hours_var.get()),
             default=VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
         )
+        min_price = normalize_vinted_deal_hunter_min_price(
+            payload.get("min_price", payload.get("deal_hunter_min_price", self.vinted_deal_hunter_min_price_var.get())),
+            default=None,
+        )
         max_price = normalize_vinted_deal_hunter_max_price(
             payload.get("max_price", self.vinted_deal_hunter_max_price_var.get()),
             default=None,
         )
-        return min_favorites, max_age_hours, max_price
+        return min_favorites, max_age_hours, min_price, max_price
 
     def _annotate_vinted_rows_with_deal_hunter(self, rows: list[dict], meta: dict | None = None) -> list[dict]:
         if not rows:
             return []
-        min_favorites, max_age_hours, max_price = self._active_vinted_deal_hunter_thresholds(meta)
+        min_favorites, max_age_hours, min_price, max_price = self._active_vinted_deal_hunter_thresholds(meta)
         if not vinted_deal_hunter_enabled(min_favorites, max_age_hours):
             min_favorites = VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES
             max_age_hours = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS
@@ -5731,6 +6106,7 @@ class ScraperApp:
             rows,
             min_favorites=min_favorites,
             max_age_hours=max_age_hours,
+            min_price=min_price,
             max_price=max_price,
         )
 
@@ -5933,7 +6309,7 @@ class ScraperApp:
                 or deal_hunter_candidates > 0
                 or deal_hunter_matches > 0
             )
-            deal_hunter_min_favorites, deal_hunter_max_age_hours, deal_hunter_max_price = self._active_vinted_deal_hunter_thresholds(meta)
+            deal_hunter_min_favorites, deal_hunter_max_age_hours, deal_hunter_min_price, deal_hunter_max_price = self._active_vinted_deal_hunter_thresholds(meta)
             self.result_total_var.set(f"{len(rows)} prodotti")
             if meta.get("loaded_from_db"):
                 counts_parts = [
@@ -5956,6 +6332,7 @@ class ScraperApp:
                         self.vinted_status_var.set(
                             f"Archivio Vinted caricato: {len(rows)} affari mostrati con filtro {active_filter} "
                             f"(soglia {deal_hunter_min_favorites}+ like, {deal_hunter_max_age_hours:g}h, "
+                            f"prezzo min {deal_hunter_min_price if deal_hunter_min_price is not None else '-'}, "
                             f"prezzo max {deal_hunter_max_price if deal_hunter_max_price is not None else '-'})."
                         )
                     else:
@@ -6009,6 +6386,35 @@ class ScraperApp:
                         f"Tag: {meta.get('db_tag_filter', '') or meta.get('tag', '') or 'tutti'}",
                         f"Ricerche salvate: {meta.get('db_total_search_runs', '-')}",
                         f"Filtro rapido: {active_filter}",
+                        f"Database: {meta.get('db_path', '-')}",
+                        f"Generato: {payload.get('generated_at', '-')}",
+                    )
+                )
+            )
+            self._render_results_rows(self.result_rows)
+            self._update_result_actions()
+            self._scroll_to_widget(self.results_tab)
+            return
+        if source == "vinted_profile":
+            active_count = int(meta.get("profile_item_count", 0) or 0)
+            new_count = int(meta.get("profile_new_count", 0) or 0)
+            gone_count = int(meta.get("profile_gone_count", 0) or 0)
+            profile_count = int(meta.get("profile_count", 1) or 1)
+            self.result_total_var.set(f"{len(rows)} righe profilo")
+            self.result_counts_var.set(
+                f"profili {profile_count} | attivi {active_count} | nuovi {new_count} | spariti {gone_count}"
+            )
+            self.vinted_profile_monitor_status_var.set(
+                f"Ultimo ciclo: {profile_count} profili, {active_count} attivi, {new_count} nuovi, {gone_count} spariti."
+            )
+            self.vinted_status_var.set("Monitor profili Vinted aggiornato.")
+            self.result_meta_var.set(
+                " | ".join(
+                    (
+                        "Sorgente: Vinted profile",
+                        f"Profili: {profile_count}",
+                        f"Ciclo: {meta.get('cycle_index', '-')}",
+                        f"Intervallo: {meta.get('interval_seconds', '-')}s",
                         f"Database: {meta.get('db_path', '-')}",
                         f"Generato: {payload.get('generated_at', '-')}",
                     )

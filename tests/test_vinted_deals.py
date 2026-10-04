@@ -7,6 +7,7 @@ from scraper_app.vinted_deals import (
     is_vinted_deal_hunter_candidate,
     is_vinted_deal_hunter_match,
     normalize_vinted_deal_hunter_max_price,
+    normalize_vinted_deal_hunter_min_price,
     normalize_vinted_deal_hunter_terms,
     parse_vinted_relative_age_hours,
 )
@@ -43,6 +44,15 @@ class VintedDealsTests(unittest.TestCase):
                 95,
                 "2 ore fa",
                 shipping_price_value=VINTED_DEAL_HUNTER_MAX_SHIPPING_PRICE + 0.01,
+            )
+        )
+        self.assertFalse(
+            is_vinted_deal_hunter_match(
+                95,
+                "2 ore fa",
+                price_value=4.0,
+                min_price=5.0,
+                shipping_price_value=1.49,
             )
         )
         self.assertFalse(
@@ -100,15 +110,27 @@ class VintedDealsTests(unittest.TestCase):
             },
             max_price=20.0,
         )
+        low_price_row = annotate_vinted_deal_hunter_row(
+            {
+                "favorite_count": 112,
+                "published_at": "5 ore fa",
+                "price_value": 4.0,
+                "shipping_price_value": 1.5,
+            },
+            min_price=5.0,
+        )
 
         self.assertFalse(high_shipping_row["deal_hunter_match"])
         self.assertIn("spedizione", high_shipping_row["deal_hunter_reason"])
         self.assertFalse(high_price_row["deal_hunter_match"])
         self.assertIn("prezzo", high_price_row["deal_hunter_reason"])
+        self.assertFalse(low_price_row["deal_hunter_match"])
+        self.assertIn("sotto min", low_price_row["deal_hunter_reason"])
 
     def test_normalize_vinted_deal_hunter_max_price(self) -> None:
         self.assertEqual(19.9, normalize_vinted_deal_hunter_max_price("19,90 €"))
         self.assertIsNone(normalize_vinted_deal_hunter_max_price(""))
+        self.assertEqual(5.0, normalize_vinted_deal_hunter_min_price("5,00 €"))
 
 
 if __name__ == "__main__":

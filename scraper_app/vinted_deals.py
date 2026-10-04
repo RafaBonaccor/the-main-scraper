@@ -77,6 +77,10 @@ def normalize_vinted_deal_hunter_max_price(value: object, default: float | None 
     return max(parsed, 0.0)
 
 
+def normalize_vinted_deal_hunter_min_price(value: object, default: float | None = None) -> float | None:
+    return normalize_vinted_deal_hunter_max_price(value, default=default)
+
+
 def vinted_deal_hunter_enabled(min_favorites: object, max_age_hours: object) -> bool:
     return normalize_vinted_deal_hunter_min_favorites(min_favorites) > 0 and normalize_vinted_deal_hunter_max_age_hours(max_age_hours) > 0
 
@@ -153,6 +157,7 @@ def is_vinted_deal_hunter_match(
     min_favorites: object = VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES,
     max_age_hours: object = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
     price_value: object = None,
+    min_price: object = None,
     max_price: object = None,
     shipping_price_value: object = None,
 ) -> bool:
@@ -170,7 +175,11 @@ def is_vinted_deal_hunter_match(
     if age_hours > normalized_max_age_hours:
         return False
     normalized_max_price = normalize_vinted_deal_hunter_max_price(max_price)
+    normalized_min_price = normalize_vinted_deal_hunter_min_price(min_price)
     numeric_price = _coerce_nonnegative_float(price_value)
+    if normalized_min_price is not None:
+        if numeric_price is None or numeric_price < normalized_min_price:
+            return False
     if normalized_max_price is not None:
         if numeric_price is None or numeric_price > normalized_max_price:
             return False
@@ -184,6 +193,7 @@ def annotate_vinted_deal_hunter_row(
     row: dict,
     min_favorites: object = VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES,
     max_age_hours: object = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
+    min_price: object = None,
     max_price: object = None,
 ) -> dict:
     annotated = dict(row)
@@ -195,6 +205,7 @@ def annotate_vinted_deal_hunter_row(
         max_age_hours,
         default=VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
     )
+    normalized_min_price = normalize_vinted_deal_hunter_min_price(min_price)
     normalized_max_price = normalize_vinted_deal_hunter_max_price(max_price)
     favorite_count = coerce_vinted_favorite_count(annotated.get("favorite_count"))
     published_at = str(annotated.get("published_at", "") or "").strip()
@@ -208,6 +219,7 @@ def annotate_vinted_deal_hunter_row(
         min_favorites=normalized_min_favorites,
         max_age_hours=normalized_max_age_hours,
         price_value=price_value,
+        min_price=normalized_min_price,
         max_price=normalized_max_price,
         shipping_price_value=shipping_price_value,
     )
@@ -234,6 +246,13 @@ def annotate_vinted_deal_hunter_row(
                 if favorite_count is not None
                 else f"spedizione {shipping_price_value:.2f}€"
             )
+        elif normalized_min_price is not None and (price_value is None or price_value < normalized_min_price):
+            if favorite_count is not None and price_value is not None:
+                reason = f"{favorite_count} like ma prezzo {price_value:.2f}€ sotto min {normalized_min_price:.2f}€"
+            elif price_value is not None:
+                reason = f"prezzo {price_value:.2f}€ sotto min {normalized_min_price:.2f}€"
+            else:
+                reason = "prezzo non confermato"
         elif normalized_max_price is not None and (price_value is None or price_value > normalized_max_price):
             if favorite_count is not None and price_value is not None:
                 reason = f"{favorite_count} like ma prezzo {price_value:.2f}€"
@@ -255,6 +274,7 @@ def annotate_vinted_deal_hunter_row(
     annotated["deal_hunter_age_hours"] = age_hours
     annotated["deal_hunter_min_favorites"] = normalized_min_favorites
     annotated["deal_hunter_max_age_hours"] = normalized_max_age_hours
+    annotated["deal_hunter_min_price"] = normalized_min_price
     annotated["deal_hunter_max_price"] = normalized_max_price
     return annotated
 
@@ -263,6 +283,7 @@ def annotate_vinted_deal_hunter_rows(
     rows: list[dict],
     min_favorites: object = VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES,
     max_age_hours: object = VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
+    min_price: object = None,
     max_price: object = None,
 ) -> list[dict]:
     return [
@@ -270,6 +291,7 @@ def annotate_vinted_deal_hunter_rows(
             row,
             min_favorites=min_favorites,
             max_age_hours=max_age_hours,
+            min_price=min_price,
             max_price=max_price,
         )
         for row in rows

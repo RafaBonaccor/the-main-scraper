@@ -20,7 +20,8 @@ def build_vinted_deal_discord_message(row: dict) -> str:
     published_at = normalize_whitespace(str(row.get("published_at", "") or ""))
     reason = normalize_whitespace(str(row.get("deal_hunter_reason", "") or ""))
 
-    lines = ["**Nuovo affare Vinted**", title]
+    heading = "**Candidato Vinted da catalogo**" if bool(row.get("deal_hunter_url_only_discord")) else "**Nuovo affare Vinted**"
+    lines = [heading, title]
     if search_term:
         lines.append(f"Query: {search_term}")
     if price:
@@ -57,6 +58,70 @@ def build_vinted_login_required_discord_message(status: dict) -> str:
     return "\n".join(lines)
 
 
+def build_vinted_profile_report_discord_message(meta: dict, rows: list[dict]) -> str:
+    profile_url = str(meta.get("profile_url", "") or "").strip()
+    member_id = normalize_whitespace(str(meta.get("member_id", "") or meta.get("profile_member_id", "") or ""))
+    checked_at = normalize_whitespace(str(meta.get("profile_checked_at", "") or meta.get("extracted_at", "") or ""))
+    active_count = int(meta.get("profile_item_count", 0) or 0)
+    new_count = int(meta.get("profile_new_count", 0) or 0)
+    gone_count = int(meta.get("profile_gone_count", 0) or 0)
+    still_count = int(meta.get("profile_still_count", 0) or 0)
+    cycle_index = int(meta.get("cycle_index", 1) or 1)
+
+    lines = [
+        "📦 **Report profilo Vinted**",
+        f"Articoli attivi: {active_count}",
+        f"Nuovi: {new_count}",
+        f"Spariti/venduti/rimossi: {gone_count}",
+        f"Gia presenti: {still_count}",
+    ]
+    if member_id:
+        lines.append(f"Member ID: {member_id}")
+    if checked_at:
+        lines.append(f"Controllato: {checked_at}")
+    lines.append(f"Ciclo: {cycle_index}")
+    if profile_url:
+        lines.append(f"Profilo: <{profile_url}>")
+
+    new_rows = [row for row in rows if str(row.get("profile_item_status", "") or "") == "new"]
+    gone_rows = [row for row in rows if str(row.get("profile_item_status", "") or "") == "gone"]
+    if new_rows:
+        lines.append("")
+        lines.append("🟢 Nuovi articoli:")
+        lines.extend(_format_vinted_profile_report_rows(new_rows))
+    if gone_rows:
+        lines.append("")
+        lines.append("🔴 Spariti/venduti/rimossi:")
+        lines.extend(_format_vinted_profile_report_rows(gone_rows))
+    if not new_rows and not gone_rows:
+        lines.append("")
+        lines.append("Nessun cambiamento rispetto allo snapshot precedente.")
+    return "\n".join(lines)
+
+
+def _format_vinted_profile_report_rows(rows: list[dict], limit: int = 8) -> list[str]:
+    lines: list[str] = []
+    for row in rows[:limit]:
+        title = normalize_whitespace(str(row.get("name", "") or row.get("title", "") or "Articolo Vinted"))
+        price = normalize_whitespace(str(row.get("price", "") or row.get("price_text", "") or ""))
+        sold_after = normalize_whitespace(str(row.get("profile_sold_after_text", "") or ""))
+        link = str(row.get("link", "") or "").strip()
+        suffix_parts = []
+        if price:
+            suffix_parts.append(price)
+        if sold_after:
+            suffix_parts.append(f"venduto/sparito dopo {sold_after}")
+        suffix = f" — {' | '.join(suffix_parts)}" if suffix_parts else ""
+        if link:
+            lines.append(f"- {title}{suffix}: <{link}>")
+        else:
+            lines.append(f"- {title}{suffix}")
+    remaining = len(rows) - limit
+    if remaining > 0:
+        lines.append(f"- ...altri {remaining}")
+    return lines
+
+
 def build_scraper_error_discord_message(
     title: str,
     message: str,
@@ -83,11 +148,15 @@ def send_discord_webhook_message(
     timeout_seconds: float = 10.0,
     *,
     attachment_paths: list[str | Path] | None = None,
+    embeds: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     payload = {
         "content": str(content or "").strip(),
         "allowed_mentions": {"parse": []},
     }
+    normalized_embeds = [embed for embed in (embeds or []) if isinstance(embed, dict)]
+    if normalized_embeds:
+        payload["embeds"] = normalized_embeds[:10]
     attachments = [
         Path(path).expanduser().resolve()
         for path in (attachment_paths or [])

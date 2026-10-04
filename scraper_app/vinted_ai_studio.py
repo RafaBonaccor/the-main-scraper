@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_VINTED_AI_MODEL = "gpt-image-2"
 DEFAULT_VINTED_AI_SIZE = "1024x1536"
+DEFAULT_VINTED_AI_QUALITY = "high"
 DEFAULT_VINTED_AI_OUTPUT_DIRNAME = "vinted_ai"
 DEFAULT_VINTED_AI_LOG_FILENAME = "generation_log.json"
 DEFAULT_VINTED_AI_RUNTIME_URL = os.environ.get("AGENT_LAB_RUNTIME_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -28,6 +29,7 @@ def generate_vinted_ai_variants(
     output_dir: str | Path,
     model: str = DEFAULT_VINTED_AI_MODEL,
     size: str = DEFAULT_VINTED_AI_SIZE,
+    quality: str = DEFAULT_VINTED_AI_QUALITY,
     variants: int = 1,
     api_key: str = "",
     base_url: str = "",
@@ -43,6 +45,7 @@ def generate_vinted_ai_variants(
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "model": str(model or DEFAULT_VINTED_AI_MODEL).strip() or DEFAULT_VINTED_AI_MODEL,
         "size": str(size or DEFAULT_VINTED_AI_SIZE).strip() or DEFAULT_VINTED_AI_SIZE,
+        "quality": str(quality or DEFAULT_VINTED_AI_QUALITY).strip() or DEFAULT_VINTED_AI_QUALITY,
         "variants_requested": variant_count,
         "prompt": cleaned_prompt,
         "source_photo_paths": [str(path.resolve()) for path in resolved_paths],
@@ -64,6 +67,7 @@ def generate_vinted_ai_variants(
             output_dir=target_dir,
             model=str(model or DEFAULT_VINTED_AI_MODEL).strip() or DEFAULT_VINTED_AI_MODEL,
             size=str(size or DEFAULT_VINTED_AI_SIZE).strip() or DEFAULT_VINTED_AI_SIZE,
+            quality=str(quality or DEFAULT_VINTED_AI_QUALITY).strip() or DEFAULT_VINTED_AI_QUALITY,
             variants=variant_count,
         )
         log_payload.update(
@@ -134,6 +138,7 @@ def _request_runtime_vinted_ai_generation(
     output_dir: Path,
     model: str,
     size: str,
+    quality: str,
     variants: int,
 ) -> dict[str, object]:
     payload = {
@@ -142,6 +147,7 @@ def _request_runtime_vinted_ai_generation(
         "output_dir": str(output_dir.resolve()),
         "model": model,
         "size": size,
+        "quality": quality,
         "variants": variants,
     }
     request = Request(
