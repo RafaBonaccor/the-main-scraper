@@ -1,5 +1,6 @@
 import time
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -26,7 +27,14 @@ VINTED_PROFILE_NAVIGATION_TIMEOUT_SECONDS = 20
 
 
 def _log_vinted_profile(message: str, **fields: object) -> None:
-    details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    def safe_log_value(value: object, limit: int = 180) -> str:
+        text = str(value)
+        text = text.replace("\r", "\\r").replace("\n", "\\n")
+        if len(text) > limit:
+            return f"{text[:limit]}…"
+        return text
+
+    details = " ".join(f"{key}={safe_log_value(value)}" for key, value in fields.items() if value is not None)
     if details:
         print(f"[vinted-profile] {message} | {details}", flush=True)
     else:
@@ -226,13 +234,14 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         for row in rows
         if not str(row.get("profile_url", "") or "").strip() or not str(row.get("member_id", "") or "").strip()
     )
-    _log_vinted_profile(
-        "profile-items-enriched",
-        profile_url=profile_url,
-        member_id=member_id,
-        rows=len(rows),
-        missing_identity_after=missing_identity_after,
-    )
+    if missing_identity_after:
+        _log_vinted_profile(
+            "profile-items-enriched",
+            profile_url=profile_url,
+            member_id=member_id,
+            rows=len(rows),
+            missing_identity_after=missing_identity_after,
+        )
     snapshot_meta = save_vinted_profile_snapshot(
         profile_url=profile_url,
         rows=rows,
@@ -247,6 +256,9 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         new=snapshot_meta.get("profile_new_count", 0),
         gone=snapshot_meta.get("profile_gone_count", 0),
         still=snapshot_meta.get("profile_still_count", 0),
+        incomplete=snapshot_meta.get("profile_snapshot_incomplete", False),
+        previous=snapshot_meta.get("profile_previous_item_count", ""),
+        missing=snapshot_meta.get("profile_missing_item_count", ""),
         db_path=snapshot_meta.get("db_path", db_path),
     )
     gone_rows = list(snapshot_meta.get("profile_gone_rows", []) or [])
@@ -388,7 +400,9 @@ def _scroll_and_read_vinted_profile_items(
 ) -> list[dict]:
     rows_by_link: dict[str, dict] = {}
     stable_rounds = 0
-    max_rounds = 40 if max_items <= 0 else max(8, min(40, (max_items // 12) + 8))
+    stable_stop_rounds = 8 if max_items <= 0 else 5
+    max_rounds = 220 if max_items <= 0 else max(20, min(220, (max_items // 8) + 20))
+    last_height = 0
     _log_vinted_profile("scroll-start", max_items=max_items, max_rounds=max_rounds)
     for _round in range(max_rounds):
         for row in _read_vinted_profile_items(driver):
@@ -400,29 +414,60 @@ def _scroll_and_read_vinted_profile_items(
             _log_vinted_profile("scroll-stop-max-items", round=_round + 1, rows=len(rows_by_link), max_items=max_items)
             break
         before_count = len(rows_by_link)
-        moved = _scroll_vinted_profile(driver)
-        time.sleep(min(max(float(page_settle_seconds or 0), 0.4), 2.0))
+        scroll_state = _scroll_vinted_profile(driver)
+        moved = bool(scroll_state.get("moved"))
+        at_bottom = bool(scroll_state.get("at_bottom"))
+        page_height = int(scroll_state.get("height") or 0)
+        height_changed = bool(page_height and page_height != last_height)
+        if page_height:
+            last_height = page_height
+        time.sleep(min(max(float(page_settle_seconds or 0), 0.8), 3.0))
         for row in _read_vinted_profile_items(driver):
             link = str(row.get("link", "") or "").strip()
             if not link:
                 continue
             rows_by_link[link] = row
-        if len(rows_by_link) <= before_count and not moved:
+        if len(rows_by_link) <= before_count and not moved and at_bottom and not height_changed:
             stable_rounds += 1
-        elif len(rows_by_link) <= before_count:
+        elif len(rows_by_link) <= before_count and at_bottom and not height_changed:
             stable_rounds += 1
         else:
             stable_rounds = 0
-        _log_vinted_profile(
-            "scroll-round",
-            round=_round + 1,
-            rows=len(rows_by_link),
-            added=max(len(rows_by_link) - before_count, 0),
-            moved=moved,
-            stable_rounds=stable_rounds,
-        )
-        if stable_rounds >= 3:
+        added_count = max(len(rows_by_link) - before_count, 0)
+        if added_count or stable_rounds >= 2 or (_round + 1) % 5 == 0:
+            _log_vinted_profile(
+                "scroll-round",
+                round=_round + 1,
+                rows=len(rows_by_link),
+                added=added_count,
+                moved=moved,
+                at_bottom=at_bottom,
+                height=page_height,
+                height_changed=height_changed,
+                stable_rounds=stable_rounds,
+            )
+        if stable_rounds >= stable_stop_rounds:
             _log_vinted_profile("scroll-stop-stable", round=_round + 1, rows=len(rows_by_link))
+            break
+    for verify_round in range(1, 4):
+        scroll_state = _scroll_vinted_profile(driver)
+        time.sleep(min(max(float(page_settle_seconds or 0), 0.8), 2.0))
+        before_count = len(rows_by_link)
+        for row in _read_vinted_profile_items(driver):
+            link = str(row.get("link", "") or "").strip()
+            if not link:
+                continue
+            rows_by_link[link] = row
+        added_count = max(len(rows_by_link) - before_count, 0)
+        _log_vinted_profile(
+            "scroll-verify",
+            round=verify_round,
+            rows=len(rows_by_link),
+            added=added_count,
+            at_bottom=bool(scroll_state.get("at_bottom")),
+            height=int(scroll_state.get("height") or 0),
+        )
+        if max_items > 0 and len(rows_by_link) >= max_items:
             break
     rows = list(rows_by_link.values())
     if max_items > 0:
@@ -494,20 +539,50 @@ return links.map((link) => {
     return rows
 
 
-def _scroll_vinted_profile(driver: Driver) -> bool:
+def _scroll_vinted_profile(driver: Driver) -> dict[str, object]:
     try:
-        return bool(
-            driver.run_js(
-                """
-const before = window.scrollY || document.documentElement.scrollTop || 0;
-window.scrollTo({ top: document.body.scrollHeight || document.documentElement.scrollHeight || 0, behavior: 'instant' });
-const after = window.scrollY || document.documentElement.scrollTop || 0;
-return after > before;
-                """
-            )
+        payload = driver.run_js(
+            """
+const root = document.scrollingElement || document.documentElement || document.body;
+const before = window.scrollY || root.scrollTop || 0;
+const viewport = window.innerHeight || root.clientHeight || 0;
+const heightBefore = Math.max(
+  root.scrollHeight || 0,
+  document.body ? document.body.scrollHeight || 0 : 0,
+  document.documentElement ? document.documentElement.scrollHeight || 0 : 0
+);
+const target = Math.max(0, heightBefore - viewport);
+window.scrollTo({ top: target, behavior: 'instant' });
+root.scrollTop = target;
+window.dispatchEvent(new Event('scroll'));
+document.dispatchEvent(new Event('scroll'));
+const after = window.scrollY || root.scrollTop || 0;
+const heightAfter = Math.max(
+  root.scrollHeight || 0,
+  document.body ? document.body.scrollHeight || 0 : 0,
+  document.documentElement ? document.documentElement.scrollHeight || 0 : 0
+);
+const maxScroll = Math.max(0, heightAfter - viewport);
+const atBottom = after >= maxScroll - 8;
+if (atBottom && maxScroll > 0) {
+  window.scrollBy(0, -Math.min(240, viewport * 0.25));
+  window.scrollTo({ top: maxScroll, behavior: 'instant' });
+  root.scrollTop = maxScroll;
+}
+return {
+  before,
+  after: window.scrollY || root.scrollTop || 0,
+  height: heightAfter,
+  viewport,
+  max_scroll: maxScroll,
+  moved: Math.abs(after - before) > 2,
+  at_bottom: atBottom,
+};
+            """
         )
+        return payload if isinstance(payload, dict) else {"moved": False, "at_bottom": False, "height": 0}
     except Exception:
-        return False
+        return {"moved": False, "at_bottom": False, "height": 0}
 
 
 def normalize_vinted_profile_url(profile_url: object) -> str:
@@ -525,8 +600,24 @@ def normalize_vinted_profile_url(profile_url: object) -> str:
 
 
 def normalize_vinted_profile_urls(profile_urls: object) -> list[str]:
+    def split_profile_url_text(value: object) -> list[str]:
+        raw_value = str(value or "")
+        raw_value = raw_value.replace("\\n", "\n").replace("\\r", "\n")
+        raw_value = re.sub(r"/n(?=https?://|www\.vinted\.|vinted\.|member/|\d)", "\n", raw_value, flags=re.IGNORECASE)
+        raw_value = re.sub(r"(?<!^)(?=https?://(?:www\.)?vinted\.)", "\n", raw_value, flags=re.IGNORECASE)
+        return [
+            part.strip()
+            for chunk in raw_value.replace("\r", "\n").replace(";", "\n").split("\n")
+            for part in chunk.split(",")
+            if part.strip()
+        ]
+
     if isinstance(profile_urls, (list, tuple, set)):
-        raw_items = [str(item or "") for item in profile_urls]
+        raw_items = [
+            part
+            for item in profile_urls
+            for part in split_profile_url_text(item)
+        ]
     else:
         raw_value = str(profile_urls or "")
         try:
@@ -534,13 +625,13 @@ def normalize_vinted_profile_urls(profile_urls: object) -> list[str]:
         except json.JSONDecodeError:
             parsed_json = None
         if isinstance(parsed_json, list):
-            raw_items = [str(item or "") for item in parsed_json]
-        else:
             raw_items = [
-                part.strip()
-                for chunk in raw_value.replace("\r", "\n").replace(";", "\n").split("\n")
-                for part in chunk.split(",")
+                part
+                for item in parsed_json
+                for part in split_profile_url_text(item)
             ]
+        else:
+            raw_items = split_profile_url_text(raw_value)
     normalized: list[str] = []
     seen: set[str] = set()
     for item in raw_items:

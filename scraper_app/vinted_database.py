@@ -1009,7 +1009,7 @@ def save_vinted_profile_snapshot(
             _create_schema(connection)
             previous_snapshot = connection.execute(
                 """
-                SELECT id
+                SELECT id, item_count
                 FROM vinted_profile_snapshots
                 WHERE member_id = ? AND profile_url = ?
                 ORDER BY checked_at DESC, id DESC
@@ -1030,6 +1030,49 @@ def save_vinted_profile_snapshot(
                         (int(previous_snapshot["id"]),),
                     ).fetchall()
                     if str(record[0] or "")
+                }
+
+            previous_count = len(previous_links)
+            current_count = len(current_links)
+            missing_count = max(previous_count - current_count, 0)
+            missing_ratio = (missing_count / previous_count) if previous_count else 0.0
+            incomplete_snapshot = bool(
+                previous_count >= 12
+                and current_count > 0
+                and missing_count >= max(8, int(previous_count * 0.25))
+                and missing_ratio >= 0.35
+            )
+            if incomplete_snapshot:
+                history_by_link = _load_vinted_profile_item_history(
+                    connection,
+                    member_id=member_id,
+                    profile_url=normalized_profile_url,
+                    links=current_links,
+                    sold_at=snapshot_at,
+                )
+                for row in normalized_rows:
+                    link = str(row.get("link", "") or "")
+                    history = history_by_link.get(link, {})
+                    row["profile_item_status"] = "still_active" if link in previous_links else "current"
+                    row["profile_first_seen_at"] = str(history.get("first_seen_at", "") or snapshot_at)
+                    row["profile_last_seen_at"] = str(history.get("last_seen_at", "") or snapshot_at)
+                return {
+                    "db_path": str(path),
+                    "profile_snapshot_id": "",
+                    "profile_checked_at": snapshot_at,
+                    "profile_member_id": member_id,
+                    "profile_item_count": current_count,
+                    "profile_new_count": 0,
+                    "profile_gone_count": 0,
+                    "profile_still_count": len(current_links & previous_links),
+                    "profile_current_rows": normalized_rows,
+                    "profile_gone_rows": [],
+                    "profile_snapshot_incomplete": True,
+                    "profile_snapshot_saved": False,
+                    "profile_previous_item_count": previous_count,
+                    "profile_missing_item_count": missing_count,
+                    "profile_missing_ratio": round(missing_ratio, 4),
+                    "db_saved_live": False,
                 }
 
             new_links = current_links - previous_links

@@ -68,6 +68,24 @@ class VintedTests(unittest.TestCase):
             ],
             normalize_vinted_profile_urls("262102939\nhttps://www.vinted.it/member/123456789,262102939"),
         )
+        self.assertEqual(
+            [
+                "https://www.vinted.it/member/262102939",
+                "https://www.vinted.it/member/167398536",
+            ],
+            normalize_vinted_profile_urls(
+                ["https://www.vinted.it/member/262102939\nhttps://www.vinted.it/member/167398536"]
+            ),
+        )
+        self.assertEqual(
+            [
+                "https://www.vinted.it/member/262102939",
+                "https://www.vinted.it/member/167398536",
+            ],
+            normalize_vinted_profile_urls(
+                "https://www.vinted.it/member/262102939/nhttps://www.vinted.it/member/167398536"
+            ),
+        )
 
     def test_save_vinted_profile_snapshot_tracks_new_and_gone_items(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -101,6 +119,35 @@ class VintedTests(unittest.TestCase):
         self.assertEqual("A", second["profile_gone_rows"][0]["name"])
         self.assertGreater(second["profile_gone_rows"][0]["profile_sold_after_seconds"], 0)
         self.assertTrue(second["profile_gone_rows"][0]["profile_sold_after_text"])
+
+    def test_save_vinted_profile_snapshot_ignores_likely_incomplete_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            profile_url = "https://www.vinted.it/member/167398536"
+            full_rows = [
+                {
+                    "link": f"https://www.vinted.it/items/{1000 + index}-item-{index}",
+                    "name": f"Item {index}",
+                    "price": "10,00 €",
+                }
+                for index in range(60)
+            ]
+            partial_rows = full_rows[:20]
+
+            save_vinted_profile_snapshot(profile_url, full_rows, db_path=db_path)
+            partial = save_vinted_profile_snapshot(profile_url, partial_rows, db_path=db_path)
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                snapshot_count = connection.execute("SELECT COUNT(*) FROM vinted_profile_snapshots").fetchone()[0]
+
+        self.assertTrue(partial["profile_snapshot_incomplete"])
+        self.assertFalse(partial["profile_snapshot_saved"])
+        self.assertEqual(20, partial["profile_item_count"])
+        self.assertEqual(60, partial["profile_previous_item_count"])
+        self.assertEqual(40, partial["profile_missing_item_count"])
+        self.assertEqual(0, partial["profile_gone_count"])
+        self.assertEqual(0, partial["profile_new_count"])
+        self.assertEqual(1, snapshot_count)
 
     def test_search_url_and_term(self) -> None:
         url = build_vinted_search_url("macbook pro")

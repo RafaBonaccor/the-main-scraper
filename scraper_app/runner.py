@@ -77,6 +77,8 @@ def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
             slow_mode=bool(kwargs.get("slow_mode", False)),
             action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
             page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
+            discord_profile_report=bool(kwargs.get("discord_profile_report", False)),
+            discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
         )
 
     if source == "subito":

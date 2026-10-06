@@ -67,6 +67,7 @@ def build_vinted_profile_report_discord_message(meta: dict, rows: list[dict]) ->
     gone_count = int(meta.get("profile_gone_count", 0) or 0)
     still_count = int(meta.get("profile_still_count", 0) or 0)
     cycle_index = int(meta.get("cycle_index", 1) or 1)
+    snapshot_incomplete = bool(meta.get("profile_snapshot_incomplete", False))
 
     lines = [
         "📦 **Report profilo Vinted**",
@@ -82,6 +83,15 @@ def build_vinted_profile_report_discord_message(meta: dict, rows: list[dict]) ->
     lines.append(f"Ciclo: {cycle_index}")
     if profile_url:
         lines.append(f"Profilo: <{profile_url}>")
+    if snapshot_incomplete:
+        previous_count = int(meta.get("profile_previous_item_count", 0) or 0)
+        missing_count = int(meta.get("profile_missing_item_count", 0) or 0)
+        lines.append("")
+        lines.append(
+            "⚠️ Acquisizione probabilmente incompleta: "
+            f"letti {active_count} articoli, precedente {previous_count}, mancanti {missing_count}. "
+            "Nessun articolo è stato marcato come venduto/rimosso in questo ciclo."
+        )
 
     new_rows = [row for row in rows if str(row.get("profile_item_status", "") or "") == "new"]
     gone_rows = [row for row in rows if str(row.get("profile_item_status", "") or "") == "gone"]

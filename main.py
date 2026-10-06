@@ -188,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     vinted_profile_parser = run_subparsers.add_parser("vinted_profile", help="Monitor one or more Vinted seller profiles and track listed/sold/removed items.")
     vinted_profile_parser.add_argument("--profile-url", "--url", dest="profile_url", default="", help="Single Vinted member URL, e.g. https://www.vinted.it/member/262102939")
-    vinted_profile_parser.add_argument("--profile-urls", default="", help="Newline-separated Vinted member URLs. Commas/semicolons and numeric IDs are also accepted.")
+    vinted_profile_parser.add_argument("--profile-urls", default="", help="Newline-separated Vinted member URLs. Numeric IDs are accepted too.")
     vinted_profile_parser.add_argument("--profiles-file", default="", help="UTF-8 text or JSON file containing multiple Vinted member URLs.")
     vinted_profile_parser.add_argument(
         "--max-items",

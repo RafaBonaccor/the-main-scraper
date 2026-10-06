@@ -452,6 +452,7 @@ class ScraperApp:
         self.vinted_profile_monitor_discord_report_var = tk.BooleanVar(value=True)
         self.vinted_profile_monitor_status_var = tk.StringVar(value="Monitor profili Vinted disattivato.")
         self.vinted_profile_monitor_urls_seed = "https://www.vinted.it/member/262102939"
+        self.vinted_profile_monitor_url_rows: list[dict[str, object]] = []
         self.vinted_db_path_var = tk.StringVar(value=str((script_path.parent / "data" / "scraper.db").resolve()))
         self.vinted_db_filter_var = tk.StringVar()
         self.vinted_db_limit_var = tk.StringVar(value="500")
@@ -687,9 +688,36 @@ class ScraperApp:
         return str(getattr(self, "vinted_ai_prompt_seed", "") or "").strip()
 
     def _current_vinted_profile_monitor_urls_text(self) -> str:
+        if hasattr(self, "vinted_profile_monitor_url_rows"):
+            values = []
+            for row in self.vinted_profile_monitor_url_rows:
+                variable = row.get("var") if isinstance(row, dict) else None
+                if variable is not None and hasattr(variable, "get"):
+                    value = str(variable.get() or "").strip()
+                    if value:
+                        values.append(value)
+            if values:
+                return "\n".join(values)
         if hasattr(self, "vinted_profile_monitor_urls_text"):
             return str(self.vinted_profile_monitor_urls_text.get("1.0", "end-1c") or "").strip()
         return str(getattr(self, "vinted_profile_monitor_urls_seed", "https://www.vinted.it/member/262102939") or "").strip()
+
+    @staticmethod
+    def _split_vinted_profile_monitor_urls_text(raw_text: object) -> list[str]:
+        raw = str(raw_text or "")
+        parts = [
+            part.strip()
+            for chunk in raw.replace("\r", "\n").replace(";", "\n").split("\n")
+            for part in chunk.split(",")
+        ]
+        values: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            if not part or part in seen:
+                continue
+            seen.add(part)
+            values.append(part)
+        return values
 
     def _load_persisted_ui_settings(self) -> None:
         if not self.ui_settings_path.exists():
@@ -1850,33 +1878,37 @@ class ScraperApp:
             profile_monitor_frame,
             text=(
                 "Controlla uno o piu profili venditore, salva snapshot nel DB e calcola nuovi articoli, "
-                "articoli spariti e dopo quanto tempo sono stati venduti/spariti. Inserisci un profilo per riga; "
-                "puoi incollare anche solo l'ID numerico del profilo."
+                "articoli spariti e dopo quanto tempo sono stati venduti/spariti. Usa il pulsante + per aggiungere "
+                "piu profili. Puoi incollare anche solo l'ID numerico del profilo."
             ),
             style="Hint.TLabel",
             wraplength=760,
             justify="left",
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
-        ttk.Label(profile_monitor_frame, text="URL profili (uno per riga)").grid(row=2, column=0, sticky="nw")
+        ttk.Label(profile_monitor_frame, text="URL profili").grid(row=2, column=0, sticky="nw")
         profile_urls_frame = ttk.Frame(profile_monitor_frame, style="Panel.TFrame")
         profile_urls_frame.grid(row=2, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(0, 8))
-        self.vinted_profile_monitor_urls_text = tk.Text(
-            profile_urls_frame,
-            height=4,
-            wrap="word",
-            bg="#ffffff",
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="solid",
-            borderwidth=1,
-        )
-        self.vinted_profile_monitor_urls_text.insert("1.0", self._current_vinted_profile_monitor_urls_text())
-        self.vinted_profile_monitor_urls_text.bind("<KeyRelease>", self._schedule_persist_ui_settings)
-        profile_urls_scroll = ttk.Scrollbar(profile_urls_frame, orient="vertical", command=self.vinted_profile_monitor_urls_text.yview)
-        self.vinted_profile_monitor_urls_text.configure(yscrollcommand=profile_urls_scroll.set)
-        self.vinted_profile_monitor_urls_text.grid(row=0, column=0, sticky="nsew")
-        profile_urls_scroll.grid(row=0, column=1, sticky="ns")
         profile_urls_frame.columnconfigure(0, weight=1)
+        self.vinted_profile_monitor_urls_rows_frame = ttk.Frame(profile_urls_frame, style="Panel.TFrame")
+        self.vinted_profile_monitor_urls_rows_frame.grid(row=0, column=0, sticky="ew")
+        self.vinted_profile_monitor_urls_rows_frame.columnconfigure(0, weight=1)
+        profile_urls_actions = ttk.Frame(profile_urls_frame, style="Panel.TFrame")
+        profile_urls_actions.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(
+            profile_urls_actions,
+            text="+ Aggiungi profilo",
+            style="Secondary.TButton",
+            command=self._add_empty_vinted_profile_monitor_url_row,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            profile_urls_actions,
+            text="Un campo per ogni profilo. Accetta URL completo oppure solo ID numerico.",
+            style="Hint.TLabel",
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.vinted_profile_monitor_url_rows = []
+        seed_profile_urls = self._split_vinted_profile_monitor_urls_text(self._current_vinted_profile_monitor_urls_text())
+        for seed_profile_url in seed_profile_urls or [""]:
+            self._add_vinted_profile_monitor_url_row(seed_profile_url, persist=False)
         ttk.Label(profile_monitor_frame, text="Database SQLite").grid(row=3, column=0, sticky="w")
         ttk.Entry(profile_monitor_frame, textvariable=self.vinted_db_path_var, width=72).grid(
             row=3,
@@ -1892,7 +1924,7 @@ class ScraperApp:
             style="Secondary.TButton",
             command=self._choose_vinted_db_path,
         ).grid(row=3, column=3, sticky="ew", pady=(0, 8))
-        ttk.Label(profile_monitor_frame, text="Intervallo (s)").grid(row=4, column=0, sticky="w")
+        ttk.Label(profile_monitor_frame, text="Ripeti dopo il primo controllo (s, 0 = una volta)").grid(row=4, column=0, sticky="w")
         ttk.Entry(profile_monitor_frame, textvariable=self.vinted_profile_monitor_interval_seconds_var, width=10).grid(
             row=4,
             column=1,
@@ -3461,11 +3493,7 @@ class ScraperApp:
 
     def _current_vinted_profile_monitor_urls(self) -> list[str]:
         raw_text = self._current_vinted_profile_monitor_urls_text()
-        parts = [
-            part.strip()
-            for chunk in raw_text.replace("\r", "\n").replace(";", "\n").split("\n")
-            for part in chunk.split(",")
-        ]
+        parts = self._split_vinted_profile_monitor_urls_text(raw_text)
         urls: list[str] = []
         seen: set[str] = set()
         for part in parts:
@@ -3479,8 +3507,66 @@ class ScraperApp:
             seen.add(value)
             urls.append(value)
         if not urls:
-            raise ValueError("Inserisci almeno un profilo Vinted valido, uno per riga.")
+            raise ValueError("Inserisci almeno un profilo Vinted valido. Usa + per aggiungere altri profili.")
         return urls
+
+    def _add_empty_vinted_profile_monitor_url_row(self) -> None:
+        self._add_vinted_profile_monitor_url_row("", persist=True)
+
+    def _add_vinted_profile_monitor_url_row(self, value: str = "", *, persist: bool = True) -> None:
+        rows_frame = getattr(self, "vinted_profile_monitor_urls_rows_frame", None)
+        if rows_frame is None:
+            return
+        row_ref: dict[str, object] = {}
+        variable = tk.StringVar(value=str(value or "").strip())
+        row_frame = ttk.Frame(rows_frame, style="Panel.TFrame")
+        entry = ttk.Entry(row_frame, textvariable=variable, width=72)
+        entry.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 4))
+        remove_button = ttk.Button(
+            row_frame,
+            text="−",
+            width=3,
+            style="Secondary.TButton",
+            command=lambda: self._remove_vinted_profile_monitor_url_row(row_ref),
+        )
+        remove_button.grid(row=0, column=1, sticky="e", pady=(0, 4))
+        row_frame.columnconfigure(0, weight=1)
+        row_ref.update({"frame": row_frame, "var": variable, "remove_button": remove_button})
+        self.vinted_profile_monitor_url_rows.append(row_ref)
+        variable.trace_add("write", self._schedule_persist_ui_settings)
+        self._render_vinted_profile_monitor_url_rows()
+        if persist:
+            self._schedule_persist_ui_settings()
+        try:
+            entry.focus_set()
+        except Exception:
+            pass
+
+    def _remove_vinted_profile_monitor_url_row(self, row_ref: dict[str, object]) -> None:
+        if len(self.vinted_profile_monitor_url_rows) <= 1:
+            variable = row_ref.get("var")
+            if variable is not None and hasattr(variable, "set"):
+                variable.set("")
+            self._schedule_persist_ui_settings()
+            return
+        frame = row_ref.get("frame")
+        if frame is not None and hasattr(frame, "destroy"):
+            frame.destroy()
+        try:
+            self.vinted_profile_monitor_url_rows.remove(row_ref)
+        except ValueError:
+            pass
+        self._render_vinted_profile_monitor_url_rows()
+        self._schedule_persist_ui_settings()
+
+    def _render_vinted_profile_monitor_url_rows(self) -> None:
+        for index, row_ref in enumerate(self.vinted_profile_monitor_url_rows):
+            frame = row_ref.get("frame")
+            if frame is not None and hasattr(frame, "grid"):
+                frame.grid(row=index, column=0, sticky="ew")
+            remove_button = row_ref.get("remove_button")
+            if remove_button is not None and hasattr(remove_button, "configure"):
+                remove_button.configure(state="normal" if len(self.vinted_profile_monitor_url_rows) > 1 else "disabled")
 
     def _write_vinted_profile_urls_file(self, urls: list[str]) -> Path:
         output_dir = Path(self.output_dir_var.get()).resolve()
@@ -3570,10 +3656,10 @@ class ScraperApp:
         self._clear_results()
         self.current_run_source = "vinted_profile"
         self.vinted_profile_monitor_status_var.set(
-            f"Monitor profili attivo: {len(urls)} profili, intervallo {interval_seconds}s."
+            f"Monitor profili attivo: controllo immediato su {len(urls)} profili, poi ogni {interval_seconds}s."
         )
-        self.vinted_status_var.set("Monitor profili Vinted avviato in job separato.")
-        self._append_log(f"[vinted-profile] Avvio monitor: {len(urls)} profili, intervallo {interval_seconds}s.\n")
+        self.vinted_status_var.set("Monitor profili Vinted avviato: primo controllo immediato.")
+        self._append_log(f"[vinted-profile] Avvio monitor: controllo immediato su {len(urls)} profili, poi intervallo {interval_seconds}s.\n")
         self._start_process(command, kind="vinted_profile_monitor", load_results=True)
 
     def _run_vinted_profile_check_now(self) -> None:
