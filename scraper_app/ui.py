@@ -47,8 +47,10 @@ from .vinted_database import (
     annotate_rows_with_vinted_offer_history,
     build_vinted_item_identity_keys,
     delete_vinted_search_run,
+    load_vinted_deal_sales,
     list_vinted_search_runs,
     load_vinted_rows,
+    summarize_vinted_deal_sales,
     update_vinted_search_run,
 )
 from .vinted_deals import (
@@ -292,6 +294,7 @@ SUBITO_JOB_OPTIONS = (
     ("pulizie", "Pulizie"),
     ("colf", "Colf"),
     ("badante", "Badante"),
+    ("badante part time", "Badante part-time"),
     ("assistente familiare", "Assistente familiare"),
     ("domestica", "Domestica"),
     ("baby sitter", "Baby sitter"),
@@ -299,14 +302,18 @@ SUBITO_JOB_OPTIONS = (
 )
 SUBITO_NEARBY_CITY_OPTIONS = (
     "roma",
+    "roma nord",
     "morlupo",
     "fiano romano",
     "rignano flaminio",
     "monterotondo",
+    "guidonia montecelio",
     "capena",
+    "faleria",
     "riano",
     "castelnuovo di porto",
     "sacrofano",
+    "montebello",
     "formello",
     "campagnano di roma",
 )
@@ -448,6 +455,7 @@ class ScraperApp:
         self.vinted_deal_hunter_url_only_discord_var = tk.BooleanVar(value=False)
         self.vinted_discord_webhook_url_var = tk.StringVar(value="")
         self.vinted_profile_monitor_interval_seconds_var = tk.StringVar(value="3600")
+        self.vinted_profile_monitor_daily_report_hour_var = tk.StringVar(value="10")
         self.vinted_profile_monitor_max_items_var = tk.StringVar(value="0")
         self.vinted_profile_monitor_discord_report_var = tk.BooleanVar(value=True)
         self.vinted_profile_monitor_status_var = tk.StringVar(value="Monitor profili Vinted disattivato.")
@@ -659,6 +667,7 @@ class ScraperApp:
             "vinted_deal_hunter_url_only_discord": self._safe_var_bool("vinted_deal_hunter_url_only_discord_var"),
             "vinted_discord_webhook_url": self._safe_var_string("vinted_discord_webhook_url_var"),
             "vinted_profile_monitor_interval_seconds": self._safe_var_string("vinted_profile_monitor_interval_seconds_var"),
+            "vinted_profile_monitor_daily_report_hour": self._safe_var_string("vinted_profile_monitor_daily_report_hour_var"),
             "vinted_profile_monitor_max_items": self._safe_var_string("vinted_profile_monitor_max_items_var"),
             "vinted_profile_monitor_discord_report": self._safe_var_bool("vinted_profile_monitor_discord_report_var"),
             "vinted_profile_monitor_urls": self._current_vinted_profile_monitor_urls_text(),
@@ -775,6 +784,9 @@ class ScraperApp:
             profile_monitor_interval_seconds = payload.get("vinted_profile_monitor_interval_seconds")
             if isinstance(profile_monitor_interval_seconds, str) and profile_monitor_interval_seconds.strip():
                 self.vinted_profile_monitor_interval_seconds_var.set(profile_monitor_interval_seconds.strip())
+            profile_monitor_daily_report_hour = payload.get("vinted_profile_monitor_daily_report_hour")
+            if isinstance(profile_monitor_daily_report_hour, str) and profile_monitor_daily_report_hour.strip():
+                self.vinted_profile_monitor_daily_report_hour_var.set(profile_monitor_daily_report_hour.strip())
             profile_monitor_max_items = payload.get("vinted_profile_monitor_max_items")
             if isinstance(profile_monitor_max_items, str) and profile_monitor_max_items.strip():
                 self.vinted_profile_monitor_max_items_var.set(profile_monitor_max_items.strip())
@@ -871,6 +883,7 @@ class ScraperApp:
         self.vinted_deal_hunter_url_only_discord_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_discord_webhook_url_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_profile_monitor_interval_seconds_var.trace_add("write", self._schedule_persist_ui_settings)
+        self.vinted_profile_monitor_daily_report_hour_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_profile_monitor_max_items_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_profile_monitor_discord_report_var.trace_add("write", self._schedule_persist_ui_settings)
         self.vinted_db_path_var.trace_add("write", self._schedule_persist_ui_settings)
@@ -1851,10 +1864,17 @@ class ScraperApp:
             text="Ferma procacciatore",
             style="Secondary.TButton",
             command=self._stop_vinted_deal_hunter,
-        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            deal_hunter_actions,
+            text="Analizza affari venduti",
+            style="Secondary.TButton",
+            command=self._show_vinted_deal_sales_analytics,
+        ).grid(row=0, column=3, sticky="ew", padx=(4, 0))
         deal_hunter_actions.columnconfigure(0, weight=1)
         deal_hunter_actions.columnconfigure(1, weight=1)
         deal_hunter_actions.columnconfigure(2, weight=1)
+        deal_hunter_actions.columnconfigure(3, weight=1)
         ttk.Label(
             deal_hunter_frame,
             textvariable=self.vinted_deal_hunter_status_var,
@@ -1940,13 +1960,26 @@ class ScraperApp:
             padx=(10, 0),
             pady=(0, 8),
         )
+        ttk.Label(profile_monitor_frame, text="Report giornaliero Discord alle ore").grid(row=5, column=0, sticky="w")
+        ttk.Entry(profile_monitor_frame, textvariable=self.vinted_profile_monitor_daily_report_hour_var, width=10).grid(
+            row=5,
+            column=1,
+            sticky="w",
+            padx=(10, 8),
+            pady=(0, 8),
+        )
+        ttk.Label(
+            profile_monitor_frame,
+            text="Ora locale 0-23. Default: 10.",
+            style="Hint.TLabel",
+        ).grid(row=5, column=2, columnspan=2, sticky="w", pady=(0, 8))
         ttk.Checkbutton(
             profile_monitor_frame,
             text="Invia resoconto Discord",
             variable=self.vinted_profile_monitor_discord_report_var,
-        ).grid(row=5, column=0, sticky="w", pady=(0, 8))
+        ).grid(row=6, column=0, sticky="w", pady=(0, 8))
         ttk.Entry(profile_monitor_frame, textvariable=self.vinted_discord_webhook_url_var, width=72).grid(
-            row=5,
+            row=6,
             column=1,
             columnspan=3,
             sticky="ew",
@@ -1954,7 +1987,7 @@ class ScraperApp:
             pady=(0, 8),
         )
         profile_monitor_actions = ttk.Frame(profile_monitor_frame, style="Panel.TFrame")
-        profile_monitor_actions.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(2, 0))
+        profile_monitor_actions.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(2, 0))
         self.vinted_profile_monitor_start_button = ttk.Button(
             profile_monitor_actions,
             text="Avvia monitor profili",
@@ -1985,7 +2018,7 @@ class ScraperApp:
             style="Hint.TLabel",
             wraplength=760,
             justify="left",
-        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         archive_section = CollapsibleSection(card, "Archivio database", expanded=False)
         archive_section.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(0, 10))
@@ -3575,6 +3608,59 @@ class ScraperApp:
         profiles_file.write_text(json.dumps(urls, ensure_ascii=False, indent=2), encoding="utf-8")
         return profiles_file
 
+    def _show_vinted_deal_sales_analytics(self) -> None:
+        """Open a compact historical view of deals verified as sold."""
+        raw_db_path = self.vinted_db_path_var.get().strip() or "data/scraper.db"
+        try:
+            rows = load_vinted_deal_sales(raw_db_path, limit=500)
+            summary = summarize_vinted_deal_sales(rows)
+        except Exception as exc:
+            messagebox.showerror("Analisi affari venduti", str(exc))
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Analisi affari venduti")
+        window.geometry("1120x590")
+        window.minsize(800, 400)
+        frame = ttk.Frame(window, style="Panel.TFrame", padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Affari confermati venduti", style="Metric.TLabel").pack(anchor="w")
+        ttk.Label(
+            frame,
+            text=(
+                f"Storico: {summary.get('sold_count', 0)}  •  "
+                f"Tempo medio: {summary.get('average_text', '') or '—'}  •  "
+                f"Mediana: {summary.get('median_text', '') or '—'}"
+            ),
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(2, 10))
+        columns = ("title", "price", "found", "sold", "elapsed", "link")
+        table = ttk.Treeview(frame, columns=columns, show="headings", height=18)
+        headings = {
+            "title": ("Annuncio", 270), "price": ("Prezzo", 100), "found": ("Trovato", 160),
+            "sold": ("Venduto", 160), "elapsed": ("Tempo vendita", 130), "link": ("URL", 340),
+        }
+        for key, (label, width) in headings.items():
+            table.heading(key, text=label)
+            table.column(key, width=width, minwidth=80, stretch=key in {"title", "link"})
+        for row in rows:
+            table.insert(
+                "", "end", values=(
+                    str(row.get("name", "") or "Affare Vinted"),
+                    str(row.get("price", "") or ""),
+                    str(row.get("deal_first_seen_at", "") or ""),
+                    str(row.get("deal_sold_at", "") or ""),
+                    str(row.get("deal_sold_after_text", "") or ""),
+                    str(row.get("link", "") or ""),
+                )
+            )
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=table.yview)
+        table.configure(yscrollcommand=scrollbar.set)
+        table.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        if not rows:
+            ttk.Label(frame, text="Ancora nessun affare confermato come venduto.", style="Hint.TLabel").pack(anchor="w", pady=(10, 0))
+
     def _parse_vinted_profile_monitor_interval_seconds(self) -> int:
         raw_value = self.vinted_profile_monitor_interval_seconds_var.get().strip() or "3600"
         try:
@@ -3584,6 +3670,16 @@ class ScraperApp:
         if seconds < 0:
             raise ValueError("Intervallo monitor profili deve essere maggiore o uguale a zero.")
         return seconds
+
+    def _parse_vinted_profile_monitor_daily_report_hour(self) -> int:
+        raw_value = self.vinted_profile_monitor_daily_report_hour_var.get().strip() or "10"
+        try:
+            hour = int(raw_value)
+        except ValueError as exc:
+            raise ValueError("Ora report giornaliero non valida. Usa un numero da 0 a 23.") from exc
+        if hour < 0 or hour > 23:
+            raise ValueError("Ora report giornaliero deve essere tra 0 e 23.")
+        return hour
 
     def _parse_vinted_profile_monitor_max_items(self) -> int:
         raw_value = self.vinted_profile_monitor_max_items_var.get().strip() or "0"
@@ -3612,6 +3708,8 @@ class ScraperApp:
             str(profiles_file),
             "--interval-seconds",
             str(self._parse_vinted_profile_monitor_interval_seconds() if interval_seconds_override is None else interval_seconds_override),
+            "--daily-report-hour",
+            str(self._parse_vinted_profile_monitor_daily_report_hour()),
             "--max-items",
             str(self._parse_vinted_profile_monitor_max_items()),
             "--keep-browser-open",

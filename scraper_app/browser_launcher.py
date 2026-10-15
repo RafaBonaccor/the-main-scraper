@@ -27,6 +27,8 @@ def open_browser_session(
         "browser_user_data_dir": browser_user_data_dir,
         "browser_profile_directory": browser_profile_directory,
         "refresh_browser_profile": bool(refresh_browser_profile),
+        # This action is explicitly used to show a browser to the user.
+        "browser_requires_foreground": True,
     }
     preferred_host = preferred_host_fragment_for_url(config["url"])
     reused = try_reuse_running_chrome(config["url"], preferred_host_fragment=preferred_host)

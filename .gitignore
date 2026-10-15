@@ -9,6 +9,8 @@ allegato/
 
 data/*.db
 data/*.db-*
+data/backups/
+data/deal_archive/
 
 .venv/
 venv/

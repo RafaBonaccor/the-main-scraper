@@ -186,6 +186,151 @@ def build_parser() -> argparse.ArgumentParser:
     _add_browser_arguments(vinted_parser)
     _add_export_arguments(vinted_parser)
 
+    vinted_competitors_parser = run_subparsers.add_parser(
+        "vinted_competitors",
+        help="Discover competitor sellers from interesting marketplace listings without using the deal-hunter scheduler.",
+    )
+    vinted_competitors_parser.add_argument("--search", default="", help="Optional direct search term or full catalog URL.")
+    vinted_competitors_parser.add_argument(
+        "--searches-file",
+        default="",
+        help="Optional JSON file containing one or more searches. Overrides competitor keywords/category.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--competitor-keywords",
+        default="charm, pandora",
+        help="Comma-separated keywords used to discover competitor sellers.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--competitor-category",
+        default="Gioielli donna",
+        help="Saved GUI category label or catalog URL used for competitor discovery.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--competitor-min-likes",
+        default=15,
+        type=int,
+        help="Open listing detail and extract seller only when the catalog listing has at least this many likes.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--competitor-max-age-hours",
+        default=720.0,
+        type=float,
+        help="Maximum listing age in hours used when scoring discovered competitor listings.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--competitor-interval-seconds",
+        default=0,
+        type=int,
+        help="If greater than zero, keep this competitor discovery job running like a cron with this pause between cycles.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--max-results",
+        default=100,
+        type=int,
+        help="Maximum catalog results to inspect for each competitor search.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--max-price",
+        default="",
+        help="Maximum item price to keep before considering a competitor listing.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--competitor-min-price",
+        default="",
+        help="Minimum item price to keep before considering a competitor listing.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--exclude-known-items",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip listings already archived/analyzed in the SQLite database.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--skip-login-required",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Do not require marketplace login for competitor discovery. This is the default.",
+    )
+    vinted_competitors_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
+    vinted_competitors_parser.add_argument(
+        "--keep-browser-open",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Leave the browser open between competitor discovery cycles.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--refresh-browser-profile",
+        action="store_true",
+        help="Refresh the persistent profile from the source Chrome data before discovery.",
+    )
+    vinted_competitors_parser.add_argument(
+        "--keep-open-seconds",
+        default=0,
+        type=int,
+        help="Blocking fallback: seconds to keep the browser open after a one-shot run.",
+    )
+    _add_orchestrator_arguments(vinted_competitors_parser)
+    _add_browser_arguments(vinted_competitors_parser)
+    _add_export_arguments(vinted_competitors_parser)
+
+    vinted_trends_parser = run_subparsers.add_parser(
+        "vinted_trends",
+        help="Measure brand/query sell-through in independent cohorts and pause weak searches safely.",
+    )
+    vinted_trends_parser.add_argument("--trend-keywords", default="", help="Comma-separated broad category queries. Empty uses the curated category preset.")
+    vinted_trends_parser.add_argument("--trend-interval-seconds", default=900, type=int, help="Seconds between scheduler cycles; 0 runs once.")
+    vinted_trends_parser.add_argument("--trend-queries-per-cycle", default=3, type=int)
+    vinted_trends_parser.add_argument("--max-results", default=100, type=int)
+    vinted_trends_parser.add_argument("--max-price", default="")
+    vinted_trends_parser.add_argument("--trend-evaluation-hours", default=72, type=int)
+    vinted_trends_parser.add_argument("--trend-evaluation-spacing-hours", default=24, type=int)
+    vinted_trends_parser.add_argument("--trend-min-sample", default=30, type=int)
+    vinted_trends_parser.add_argument("--trend-min-sell-through", default=8.0, type=float)
+    vinted_trends_parser.add_argument("--trend-promising-sell-through", default=15.0, type=float)
+    vinted_trends_parser.add_argument("--trend-weak-evaluations", default=2, type=int)
+    vinted_trends_parser.add_argument("--trend-empty-scans", default=3, type=int)
+    vinted_trends_parser.add_argument("--trend-error-scans", default=3, type=int)
+    vinted_trends_parser.add_argument("--trend-pause-hours", default=72, type=int)
+    vinted_trends_parser.add_argument("--trend-sale-check-interval-seconds", default=3600, type=int)
+    vinted_trends_parser.add_argument("--trend-sale-checks-per-cycle", default=20, type=int)
+    vinted_trends_parser.add_argument("--trend-max-tracking-hours", default=168, type=int)
+    vinted_trends_parser.add_argument("--db-path", default="data/scraper.db")
+    vinted_trends_parser.add_argument("--refresh-browser-profile", action="store_true")
+    _add_orchestrator_arguments(vinted_trends_parser)
+    _add_browser_arguments(vinted_trends_parser)
+    _add_export_arguments(vinted_trends_parser)
+
+    vinted_continuous_parser = run_subparsers.add_parser(
+        "vinted_continuous",
+        help="Continuously monitor selected seller profiles and discover competitor sellers in one scheduled job.",
+    )
+    vinted_continuous_parser.add_argument("--profile-url", "--url", dest="profile_url", default="")
+    vinted_continuous_parser.add_argument("--profile-urls", default="", help="Newline-separated marketplace member URLs.")
+    vinted_continuous_parser.add_argument("--profiles-file", default="", help="UTF-8 text or JSON file containing monitored profile URLs.")
+    vinted_continuous_parser.add_argument("--max-items", default=0, type=int, help="Maximum items read for each monitored profile. Use 0 for all.")
+    vinted_continuous_parser.add_argument("--competitor-keywords", default="charm, pandora", help="Comma-separated keywords used for competitor discovery.")
+    vinted_continuous_parser.add_argument("--competitor-category", default="Gioielli donna", help="Category label or catalog URL for competitor discovery.")
+    vinted_continuous_parser.add_argument("--competitor-min-likes", default=15, type=int, help="Minimum likes before opening a competitor candidate.")
+    vinted_continuous_parser.add_argument("--competitor-max-age-hours", default=720.0, type=float, help="Maximum candidate age in hours.")
+    vinted_continuous_parser.add_argument("--competitor-min-price", default="", help="Minimum item price for competitor candidates.")
+    vinted_continuous_parser.add_argument("--max-price", default="", help="Maximum item price for competitor candidates.")
+    vinted_continuous_parser.add_argument("--max-results", default=100, type=int, help="Maximum catalog results per competitor search.")
+    vinted_continuous_parser.add_argument("--article-interval-seconds", default=5, type=int, help="Pause between competitor/article scans. Use 0 to scan articles once.")
+    vinted_continuous_parser.add_argument("--profile-interval-seconds", default=3600, type=int, help="Pause between profile checks. Use 0 to check profiles once.")
+    vinted_continuous_parser.add_argument("--continuous-interval-seconds", default=None, type=int, help=argparse.SUPPRESS)
+    vinted_continuous_parser.add_argument("--exclude-known-items", action=argparse.BooleanOptionalAction, default=True)
+    vinted_continuous_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
+    vinted_continuous_parser.add_argument("--keep-browser-open", action=argparse.BooleanOptionalAction, default=True)
+    vinted_continuous_parser.add_argument("--refresh-browser-profile", action="store_true")
+    vinted_continuous_parser.add_argument("--discord-profile-report", action=argparse.BooleanOptionalAction, default=False)
+    vinted_continuous_parser.add_argument("--discord-deal-notifications", action=argparse.BooleanOptionalAction, default=False)
+    vinted_continuous_parser.add_argument("--discord-webhook-url", default="")
+    vinted_continuous_parser.add_argument("--daily-report-hour", default=10, type=int)
+    _add_orchestrator_arguments(vinted_continuous_parser)
+    _add_browser_arguments(vinted_continuous_parser)
+    _add_export_arguments(vinted_continuous_parser)
+
     vinted_profile_parser = run_subparsers.add_parser("vinted_profile", help="Monitor one or more Vinted seller profiles and track listed/sold/removed items.")
     vinted_profile_parser.add_argument("--profile-url", "--url", dest="profile_url", default="", help="Single Vinted member URL, e.g. https://www.vinted.it/member/262102939")
     vinted_profile_parser.add_argument("--profile-urls", default="", help="Newline-separated Vinted member URLs. Numeric IDs are accepted too.")
@@ -230,6 +375,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--discord-webhook-url",
         default="",
         help="Discord webhook URL used for Vinted profile reports.",
+    )
+    vinted_profile_parser.add_argument(
+        "--daily-report-hour",
+        default=10,
+        type=int,
+        help="Local hour for the once-per-day Discord digest. Default: 10.",
     )
     _add_orchestrator_arguments(vinted_profile_parser)
     _add_browser_arguments(vinted_profile_parser)
@@ -300,6 +451,60 @@ def build_parser() -> argparse.ArgumentParser:
     _add_orchestrator_arguments(subito_parser)
     _add_browser_arguments(subito_parser)
     _add_export_arguments(subito_parser)
+
+    subito_caregiver_parser = run_subparsers.add_parser(
+        "subito_caregiver",
+        help="Continuously monitor public part-time caregiver job listings without sharing Vinted state.",
+    )
+    subito_caregiver_parser.add_argument(
+        "--locations",
+        default="Roma, Monterotondo, Guidonia Montecelio, Rignano Flaminio, Morlupo, Capena, Fiano Romano, Faleria, Castelnuovo di Porto, Riano, Sacrofano, Montebello, Roma Nord",
+        help="Comma- or newline-separated locations monitored independently.",
+    )
+    subito_caregiver_parser.add_argument(
+        "--search-terms",
+        default="badante part time",
+        help="Comma-separated role queries combined with every monitored location.",
+    )
+    subito_caregiver_parser.add_argument("--region", default="lazio")
+    subito_caregiver_parser.add_argument("--category", default="offerte-lavoro")
+    subito_caregiver_parser.add_argument(
+        "--interval-seconds",
+        default=1800,
+        type=int,
+        help="Pause between complete monitoring cycles. Use 0 for one immediate cycle.",
+    )
+    subito_caregiver_parser.add_argument(
+        "--max-results",
+        default=25,
+        type=int,
+        help="Maximum listings inspected for each role/location query.",
+    )
+    subito_caregiver_parser.add_argument("--max-age-days", default=14, type=int)
+    subito_caregiver_parser.add_argument(
+        "--only-part-time",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require an explicit part-time/a-ore marker in the listing.",
+    )
+    subito_caregiver_parser.add_argument(
+        "--include-details",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Open matched search results to read their complete description (slower).",
+    )
+    subito_caregiver_parser.add_argument("--db-path", default="data/subito_jobs.db")
+    subito_caregiver_parser.add_argument(
+        "--discord-notifications",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Send only newly discovered matching jobs to Discord.",
+    )
+    subito_caregiver_parser.add_argument("--discord-webhook-url", default="")
+    _add_orchestrator_arguments(subito_caregiver_parser)
+    _add_browser_arguments(subito_caregiver_parser)
+    subito_caregiver_parser.set_defaults(browser_mode="isolated", browser_profile_directory="SubitoMonitor")
+    _add_export_arguments(subito_caregiver_parser)
 
     custom_parser = run_subparsers.add_parser("custom_site", help="Use the generic custom-site scraper.")
     custom_parser.add_argument("--url", required=True, help="Target URL.")
@@ -687,7 +892,7 @@ def _build_status_payload() -> dict:
         "platform": os.name,
         "active_venv_candidate": active_venv,
         "recommended_browser_mode": "sessione_persistente",
-        "supported_sources": ["google_maps", "vinted", "vinted_descriptions", "subito", "custom_site"],
+        "supported_sources": ["google_maps", "vinted", "vinted_competitors", "vinted_trends", "vinted_continuous", "vinted_descriptions", "vinted_profile", "subito", "subito_caregiver", "custom_site"],
         "supported_contact_sources": ["subito", "vinted", "vinted_upload"],
         "features": {
             "gui": True,
@@ -702,6 +907,7 @@ def _build_status_payload() -> dict:
             "data_dir": str((project_root / "data").resolve()),
             "error_logs_dir": str((project_root / "error_logs").resolve()),
             "vinted_db_default": str((project_root / "data" / "scraper.db").resolve()),
+            "subito_jobs_db_default": str((project_root / "data" / "subito_jobs.db").resolve()),
             "readme": str((project_root / "README").resolve()),
             "agents_doc": str((project_root / "AGENTS.md").resolve()),
         },
@@ -724,11 +930,15 @@ def _normalize_run_result(source: str, rows: list[dict], meta: dict, export_path
 
 
 def _normalize_meta_summary(source: str, meta: dict) -> dict:
-    if source == "vinted":
+    if source in {"vinted", "vinted_competitors"}:
         return {
             "search_term": str(meta.get("search_term", "") or meta.get("search", "") or ""),
             "row_count": int(meta.get("row_count", 0) or 0),
             "db_path": str(meta.get("db_path", "") or ""),
+            "competitor_discovery_enabled": bool(meta.get("competitor_discovery_enabled", False)),
+            "competitor_sellers_found": int(meta.get("competitor_sellers_found", 0) or 0),
+            "competitor_interval_seconds": int(meta.get("competitor_interval_seconds", 0) or 0),
+            "competitor_status_counts": dict(meta.get("competitor_status_counts", {}) or {}),
         }
     if source == "vinted_profile":
         return {
@@ -739,14 +949,38 @@ def _normalize_meta_summary(source: str, meta: dict) -> dict:
             "gone_items": int(meta.get("profile_gone_count", 0) or 0),
             "db_path": str(meta.get("db_path", "") or ""),
         }
-    if source == "subito":
+    if source == "vinted_continuous":
+        return {
+            "row_count": int(meta.get("row_count", 0) or 0),
+            "continuous_cycle": int(meta.get("continuous_cycle", 0) or 0),
+            "article_interval_seconds": int(meta.get("article_interval_seconds", 0) or 0),
+            "profile_interval_seconds": int(meta.get("profile_interval_seconds", 0) or 0),
+            "profile_count": int(meta.get("profile_count", 0) or 0),
+            "competitor_search_count": int(meta.get("competitor_search_count", 0) or 0),
+            "component_errors": list(meta.get("component_errors", []) or []),
+            "db_path": str(meta.get("db_path", "") or ""),
+        }
+    if source == "vinted_trends":
+        return {
+            "trend_cycle": int(meta.get("trend_cycle", 0) or 0),
+            "queries_configured": int(meta.get("queries_configured", 0) or 0),
+            "queries_scanned": int(meta.get("queries_scanned", 0) or 0),
+            "rows_observed": int(meta.get("rows_observed", 0) or 0),
+            "sale_checks": dict(meta.get("sale_checks", {}) or {}),
+            "query_summary": list(meta.get("query_summary", []) or []),
+            "db_path": str(meta.get("db_path", "") or ""),
+        }
+    if source in {"subito", "subito_caregiver"}:
         return {
             "query": str(meta.get("query", "") or ""),
-            "cities": list(meta.get("cities", []) or []),
+            "cities": list(meta.get("cities", meta.get("locations", [])) or []),
             "row_count": int(meta.get("row_count", 0) or 0),
             "query_errors_count": len(list(meta.get("query_errors", []) or [])),
             "geo_counts": dict(meta.get("geo_counts", {}) or {}),
             "screening_counts": dict(meta.get("screening_counts", {}) or {}),
+            "cycle_index": int(meta.get("cycle_index", 0) or 0),
+            "new_count": int(meta.get("new_count", 0) or 0),
+            "db_path": str(meta.get("db_path", "") or ""),
         }
     if source == "google_maps":
         return {
@@ -761,7 +995,7 @@ def _normalize_meta_summary(source: str, meta: dict) -> dict:
 
 
 def _normalize_row(source: str, row: dict) -> dict:
-    if source == "vinted":
+    if source in {"vinted", "vinted_competitors"}:
         return {
             "id": str(row.get("item_id", "") or ""),
             "title": str(row.get("name", "") or ""),
@@ -777,6 +1011,9 @@ def _normalize_row(source: str, row: dict) -> dict:
             "total_text": str(row.get("total_price", "") or ""),
             "total_value": _safe_float_or_none(row.get("total_price_value")),
             "description": str(row.get("description", "") or ""),
+            "seller_name": str(row.get("seller_name", "") or ""),
+            "seller_profile_url": str(row.get("seller_profile_url", "") or ""),
+            "seller_member_id": str(row.get("seller_member_id", "") or ""),
             "currency": str(row.get("currency", "") or ""),
             "offer_already_submitted": bool(row.get("offer_already_submitted", False)),
             "offer_last_submitted_at": str(row.get("offer_last_submitted_at", "") or ""),
@@ -800,7 +1037,40 @@ def _normalize_row(source: str, row: dict) -> dict:
             "sold_after_text": str(row.get("profile_sold_after_text", "") or ""),
             "last_seen_at": str(row.get("extracted_at", "") or ""),
         }
-    if source == "subito":
+    if source == "vinted_continuous":
+        component = str(row.get("continuous_component", "") or "")
+        if component == "profiles":
+            return {
+                "component": component,
+                "id": str(row.get("item_id", "") or ""),
+                "title": str(row.get("name", "") or ""),
+                "link": str(row.get("link", "") or ""),
+                "profile_url": str(row.get("profile_url", "") or ""),
+                "status": str(row.get("profile_item_status", "") or ""),
+                "price_text": str(row.get("price", "") or ""),
+            }
+        return {
+            "component": component,
+            "id": str(row.get("item_id", "") or ""),
+            "title": str(row.get("name", "") or ""),
+            "link": str(row.get("link", "") or ""),
+            "price_text": str(row.get("price", "") or ""),
+            "seller_name": str(row.get("seller_name", "") or ""),
+            "seller_profile_url": str(row.get("seller_profile_url", "") or ""),
+            "seller_member_id": str(row.get("seller_member_id", "") or ""),
+        }
+    if source == "vinted_trends":
+        return {
+            "id": str(row.get("item_id", "") or ""),
+            "title": str(row.get("name", "") or ""),
+            "link": str(row.get("link", "") or ""),
+            "query": str(row.get("trend_query", "") or ""),
+            "segment": str(row.get("trend_segment", row.get("trend_query", "")) or ""),
+            "query_kind": str(row.get("trend_query_kind", "") or ""),
+            "price_value": _safe_float_or_none(row.get("price_value")),
+            "favorites_count": _safe_int_or_none(row.get("favorite_count", row.get("favorites_count"))),
+        }
+    if source in {"subito", "subito_caregiver"}:
         return {
             "title": str(row.get("title", "") or ""),
             "company": str(row.get("company", "") or ""),
@@ -815,6 +1085,10 @@ def _normalize_row(source: str, row: dict) -> dict:
             "contact_status": str(row.get("contact_status", "") or ""),
             "price_text": str(row.get("price", "") or ""),
             "description": str(row.get("description", "") or ""),
+            "monitor_location_target": str(row.get("monitor_location_target", "") or ""),
+            "monitor_search_term": str(row.get("monitor_search_term", "") or ""),
+            "monitor_is_new": bool(row.get("monitor_is_new", False)),
+            "monitor_first_seen_at": str(row.get("monitor_first_seen_at", "") or ""),
         }
     if source == "google_maps":
         return {

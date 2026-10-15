@@ -41,6 +41,28 @@ def build_vinted_deal_discord_message(row: dict) -> str:
     return "\n".join(lines)
 
 
+def build_vinted_deal_sold_discord_message(row: dict) -> str:
+    """A compact, one-time notice emitted when a tracked deal becomes sold."""
+    title = normalize_whitespace(str(row.get("name", "") or "Affare Vinted"))
+    price = normalize_whitespace(str(row.get("price", "") or ""))
+    link = str(row.get("link", "") or "").strip()
+    elapsed = normalize_whitespace(str(row.get("deal_sold_after_text", "") or ""))
+    duration_source = normalize_whitespace(str(row.get("deal_sale_duration_source", "") or ""))
+    lines = ["✅ **Affare Vinted venduto**", title]
+    if price:
+        lines.append(f"Prezzo: {price}")
+    if elapsed:
+        lines.append(f"Tempo stimato per la vendita: {elapsed}")
+        lines.append(
+            "Fonte tempo: ora di caricamento"
+            if duration_source == "listing_age"
+            else "Fonte tempo: scoperta dell'affare"
+        )
+    if link:
+        lines.append(f"Annuncio: <{link}>")
+    return "\n".join(lines)
+
+
 def build_vinted_login_required_discord_message(status: dict) -> str:
     expected_alt = normalize_whitespace(str(status.get("expected_alt", "bonaccarla") or "bonaccarla"))
     current_url = str(status.get("current_url", "") or "").strip()
@@ -109,6 +131,95 @@ def build_vinted_profile_report_discord_message(meta: dict, rows: list[dict]) ->
     return "\n".join(lines)
 
 
+def build_vinted_profile_daily_report_discord_message(
+    meta: dict,
+    rows: list[dict],
+    deal_sales: list[dict] | None = None,
+    deal_sales_summary: dict | None = None,
+) -> str:
+    since_at = normalize_whitespace(str(meta.get("daily_since_at", "") or ""))
+    until_at = normalize_whitespace(str(meta.get("daily_until_at", "") or ""))
+    profile_count = int(meta.get("profile_count", 0) or 0)
+    new_rows = [row for row in rows if str(row.get("profile_item_status", "") or "").lower() == "new"]
+    gone_rows = [row for row in rows if str(row.get("profile_item_status", "") or "").lower() == "gone"]
+    lines = [
+        "🗓️ **Report giornaliero profili**",
+        f"Profili monitorati: {profile_count}",
+        f"Nuovi articoli oggi: {len(new_rows)}",
+        f"Spariti/venduti/rimossi oggi: {len(gone_rows)}",
+    ]
+    if since_at and until_at:
+        lines.append(f"Periodo: {since_at} → {until_at}")
+    if new_rows:
+        lines.append("")
+        lines.append("🟢 Nuovi trovati oggi:")
+        lines.extend(_format_vinted_profile_report_rows(new_rows, limit=10))
+    if gone_rows:
+        lines.append("")
+        lines.append("🔴 Venduti/spariti oggi:")
+        lines.extend(_format_vinted_profile_report_rows(gone_rows, limit=10))
+    if not new_rows and not gone_rows:
+        lines.append("")
+        lines.append("Nessun cambiamento registrato oggi.")
+    if len(new_rows) > 10 or len(gone_rows) > 10:
+        lines.append("")
+        lines.append("Lista tagliata per non superare i limiti di Discord.")
+    sold_deals = deal_sales or []
+    if sold_deals:
+        summary = deal_sales_summary or {}
+        lines.append("")
+        lines.append("💎 **Affari confermati venduti**")
+        lines.append(f"Venduti oggi: {len(sold_deals)}")
+        average = normalize_whitespace(str(summary.get("average_text", "") or ""))
+        median = normalize_whitespace(str(summary.get("median_text", "") or ""))
+        if average:
+            lines.append(f"Tempo medio dalla scoperta: {average}")
+        if median:
+            lines.append(f"Mediana: {median}")
+        lines.extend(_format_vinted_deal_sale_rows(sold_deals, limit=0))
+    return "\n".join(lines)
+
+
+def split_discord_message(
+    content: str,
+    *,
+    max_length: int = 1900,
+    continuation_prefix: str = "↪️ **Report giornaliero — continua**",
+) -> list[str]:
+    """Split a report on line boundaries without dropping any rows."""
+    normalized_limit = max(min(int(max_length or 1900), 2000), 200)
+    text = str(content or "").strip()
+    if not text:
+        return []
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines():
+        candidate = line if not current else f"{current}\n{line}"
+        if len(candidate) <= normalized_limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while len(line) > normalized_limit:
+            chunks.append(line[:normalized_limit])
+            line = line[normalized_limit:]
+        current = line
+    if current:
+        chunks.append(current)
+    if len(chunks) <= 1:
+        return chunks
+    prefixed: list[str] = [chunks[0]]
+    prefix = str(continuation_prefix or "").strip()
+    for chunk in chunks[1:]:
+        candidate = f"{prefix}\n{chunk}" if prefix else chunk
+        if len(candidate) <= 2000:
+            prefixed.append(candidate)
+        else:
+            prefixed.append(chunk)
+    return prefixed
+
+
 def _format_vinted_profile_report_rows(rows: list[dict], limit: int = 8) -> list[str]:
     lines: list[str] = []
     for row in rows[:limit]:
@@ -129,6 +240,22 @@ def _format_vinted_profile_report_rows(rows: list[dict], limit: int = 8) -> list
     remaining = len(rows) - limit
     if remaining > 0:
         lines.append(f"- ...altri {remaining}")
+    return lines
+
+
+def _format_vinted_deal_sale_rows(rows: list[dict], limit: int = 8) -> list[str]:
+    lines: list[str] = []
+    selected_rows = rows if limit <= 0 else rows[:limit]
+    for row in selected_rows:
+        title = normalize_whitespace(str(row.get("name", "") or "Affare Vinted"))
+        price = normalize_whitespace(str(row.get("price", "") or ""))
+        elapsed = normalize_whitespace(str(row.get("deal_sold_after_text", "") or ""))
+        link = str(row.get("link", "") or "").strip()
+        details = " | ".join(part for part in (price, f"venduto in {elapsed}" if elapsed else "") if part)
+        suffix = f" — {details}" if details else ""
+        lines.append(f"- {title}{suffix}{': <' + link + '>' if link else ''}")
+    if limit > 0 and len(rows) > limit:
+        lines.append(f"- ...altri {len(rows) - limit}")
     return lines
 
 

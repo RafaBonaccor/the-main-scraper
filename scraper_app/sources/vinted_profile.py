@@ -1,15 +1,22 @@
 import time
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.request import urlopen
 
 from botasaurus.browser import Driver, Wait, browser
 
 from ..browser_helpers import DEFAULT_COOKIE_REJECT_TEXTS, click_first_matching_text, current_page_url
 from ..browser_runtime import resolve_browser_arguments, resolve_browser_profile
-from ..discord_notifications import build_vinted_profile_report_discord_message, send_discord_webhook_message
+from ..discord_notifications import (
+    build_vinted_profile_daily_report_discord_message,
+    build_vinted_profile_report_discord_message,
+    send_discord_webhook_message,
+    split_discord_message,
+)
 from ..exporters import write_outcome_json
 from ..models import ScrapeOutcome
 from ..runtime_controls import consume_stop_after_current_item_request
@@ -17,13 +24,35 @@ from ..utils import normalize_whitespace
 from ..vinted_database import (
     DEFAULT_VINTED_DB_PATH,
     extract_vinted_item_id_from_link,
+    load_vinted_profile_daily_changes,
+    load_vinted_deal_sales,
     normalize_vinted_member_id,
     save_vinted_profile_snapshot,
+    summarize_vinted_deal_sales,
 )
 from .vinted import VINTED_BASE_URL, normalize_vinted_image_url, normalize_vinted_item_url
 
 
 VINTED_PROFILE_NAVIGATION_TIMEOUT_SECONDS = 20
+DEFAULT_AGENT_LAB_RUNTIME_URL = "http://127.0.0.1:8000"
+
+
+def _download_vinted_daily_html_report(*, db_path: str, days: int = 30) -> Path:
+    runtime_url = str(os.environ.get("AGENT_LAB_RUNTIME_URL", DEFAULT_AGENT_LAB_RUNTIME_URL) or "").strip().rstrip("/")
+    if not runtime_url:
+        raise ValueError("Agent Lab runtime URL is empty.")
+    query = urlencode({"days": max(min(int(days or 30), 365), 1), "limit": 500})
+    endpoint = f"{runtime_url}/api/vinted/reports/export?{query}"
+    with urlopen(endpoint, timeout=30) as response:
+        content = response.read()
+        status = int(getattr(response, "status", 200) or 200)
+    if status < 200 or status >= 300 or not content:
+        raise RuntimeError(f"Marketplace HTML report export failed with HTTP {status}.")
+    output_dir = Path(db_path).expanduser().resolve().parent / "reports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"marketplace-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
+    output_path.write_bytes(content)
+    return output_path
 
 
 def _log_vinted_profile(message: str, **fields: object) -> None:
@@ -52,6 +81,7 @@ def run_vinted_profile_monitor(
     browser_user_data_dir: str = "",
     browser_profile_directory: str = "Default",
     keep_browser_open: bool = True,
+    close_existing_runtime_browser: bool = False,
     refresh_browser_profile: bool = False,
     keep_open_seconds: int = 0,
     slow_mode: bool = False,
@@ -59,6 +89,8 @@ def run_vinted_profile_monitor(
     page_settle_seconds: float = 3.0,
     discord_profile_report: bool = False,
     discord_webhook_url: str = "",
+    daily_report_hour: int = 10,
+    send_daily_report: bool = True,
 ) -> ScrapeOutcome:
     normalized_profile_urls = normalize_vinted_profile_urls(profile_urls or profile_url)
     if not normalized_profile_urls:
@@ -78,6 +110,7 @@ def run_vinted_profile_monitor(
         _log_vinted_profile("profile-input", index=index, profile_url=normalized_url)
     latest_outcome: ScrapeOutcome | None = None
     cycle_index = 0
+    last_daily_report_date = ""
     while True:
         if consume_stop_after_current_item_request():
             break
@@ -112,6 +145,7 @@ def run_vinted_profile_monitor(
                     "browser_user_data_dir": browser_user_data_dir,
                     "browser_profile_directory": browser_profile_directory,
                     "keep_browser_open": bool(keep_browser_open),
+                    "close_existing_runtime_browser": bool(close_existing_runtime_browser),
                     "refresh_browser_profile": bool(refresh_browser_profile),
                     "keep_open_seconds": max(int(keep_open_seconds or 0), 0),
                     "slow_mode": bool(slow_mode),
@@ -161,6 +195,15 @@ def run_vinted_profile_monitor(
             ui_result_path.parent.mkdir(parents=True, exist_ok=True)
             write_outcome_json(ui_result_path, latest_outcome)
             _log_vinted_profile("ui-result-written", path=str(ui_result_path), rows=len(cycle_rows))
+        if send_daily_report:
+            last_daily_report_date = maybe_send_vinted_profile_daily_report(
+                db_path=db_path,
+                profile_urls=normalized_profile_urls,
+                discord_profile_report=bool(discord_profile_report),
+                discord_webhook_url=str(discord_webhook_url or "").strip(),
+                daily_report_hour=int(daily_report_hour if daily_report_hour is not None else 10),
+                last_daily_report_date=last_daily_report_date,
+            )
         if normalized_interval <= 0:
             return latest_outcome
         print(
@@ -182,10 +225,107 @@ def run_vinted_profile_monitor(
     raise RuntimeError("Monitor profilo Vinted interrotto prima di completare il primo ciclo.")
 
 
+def maybe_send_vinted_profile_daily_report(
+    *,
+    db_path: str,
+    profile_urls: list[str],
+    discord_profile_report: bool,
+    discord_webhook_url: str,
+    daily_report_hour: int,
+    last_daily_report_date: str,
+) -> str:
+    if not discord_profile_report:
+        return last_daily_report_date
+    webhook_url = str(discord_webhook_url or "").strip()
+    if not webhook_url:
+        return last_daily_report_date
+    hour = max(min(int(daily_report_hour or 10), 23), 0)
+    now = datetime.now()
+    today_key = now.date().isoformat()
+    if now.hour < hour or last_daily_report_date == today_key:
+        return last_daily_report_date
+    since_at = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
+    until_at = now.isoformat(timespec="seconds")
+    try:
+        rows = load_vinted_profile_daily_changes(
+            db_path=db_path,
+            since_at=since_at,
+            until_at=until_at,
+            profile_urls=profile_urls,
+            limit=120,
+        )
+        deal_sales = load_vinted_deal_sales(
+            db_path=db_path,
+            since_at=since_at,
+            limit=0,
+        )
+        meta = {
+            "profile_count": len(profile_urls),
+            "daily_since_at": since_at,
+            "daily_until_at": until_at,
+            "daily_report_hour": hour,
+        }
+        message = build_vinted_profile_daily_report_discord_message(
+            meta,
+            rows,
+            deal_sales=deal_sales,
+            deal_sales_summary=summarize_vinted_deal_sales(deal_sales),
+        )
+        messages = split_discord_message(message)
+        attachment_paths: list[Path] = []
+        try:
+            html_report_path = _download_vinted_daily_html_report(db_path=db_path, days=30)
+            attachment_paths.append(html_report_path)
+            _log_vinted_profile(
+                "daily-html-report-ready",
+                path=html_report_path,
+                size_bytes=html_report_path.stat().st_size,
+            )
+        except Exception as exc:
+            _log_vinted_profile("daily-html-report-error", date=today_key, error=exc)
+        results = []
+        for index, chunk in enumerate(messages):
+            results.append(
+                send_discord_webhook_message(
+                    webhook_url,
+                    chunk,
+                    attachment_paths=attachment_paths if index == 0 else None,
+                    embeds=_build_vinted_profile_report_embeds(rows) if index == 0 else None,
+                )
+            )
+        if results and all(bool(result.get("ok")) for result in results):
+            _log_vinted_profile(
+                "daily-report-sent",
+                date=today_key,
+                hour=hour,
+                rows=len(rows),
+                sold_deals=len(deal_sales),
+                messages=len(results),
+                html_report_attached=bool(attachment_paths),
+                sent_at=str(results[-1].get("sent_at", "") or ""),
+            )
+            return today_key
+        failed_result = next((result for result in results if not bool(result.get("ok"))), {})
+        _log_vinted_profile(
+            "daily-report-failed",
+            date=today_key,
+            hour=hour,
+            messages=len(results),
+            error=str(failed_result.get("error", "") or "No Discord message generated"),
+        )
+    except Exception as exc:
+        _log_vinted_profile("daily-report-error", date=today_key, hour=hour, error=exc)
+    return last_daily_report_date
+
+
 @browser(
     profile=resolve_browser_profile,
     add_arguments=resolve_browser_arguments,
     wait_for_complete_page_load=False,
+    close_on_crash=True,
+    max_retry=2,
+    retry_wait=1,
+    raise_exception=True,
 )
 def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
     profile_url = str(config["profile_url"])
@@ -347,13 +487,10 @@ def _notify_vinted_profile_report(rows: list[dict], meta: dict, config: dict) ->
         return {
             "discord_profile_report": False,
             "discord_profile_report_sent": False,
-            "discord_profile_report_error": "webhook assente",
+            "discord_profile_report_error": "webhook Discord assente",
         }
-    result = send_discord_webhook_message(
-        webhook_url,
-        build_vinted_profile_report_discord_message(meta, rows),
-        embeds=_build_vinted_profile_report_embeds(rows),
-    )
+    message = build_vinted_profile_report_discord_message(meta, rows)
+    result = send_discord_webhook_message(webhook_url, message, embeds=_build_vinted_profile_report_embeds(rows))
     if bool(result.get("ok")):
         return {
             "discord_profile_report": True,

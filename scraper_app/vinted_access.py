@@ -21,13 +21,19 @@ def read_vinted_access_status(driver: Driver) -> dict[str, object]:
 const marker = document.querySelector({json.dumps(VINTED_ACCESS_MARKER_SELECTOR)});
 const pageTitle = String(document.title || '');
 const bodyText = String(document.body ? (document.body.innerText || document.body.textContent || '') : '');
+const h1Text = String(document.querySelector('h1')?.innerText || document.querySelector('h1')?.textContent || '').replace(/\\s+/g, ' ').trim();
 const combinedText = `${{pageTitle}}\n${{bodyText}}`.toLowerCase();
-const pageNotFound = {json.dumps(list(VINTED_PAGE_NOT_FOUND_TEXTS))}.some((needle) => combinedText.includes(String(needle).toLowerCase()));
+const h1NotFound = /^(?:page\\s+)?not found$/i.test(h1Text) || /^pagina non trovata$/i.test(h1Text);
+const notFoundMedia = document.querySelector(
+  'video[poster*="error-page/notfound"], video source[src*="error-page/notfound"], img[src*="error-page/notfound"]'
+);
+const pageNotFound = Boolean(notFoundMedia) || h1NotFound || {json.dumps(list(VINTED_PAGE_NOT_FOUND_TEXTS))}.some((needle) => combinedText.includes(String(needle).toLowerCase()));
 return {{
   marker_present: !pageNotFound && !!marker,
   marker_alt: marker ? (marker.getAttribute('alt') || '') : '',
   marker_src: marker ? (marker.getAttribute('src') || '') : '',
   page_title: pageTitle,
+  h1_text: h1Text,
   page_not_found: !!pageNotFound,
 }};
         """
@@ -39,6 +45,7 @@ return {{
         "marker_alt": str(payload.get("marker_alt", "") or ""),
         "marker_src": str(payload.get("marker_src", "") or ""),
         "page_title": str(payload.get("page_title", "") or ""),
+        "h1_text": str(payload.get("h1_text", "") or ""),
         "page_not_found": bool(payload.get("page_not_found")),
         "expected_alt": VINTED_ACCESS_MARKER_ALT,
         "selector": VINTED_ACCESS_MARKER_SELECTOR,

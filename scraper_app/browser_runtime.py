@@ -1,7 +1,11 @@
 import os
 import re
 import shutil
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -82,6 +86,55 @@ PROFILE_SKIP_FILE_NAMES = {
 }
 
 
+def _remove_conflicting_window_flags(arguments: list[str]) -> list[str]:
+    """Let ``--start-minimized`` win over Botasaurus' forced maximize flag."""
+    if "--start-minimized" not in arguments:
+        return arguments
+    return [argument for argument in arguments if argument != "--start-maximized"]
+
+
+def _patch_botasaurus_minimized_start() -> None:
+    """Remove forced maximize and apply minimize through Chrome DevTools."""
+    try:
+        from botasaurus_driver.core.config import Config
+        from botasaurus_driver.driver import Driver
+    except ImportError:
+        return
+    if not bool(getattr(Config, "_agent_lab_minimized_patch", False)):
+        original_call = Config.__call__
+
+        def patched_call(self):
+            return _remove_conflicting_window_flags(original_call(self))
+
+        Config.__call__ = patched_call
+        Config._agent_lab_minimized_patch = True
+
+    if not bool(getattr(Driver, "_agent_lab_minimized_patch", False)):
+        original_init = Driver.__init__
+
+        def patched_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            configured_arguments = list(getattr(self.config, "arguments", []) or [])
+            if "--start-minimized" not in configured_arguments:
+                return
+            try:
+                # Chrome 154 on macOS accepts the CLI switch but ignores it.
+                # CDP changes the real native window state deterministically.
+                self._tab.minimize()
+                print("[browser-runtime] Chrome window minimized through DevTools", flush=True)
+            except Exception as exc:
+                print(
+                    f"[browser-runtime] DevTools minimize failed: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+        Driver.__init__ = patched_init
+        Driver._agent_lab_minimized_patch = True
+
+
+_patch_botasaurus_minimized_start()
+
+
 def default_chrome_user_data_dir() -> str:
     if DEFAULT_WINDOWS_CHROME_USER_DATA_DIR.exists():
         return str(DEFAULT_WINDOWS_CHROME_USER_DATA_DIR)
@@ -119,12 +172,12 @@ def resolve_browser_profile(config: dict) -> str | None:
 
     cached_profile_root = str(config.get("_resolved_browser_profile_root", "") or "").strip()
     if cached_profile_root:
-        return cached_profile_root
+        return _finalize_browser_profile(config, cached_profile_root)
 
     user_data_dir = str(config.get("browser_user_data_dir", "") or "").strip()
     if browser_mode == "profilo_personalizzato" and user_data_dir:
         config["_resolved_browser_profile_root"] = user_data_dir
-        return user_data_dir
+        return _finalize_browser_profile(config, user_data_dir)
 
     if browser_mode == "sessione_persistente":
         persistent_root = prepare_persistent_profile_root(
@@ -133,29 +186,107 @@ def resolve_browser_profile(config: dict) -> str | None:
             refresh=bool(config.get("refresh_browser_profile", False)),
         )
         config["_resolved_browser_profile_root"] = persistent_root
-        return persistent_root
+        return _finalize_browser_profile(config, persistent_root)
 
     if browser_mode == "chrome_normale":
+        if bool(config.get("close_existing_runtime_browser", False)):
+            closed_count = close_runtime_chrome_instances()
+            if closed_count:
+                print(f"[browser-runtime] closed previous scraper Chrome processes={closed_count}", flush=True)
         source_user_data_dir = user_data_dir or default_chrome_user_data_dir()
         snapshot_root = prepare_chrome_normale_profile_copy(
             source_user_data_dir=source_user_data_dir,
             profile_directory=str(config.get("browser_profile_directory", "") or "Default"),
         )
         config["_resolved_browser_profile_root"] = snapshot_root
-        return snapshot_root
+        return _finalize_browser_profile(config, snapshot_root)
 
     fallback = default_chrome_user_data_dir()
     if fallback:
         config["_resolved_browser_profile_root"] = fallback
-    return fallback or None
+    if fallback:
+        return _finalize_browser_profile(config, fallback)
+    return None
+
+
+def browser_should_open_in_background(config: dict) -> bool:
+    """Return whether this browser session should avoid taking desktop focus.
+
+    Background mode remains a normal visible Chrome session; it is not
+    headless. That keeps DOM behaviour and authenticated profiles unchanged.
+    Interactive flows can opt out with ``browser_requires_foreground``.
+    """
+    if bool(config.get("browser_requires_foreground", False)):
+        return False
+    value = config.get("browser_open_in_background", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+def _finalize_browser_profile(config: dict, profile_root: str) -> str:
+    return profile_root
+
+
+def close_runtime_chrome_instances() -> int:
+    """Terminate only Chrome instances created with scraper-owned temp profiles.
+
+    It intentionally never touches the user's normal Chrome profile. This is
+    used by autonomous monitoring before a new component obtains a browser.
+    """
+    if sys.platform != "darwin":
+        return 0
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return 0
+    runtime_root = str(RUNTIME_PROFILES_DIR)
+    target_pids: set[int] = set()
+    for raw_line in str(completed.stdout or "").splitlines():
+        match = re.match(r"\s*(\d+)\s+(.*)$", raw_line)
+        if not match:
+            continue
+        pid = int(match.group(1))
+        command = match.group(2)
+        if runtime_root not in command or "--user-data-dir=" not in command or "Google Chrome" not in command:
+            continue
+        target_pids.add(pid)
+    for pid in target_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+    if target_pids:
+        time.sleep(0.4)
+    for pid in target_pids:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return len(target_pids)
 
 
 def resolve_browser_arguments(config: dict) -> list[str]:
     browser_mode = normalize_browser_mode(str(config.get("browser_mode", "chrome_normale") or "chrome_normale"))
-    if browser_mode == "isolated":
-        return []
-
     arguments: list[str] = []
+    if browser_should_open_in_background(config):
+        arguments.append("--start-minimized")
+    if browser_mode == "isolated":
+        return arguments
+
     profile_directory = str(config.get("browser_profile_directory", "") or "").strip()
     if profile_directory:
         arguments.append(f"--profile-directory={profile_directory}")
@@ -169,12 +300,13 @@ def prepare_chrome_normale_profile_copy(source_user_data_dir: str, profile_direc
         raise FileNotFoundError(f"Chrome User Data non trovato: {source_root}")
 
     profile_name = (profile_directory or "Default").strip() or "Default"
-    target_root = RUNTIME_PROFILES_DIR / f"cn_{_slug(profile_name)}"
+    # Never overwrite a fixed profile directory while a previous Chrome driver
+    # still has it open. That race caused macOS error 66 (Directory not empty)
+    # and terminated long-running monitor jobs. mkdtemp is atomic and gives each
+    # process/session its own disposable copy.
+    RUNTIME_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    target_root = Path(tempfile.mkdtemp(prefix=f"cn_{_slug(profile_name)}_", dir=RUNTIME_PROFILES_DIR))
     _ensure_runtime_target(target_root)
-
-    if target_root.exists():
-        shutil.rmtree(target_root)
-    target_root.mkdir(parents=True, exist_ok=True)
 
     for root_file_name in ("Local State", "First Run"):
         source_file = source_root / root_file_name

@@ -4,6 +4,7 @@ from scraper_app.vinted_deals import (
     VINTED_DEAL_HUNTER_DEFAULT_TERMS,
     VINTED_DEAL_HUNTER_MAX_SHIPPING_PRICE,
     annotate_vinted_deal_hunter_row,
+    evaluate_vinted_deal_relevance,
     is_vinted_deal_hunter_candidate,
     is_vinted_deal_hunter_match,
     normalize_vinted_deal_hunter_max_price,
@@ -39,7 +40,7 @@ class VintedDealsTests(unittest.TestCase):
         self.assertTrue(is_vinted_deal_hunter_match(70, "un giorno fa", shipping_price_value=0.99))
         self.assertFalse(is_vinted_deal_hunter_match(69, "2 ore fa"))
         self.assertFalse(is_vinted_deal_hunter_match(95, "2 giorni fa", shipping_price_value=1.99))
-        self.assertFalse(
+        self.assertTrue(
             is_vinted_deal_hunter_match(
                 95,
                 "2 ore fa",
@@ -91,7 +92,7 @@ class VintedDealsTests(unittest.TestCase):
         self.assertTrue(row["deal_hunter_match"])
         self.assertEqual("affare 24h/70+", row["deal_hunter_label"])
 
-    def test_annotate_row_rejects_high_shipping_or_price(self) -> None:
+    def test_annotate_row_ignores_shipping_but_rejects_out_of_range_price(self) -> None:
         high_shipping_row = annotate_vinted_deal_hunter_row(
             {
                 "favorite_count": 112,
@@ -120,8 +121,8 @@ class VintedDealsTests(unittest.TestCase):
             min_price=5.0,
         )
 
-        self.assertFalse(high_shipping_row["deal_hunter_match"])
-        self.assertIn("spedizione", high_shipping_row["deal_hunter_reason"])
+        self.assertTrue(high_shipping_row["deal_hunter_match"])
+        self.assertNotIn("spedizione", high_shipping_row["deal_hunter_reason"])
         self.assertFalse(high_price_row["deal_hunter_match"])
         self.assertIn("prezzo", high_price_row["deal_hunter_reason"])
         self.assertFalse(low_price_row["deal_hunter_match"])
@@ -131,6 +132,59 @@ class VintedDealsTests(unittest.TestCase):
         self.assertEqual(19.9, normalize_vinted_deal_hunter_max_price("19,90 €"))
         self.assertIsNone(normalize_vinted_deal_hunter_max_price(""))
         self.assertEqual(5.0, normalize_vinted_deal_hunter_min_price("5,00 €"))
+
+    def test_relevance_rejects_incidental_charme_and_wrong_catalog(self) -> None:
+        relevance = evaluate_vinted_deal_relevance(
+            {
+                "search_term": "charm",
+                "search_url": "https://www.vinted.it/catalog/21-jewellery?search_text=charm",
+                "name": "Curiosité – Bobine industrielle vintage",
+                "description": "Un objet au charme unique",
+                "detail_category_path": "Hobby e collezionismo > Cucito > Filo da cucito",
+                "detail_catalog_ids": ["4824", "5151", "5158"],
+            }
+        )
+
+        self.assertTrue(relevance["checked"])
+        self.assertFalse(relevance["category_match"])
+        self.assertFalse(relevance["query_match"])
+        self.assertFalse(relevance["match"])
+
+    def test_relevance_accepts_query_and_requested_catalog(self) -> None:
+        relevance = evaluate_vinted_deal_relevance(
+            {
+                "search_term": "charm",
+                "search_url": "https://www.vinted.it/catalog/21-jewellery?search_text=charm",
+                "name": "Charm Pandora cuore",
+                "detail_category_path": "Donna > Accessori > Gioielli > Charm e ciondoli",
+                "detail_catalog_ids": ["1904", "1187", "21", "2938"],
+            }
+        )
+
+        self.assertTrue(relevance["category_match"])
+        self.assertTrue(relevance["query_match"])
+        self.assertTrue(relevance["match"])
+
+    def test_annotation_demotes_irrelevant_numeric_deal(self) -> None:
+        row = annotate_vinted_deal_hunter_row(
+            {
+                "search_term": "charm",
+                "search_url": "https://www.vinted.it/catalog/21-jewellery?search_text=charm",
+                "name": "Bobina vintage",
+                "detail_category_path": "Hobby e collezionismo > Cucito",
+                "detail_catalog_ids": ["4824", "5151"],
+                "favorite_count": 100,
+                "published_at": "2 ore fa",
+                "price_value": 16.0,
+            },
+            min_favorites=15,
+            max_age_hours=72,
+            min_price=12,
+        )
+
+        self.assertTrue(row["deal_hunter_candidate"])
+        self.assertFalse(row["deal_hunter_match"])
+        self.assertEqual("scartato non pertinente", row["deal_hunter_label"])
 
 
 if __name__ == "__main__":

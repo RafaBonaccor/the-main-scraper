@@ -196,6 +196,8 @@ def run_vinted_upload_worker_loop(
         "action_delay_seconds": float(action_delay_seconds),
         "page_settle_seconds": float(page_settle_seconds),
         "idle_timeout_seconds": max(int(idle_timeout_seconds or 0), 120),
+        # The persistent worker still needs Finder/photo and login interaction.
+        "browser_requires_foreground": True,
     }
     return _run_vinted_upload_worker_task(config)
 

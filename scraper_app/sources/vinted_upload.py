@@ -77,6 +77,8 @@ def run_vinted_upload_action(
         "browser_mode": browser_mode,
         "browser_user_data_dir": browser_user_data_dir,
         "browser_profile_directory": browser_profile_directory,
+        # Finder/photo selection and manual login are interactive upload steps.
+        "browser_requires_foreground": True,
     }
     return _run_vinted_upload_task(config)
 
@@ -109,6 +111,8 @@ def run_vinted_upload_batch(
         "browser_mode": browser_mode,
         "browser_user_data_dir": browser_user_data_dir,
         "browser_profile_directory": browser_profile_directory,
+        # Batch uploads use the same interactive Finder/login flow.
+        "browser_requires_foreground": True,
     }
     return _run_vinted_upload_batch_task(config)
 

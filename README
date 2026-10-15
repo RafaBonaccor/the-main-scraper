@@ -165,6 +165,25 @@ python main.py run vinted_descriptions --links-file output\_ui_vinted_items.json
 python main.py run subito --region lazio --city roma --category offerte-lavoro --job-keywords "pulizie,colf,badante" --anchor-place Morlupo --max-distance-km 30 --max-results 25 --browser-mode sessione_persistente --format all --output-dir output
 ```
 
+### Monitor badanti part-time autonomo
+
+`subito_caregiver` è separato dal flusso Vinted e può essere avviato come job
+parallelo dal Project Gateway. Esegue subito il primo ciclo, combina la ricerca
+con ogni zona configurata, accetta solo annunci con ruolo di assistenza e
+part-time esplicito, quindi salva cicli e avvistamenti in
+`data/subito_jobs.db`. Gli URL già visti non vengono considerati nuovi una
+seconda volta.
+
+```powershell
+python main.py run subito_caregiver --interval-seconds 1800 --max-results 25 --max-age-days 14 --browser-mode isolated --db-path data\subito_jobs.db --format none
+```
+
+Il preset include Roma, Monterotondo, Guidonia Montecelio, Rignano Flaminio,
+Morlupo, Capena, Fiano Romano, Faleria, Castelnuovo di Porto, Riano, Sacrofano,
+Montebello e Roma Nord. Usa `--interval-seconds 0` per un solo controllo. Le
+notifiche Discord dei soli annunci nuovi sono opzionali tramite
+`--discord-notifications --discord-webhook-url ...`.
+
 ### Preparare / inviare contatti Subito
 
 ```powershell
@@ -478,6 +497,7 @@ Questa sezione e pensata per chi lavora sul repo con un coding agent.
   - `scraper_app/ui.py`
 - per Subito la logica importante sta in:
   - `scraper_app/sources/subito.py`
+  - `scraper_app/subito_monitor.py`
   - `scraper_app/sources/subito_contact.py`
   - `scraper_app/openai_screening.py`
 
@@ -517,3 +537,41 @@ Gli obiettivi reali sono:
 - trovare annunci utili su Subito per candidatura mirata
 - trovare prodotti su Vinted e calcolarne il costo reale
 - gestire il tutto da una GUI unica, con export e persistenza
+
+## Browser in background su macOS
+
+I job automatici aprono Chrome minimizzato per non portare continuamente la
+finestra dello scraper in primo piano. Il runtime rimuove il flag
+`--start-maximized` imposto da Botasaurus prima di aggiungere
+`--start-minimized`, evitando istruzioni in conflitto. Poiché Chrome 154 su
+macOS ignora comunque il flag minimizzato, subito dopo la creazione il runtime
+imposta anche lo stato nativo `MINIMIZED` tramite Chrome DevTools. Le normali
+finestre Chrome dell'utente non vengono modificate. Il browser rimane grafico
+(non headless), quindi DOM, sessione e comportamento del sito restano quelli di
+Chrome normale.
+
+I flussi interattivi, come apertura manuale del browser e caricamento prodotti
+con selezione delle foto, richiedono invece il primo piano e sono esclusi dalla
+minimizzazione automatica.
+# Category Trend Scout
+
+The independent `vinted_trends` source measures confirmed marketplace rotation
+for broad category searches without changing the normal deal hunter:
+
+```bash
+python main.py run vinted_trends \
+  --trend-keywords "gioielli, spille, collane, braccialetti, anelli, orecchini" \
+  --trend-interval-seconds 900 \
+  --trend-evaluation-hours 72 \
+  --trend-min-sample 30 \
+  --trend-min-sell-through 8 \
+  --trend-promising-sell-through 15 \
+  --format none
+```
+
+Categories are always comma-separated. An empty `--trend-keywords` uses the
+curated category preset. Queries are not judged
+until the sample is mature. Low rotation needs repeated weak evaluations before
+pause (24 hours apart by default); empty scans and browser errors have separate counters; paused queries are
+probed again later. Missing pages are not treated as sales and are excluded from
+the sell-through denominator.
