@@ -1586,6 +1586,55 @@ def load_vinted_rows(
     }
 
 
+def load_vinted_item_image_refs(
+    rows: list[dict],
+    db_path: str | Path = DEFAULT_VINTED_DB_PATH,
+) -> dict[str, dict[str, str]]:
+    """Recover the newest archived/image URL fields for selected listing rows."""
+    links = list(
+        dict.fromkeys(
+            str(row.get("link", "") or "").strip()
+            for row in rows
+            if str(row.get("link", "") or "").strip()
+        )
+    )
+    path = Path(db_path).expanduser().resolve()
+    if not links or not path.is_file():
+        return {}
+    refs: dict[str, dict[str, str]] = {}
+    try:
+        with closing(sqlite3.connect(path)) as connection:
+            for offset in range(0, len(links), 400):
+                chunk = links[offset : offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                records = connection.execute(
+                    f"""
+                    SELECT item_link, snapshot_json
+                    FROM vinted_search_run_rows
+                    WHERE item_link IN ({placeholders})
+                    ORDER BY id DESC
+                    """,
+                    chunk,
+                ).fetchall()
+                for link, raw_json in records:
+                    if link in refs and refs[link].get("image_url") and refs[link].get("archive_image_path"):
+                        continue
+                    try:
+                        payload = json.loads(raw_json)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    current = refs.setdefault(str(link), {})
+                    for key in ("image_url", "archive_image_path", "local_image_path"):
+                        value = str(payload.get(key, "") or "").strip()
+                        if value and not current.get(key):
+                            current[key] = value
+    except sqlite3.Error:
+        return {}
+    return refs
+
+
 def list_vinted_search_runs(
     db_path: str | Path = DEFAULT_VINTED_DB_PATH,
     limit: int = 100,
@@ -1774,8 +1823,29 @@ def save_vinted_profile_snapshot(
         normalized["profile_url"] = normalized_profile_url
         normalized["member_id"] = member_id
         normalized_rows.append(normalized)
-    current_links = {str(row.get("link", "") or "") for row in normalized_rows}
+    sold_links = {
+        str(row.get("link", "") or "")
+        for row in normalized_rows
+        if str(row.get("profile_item_status", "") or "").lower() == "sold"
+    }
+    unavailable_links = {
+        str(row.get("link", "") or "")
+        for row in normalized_rows
+        if str(row.get("profile_item_status", "") or "").lower() == "unavailable"
+    }
+    current_links = {
+        str(row.get("link", "") or "")
+        for row in normalized_rows
+        if str(row.get("profile_item_status", "") or "").lower() not in {"sold", "unavailable"}
+    }
+    active_links = {
+        str(row.get("link", "") or "")
+        for row in normalized_rows
+        if str(row.get("profile_item_status", "") or "").lower() not in {"sold", "unavailable", "unknown"}
+    }
     current_links.discard("")
+    sold_links.discard("")
+    unavailable_links.discard("")
 
     try:
         with closing(sqlite3.connect(path)) as connection:
@@ -1808,7 +1878,8 @@ def save_vinted_profile_snapshot(
 
             previous_count = len(previous_links)
             current_count = len(current_links)
-            missing_count = max(previous_count - current_count, 0)
+            confirmed_terminal_links = previous_links & (sold_links | unavailable_links)
+            missing_count = max(previous_count - current_count - len(confirmed_terminal_links), 0)
             missing_ratio = (missing_count / previous_count) if previous_count else 0.0
             incomplete_snapshot = bool(
                 previous_count >= 12
@@ -1835,9 +1906,10 @@ def save_vinted_profile_snapshot(
                     "profile_snapshot_id": "",
                     "profile_checked_at": snapshot_at,
                     "profile_member_id": member_id,
-                    "profile_item_count": current_count,
+                    "profile_item_count": len(active_links),
                     "profile_new_count": 0,
                     "profile_gone_count": 0,
+                    "profile_sold_count": sum(1 for row in normalized_rows if row.get("profile_item_status") == "sold"),
                     "profile_still_count": len(current_links & previous_links),
                     "profile_current_rows": normalized_rows,
                     "profile_gone_rows": [],
@@ -1850,13 +1922,13 @@ def save_vinted_profile_snapshot(
                 }
 
             new_links = current_links - previous_links
-            gone_links = previous_links - current_links
+            gone_links = previous_links - current_links - sold_links - unavailable_links
             still_links = current_links & previous_links
             history_by_link = _load_vinted_profile_item_history(
                 connection,
                 member_id=member_id,
                 profile_url=normalized_profile_url,
-                links=current_links | gone_links,
+                links=current_links | gone_links | sold_links | unavailable_links,
                 sold_at=snapshot_at,
             )
 
@@ -1881,12 +1953,21 @@ def save_vinted_profile_snapshot(
             snapshot_id = int(snapshot.lastrowid)
 
             current_by_link = {str(row.get("link", "") or ""): row for row in normalized_rows}
-            all_links = sorted(current_links | gone_links)
+            all_links = sorted(current_links | gone_links | sold_links | unavailable_links)
             for link in all_links:
                 row = current_by_link.get(link, {})
-                status = "new" if link in new_links else "gone" if link in gone_links else "still_active"
+                if link in sold_links:
+                    status = "sold"
+                elif link in unavailable_links:
+                    status = "unavailable"
+                else:
+                    detected_status = str(row.get("profile_item_status", "") or "").lower()
+                    if detected_status == "unknown":
+                        status = "unknown"
+                    else:
+                        status = "new" if link in new_links else "gone" if link in gone_links else "still_active"
                 history = history_by_link.get(link, {})
-                if status == "gone":
+                if status in {"gone", "sold", "unavailable"}:
                     row = {
                         "source": "vinted_profile",
                         "profile_url": normalized_profile_url,
@@ -1896,11 +1977,12 @@ def save_vinted_profile_snapshot(
                         "name": str(history.get("item_name", "") or ""),
                         "price": str(history.get("price_text", "") or ""),
                         "image_url": str(history.get("image_url", "") or ""),
-                        "profile_item_status": "gone",
+                        "profile_item_status": status,
                         "profile_first_seen_at": str(history.get("first_seen_at", "") or ""),
                         "profile_last_seen_at": str(history.get("last_seen_at", "") or ""),
                         "profile_sold_after_seconds": history.get("sold_after_seconds"),
                         "profile_sold_after_text": str(history.get("sold_after_text", "") or ""),
+                        "profile_sold_at": snapshot_at if status == "sold" else "",
                         "extracted_at": snapshot_at,
                     }
                 connection.execute(
@@ -1921,7 +2003,7 @@ def save_vinted_profile_snapshot(
                         str(row.get("price", "") or ""),
                         str(row.get("image_url", "") or ""),
                         status,
-                        0 if status == "gone" else 1,
+                        0 if status in {"gone", "sold", "unavailable"} else 1,
                         json.dumps(row, ensure_ascii=False),
                     ),
                 )
@@ -1932,6 +2014,9 @@ def save_vinted_profile_snapshot(
     for row in normalized_rows:
         link = str(row.get("link", "") or "")
         history = history_by_link.get(link, {})
+        detected_status = str(row.get("profile_item_status", "") or "").lower()
+        if detected_status in {"sold", "unavailable", "unknown"}:
+            continue
         row["profile_item_status"] = "new" if link in new_links else "still_active"
         row["profile_first_seen_at"] = str(history.get("first_seen_at", "") or snapshot_at)
         row["profile_last_seen_at"] = snapshot_at
@@ -1959,9 +2044,10 @@ def save_vinted_profile_snapshot(
         "profile_snapshot_id": snapshot_id,
         "profile_checked_at": snapshot_at,
         "profile_member_id": member_id,
-        "profile_item_count": len(current_links),
+        "profile_item_count": len(active_links),
         "profile_new_count": len(new_links),
         "profile_gone_count": len(gone_links),
+        "profile_sold_count": len(sold_links),
         "profile_still_count": len(still_links),
         "profile_current_rows": normalized_rows,
         "profile_gone_rows": gone_rows,
@@ -2001,7 +2087,7 @@ def load_vinted_profile_daily_changes(
         JOIN vinted_profile_snapshots s ON s.id = psi.snapshot_id
         WHERE s.checked_at >= ?
           AND s.checked_at <= ?
-          AND LOWER(psi.status) IN ('new', 'gone')
+          AND LOWER(psi.status) IN ('new', 'gone', 'sold')
     """
     params: list[object] = [since_at, until_at]
     if profile_member_ids:
@@ -2043,6 +2129,7 @@ def load_vinted_profile_daily_changes(
                 "profile_first_seen_at": str(snapshot_payload.get("profile_first_seen_at", "") or ""),
                 "profile_last_seen_at": str(snapshot_payload.get("profile_last_seen_at", "") or ""),
                 "profile_sold_after_text": str(snapshot_payload.get("profile_sold_after_text", "") or ""),
+                "profile_sold_at": str(snapshot_payload.get("profile_sold_at", "") or ""),
                 "first_change_at": str(record["first_change_at"] or ""),
                 "last_change_at": str(record["last_change_at"] or ""),
             }

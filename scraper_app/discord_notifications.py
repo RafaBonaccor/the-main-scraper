@@ -87,6 +87,7 @@ def build_vinted_profile_report_discord_message(meta: dict, rows: list[dict]) ->
     active_count = int(meta.get("profile_item_count", 0) or 0)
     new_count = int(meta.get("profile_new_count", 0) or 0)
     gone_count = int(meta.get("profile_gone_count", 0) or 0)
+    sold_count = int(meta.get("profile_sold_count", 0) or 0)
     still_count = int(meta.get("profile_still_count", 0) or 0)
     cycle_index = int(meta.get("cycle_index", 1) or 1)
     snapshot_incomplete = bool(meta.get("profile_snapshot_incomplete", False))
@@ -95,7 +96,8 @@ def build_vinted_profile_report_discord_message(meta: dict, rows: list[dict]) ->
         "📦 **Report profilo Vinted**",
         f"Articoli attivi: {active_count}",
         f"Nuovi: {new_count}",
-        f"Spariti/venduti/rimossi: {gone_count}",
+        f"Venduti: {sold_count}",
+        f"Spariti/non disponibili: {gone_count}",
         f"Gia presenti: {still_count}",
     ]
     if member_id:
@@ -117,15 +119,20 @@ def build_vinted_profile_report_discord_message(meta: dict, rows: list[dict]) ->
 
     new_rows = [row for row in rows if str(row.get("profile_item_status", "") or "") == "new"]
     gone_rows = [row for row in rows if str(row.get("profile_item_status", "") or "") == "gone"]
+    sold_rows = [row for row in rows if str(row.get("profile_item_status", "") or "") == "sold"]
     if new_rows:
         lines.append("")
         lines.append("🟢 Nuovi articoli:")
         lines.extend(_format_vinted_profile_report_rows(new_rows))
     if gone_rows:
         lines.append("")
-        lines.append("🔴 Spariti/venduti/rimossi:")
+        lines.append("⚪ Spariti/non disponibili:")
         lines.extend(_format_vinted_profile_report_rows(gone_rows))
-    if not new_rows and not gone_rows:
+    if sold_rows:
+        lines.append("")
+        lines.append("🔴 Venduti:")
+        lines.extend(_format_vinted_profile_report_rows(sold_rows))
+    if not new_rows and not gone_rows and not sold_rows:
         lines.append("")
         lines.append("Nessun cambiamento rispetto allo snapshot precedente.")
     return "\n".join(lines)
@@ -142,11 +149,13 @@ def build_vinted_profile_daily_report_discord_message(
     profile_count = int(meta.get("profile_count", 0) or 0)
     new_rows = [row for row in rows if str(row.get("profile_item_status", "") or "").lower() == "new"]
     gone_rows = [row for row in rows if str(row.get("profile_item_status", "") or "").lower() == "gone"]
+    sold_rows = [row for row in rows if str(row.get("profile_item_status", "") or "").lower() == "sold"]
     lines = [
         "🗓️ **Report giornaliero profili**",
         f"Profili monitorati: {profile_count}",
         f"Nuovi articoli oggi: {len(new_rows)}",
-        f"Spariti/venduti/rimossi oggi: {len(gone_rows)}",
+        f"Venduti oggi: {len(sold_rows)}",
+        f"Spariti/non disponibili oggi: {len(gone_rows)}",
     ]
     if since_at and until_at:
         lines.append(f"Periodo: {since_at} → {until_at}")
@@ -156,12 +165,16 @@ def build_vinted_profile_daily_report_discord_message(
         lines.extend(_format_vinted_profile_report_rows(new_rows, limit=10))
     if gone_rows:
         lines.append("")
-        lines.append("🔴 Venduti/spariti oggi:")
+        lines.append("⚪ Spariti/non disponibili oggi:")
         lines.extend(_format_vinted_profile_report_rows(gone_rows, limit=10))
-    if not new_rows and not gone_rows:
+    if sold_rows:
+        lines.append("")
+        lines.append("🔴 Venduti oggi:")
+        lines.extend(_format_vinted_profile_report_rows(sold_rows, limit=10))
+    if not new_rows and not gone_rows and not sold_rows:
         lines.append("")
         lines.append("Nessun cambiamento registrato oggi.")
-    if len(new_rows) > 10 or len(gone_rows) > 10:
+    if len(new_rows) > 10 or len(gone_rows) > 10 or len(sold_rows) > 10:
         lines.append("")
         lines.append("Lista tagliata per non superare i limiti di Discord.")
     sold_deals = deal_sales or []

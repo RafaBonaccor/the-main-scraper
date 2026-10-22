@@ -48,6 +48,7 @@ from .vinted_database import (
     build_vinted_item_identity_keys,
     delete_vinted_search_run,
     load_vinted_deal_sales,
+    load_vinted_item_image_refs,
     list_vinted_search_runs,
     load_vinted_rows,
     summarize_vinted_deal_sales,
@@ -420,6 +421,7 @@ class ScraperApp:
         self.ui_settings_path = (script_path.parent / "data" / "ui_settings.json").resolve()
         self.process: subprocess.Popen[str] | None = None
         self.vinted_offer_process: subprocess.Popen[str] | None = None
+        self.aliexpress_sourcing_process: subprocess.Popen[str] | None = None
         self.process_kind = ""
         self.process_should_load_results = False
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -474,6 +476,7 @@ class ScraperApp:
         self.vinted_refresh_browser_profile_var = tk.BooleanVar(value=False)
         self.vinted_search_preview_var = tk.StringVar()
         self.vinted_status_var = tk.StringVar(value="Pronto per una nuova ricerca Vinted.")
+        self.aliexpress_sourcing_status_var = tk.StringVar(value="Sourcing visivo pronto.")
         self.vinted_deal_hunter_status_var = tk.StringVar(value="Procacciatore affari disattivato.")
         self.vinted_upload_title_var = tk.StringVar()
         self.vinted_upload_price_var = tk.StringVar()
@@ -2629,8 +2632,23 @@ class ScraperApp:
             state="disabled",
         )
         self.vinted_discord_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.aliexpress_sourcing_button = ttk.Button(
+            lead_card,
+            text="Cerca selezionati su AliExpress",
+            style="Accent.TButton",
+            command=self._start_selected_aliexpress_sourcing,
+            state="disabled",
+        )
+        self.aliexpress_sourcing_button.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(
+            lead_card,
+            textvariable=self.aliexpress_sourcing_status_var,
+            style="Hint.TLabel",
+            wraplength=430,
+            justify="left",
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
         offer_discount_frame = ttk.Frame(lead_card, style="Panel.TFrame")
-        offer_discount_frame.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        offer_discount_frame.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(offer_discount_frame, text="Sconto offerta (%)").grid(row=0, column=0, sticky="w")
         ttk.Entry(offer_discount_frame, textvariable=self.vinted_offer_discount_percent_var, width=8).grid(
             row=0,
@@ -3119,7 +3137,7 @@ class ScraperApp:
         selected_rows = self._get_selected_rows()
         selected_new_rows = [item for item in selected_rows if not self._row_has_submitted_contact(item)]
         accepted_rows = self._get_accepted_subito_rows()
-        selected_vinted_rows = [item for item in selected_rows if str(item.get("source", "") or "").strip().lower() == "vinted"]
+        selected_vinted_rows = [item for item in selected_rows if self._row_is_vinted_listing(item)]
         selected_rows_with_links = [item for item in selected_rows if str(item.get("link", "") or "").strip()]
         has_row = row is not None and bool(str(row.get("link", "") or "").strip())
         has_website = row is not None and bool(str(row.get("website", "") or "").strip())
@@ -3137,6 +3155,10 @@ class ScraperApp:
         )
         if hasattr(self, "vinted_discord_button"):
             self.vinted_discord_button.configure(state="normal" if is_vinted else "disabled")
+        if hasattr(self, "aliexpress_sourcing_button"):
+            self.aliexpress_sourcing_button.configure(
+                state="normal" if selected_vinted_rows and self.aliexpress_sourcing_process is None else "disabled"
+            )
         if hasattr(self, "vinted_extract_button"):
             self.vinted_extract_button.configure(state="normal" if selected_vinted_rows else "disabled")
         self.contact_button.configure(state="normal" if is_subito else "disabled")
@@ -5252,6 +5274,162 @@ class ScraperApp:
         self.vinted_status_var.set("Annuncio Vinted inviato su Discord.")
         messagebox.showinfo("Discord Vinted", "Annuncio inviato su Discord.")
 
+    @staticmethod
+    def _row_is_vinted_listing(row: dict) -> bool:
+        source = str(row.get("source", "") or "").strip().lower()
+        link = str(row.get("link", "") or "").strip().lower()
+        return source.startswith("vinted") or ("vinted." in link and "/items/" in link)
+
+    def _start_selected_aliexpress_sourcing(self) -> None:
+        if self.aliexpress_sourcing_process is not None:
+            messagebox.showinfo("Sourcing AliExpress", "Il batch di sourcing e gia in esecuzione.")
+            return
+        rows = [row for row in self._get_selected_rows() if self._row_is_vinted_listing(row)]
+        if not rows:
+            messagebox.showerror("Sourcing AliExpress", "Seleziona almeno un articolo della piattaforma.")
+            return
+        image_refs = load_vinted_item_image_refs(
+            rows,
+            db_path=self.vinted_db_path_var.get().strip() or self.script_path.parent / "data" / "scraper.db",
+        )
+        items: list[dict] = []
+        missing_images: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            source_link = str(row.get("link", "") or "").strip()
+            stored_ref = image_refs.get(source_link, {})
+            source_key = str(row.get("item_id", "") or source_link).strip()
+            if not source_key or source_key in seen:
+                continue
+            image_url = str(row.get("image_url", "") or stored_ref.get("image_url", "") or "").strip()
+            local_image_path = str(
+                row.get("archive_image_path", "")
+                or row.get("local_image_path", "")
+                or row.get("image_path", "")
+                or stored_ref.get("archive_image_path", "")
+                or stored_ref.get("local_image_path", "")
+                or ""
+            ).strip()
+            if not image_url and not (local_image_path and Path(local_image_path).expanduser().is_file()):
+                missing_images.append(str(row.get("name", "") or source_key))
+                continue
+            seen.add(source_key)
+            items.append(
+                {
+                    "source": "vinted",
+                    "item_id": str(row.get("item_id", "") or "").strip(),
+                    "link": source_link,
+                    "name": str(row.get("name", "") or row.get("title", "") or "").strip(),
+                    "image_url": image_url,
+                    "local_image_path": local_image_path,
+                }
+            )
+        if not items:
+            messagebox.showerror(
+                "Sourcing AliExpress",
+                "Gli articoli selezionati non contengono immagini utilizzabili. Aggiorna prima i dettagli degli annunci.",
+            )
+            return
+        warning = ""
+        if missing_images:
+            warning = f"\n\n{len(missing_images)} articoli senza immagine verranno saltati."
+        if not messagebox.askyesno(
+            "Conferma sourcing AliExpress",
+            f"Cerchero prodotti simili per {len(items)} articoli selezionati.{warning}\n\n"
+            "Il batch usa un processo e un browser separati: il monitoraggio della piattaforma continuera normalmente.\n\nContinuare?",
+        ):
+            return
+        try:
+            command, manifest_path, result_path = self._build_selected_aliexpress_sourcing_command(items)
+        except ValueError as exc:
+            messagebox.showerror("Sourcing AliExpress", str(exc))
+            return
+        self._start_aliexpress_sourcing_process(
+            command,
+            item_count=len(items),
+            manifest_path=manifest_path,
+            result_path=result_path,
+        )
+
+    def _build_selected_aliexpress_sourcing_command(self, items: list[dict]) -> tuple[list[str], Path, Path]:
+        output_raw = self.output_dir_var.get().strip() or "output"
+        output_dir = Path(output_raw).expanduser()
+        if not output_dir.is_absolute():
+            output_dir = self.script_path.parent / output_dir
+        batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        batch_dir = output_dir.resolve() / "aliexpress_batches" / batch_id
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = batch_dir / "selected_items.json"
+        result_path = batch_dir / "results.json"
+        manifest_path.write_text(
+            json.dumps({"batch_id": batch_id, "items": items}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        command = [
+            sys.executable,
+            str(self.script_path),
+            "run",
+            "aliexpress_image",
+            "--items-file",
+            str(manifest_path),
+            "--max-results",
+            "40",
+            "--db-path",
+            str((self.script_path.parent / "data" / "aliexpress_sourcing.db").resolve()),
+            "--reuse-cache-hours",
+            "24",
+            "--format",
+            "json",
+            "--output-dir",
+            str(batch_dir),
+            "--filename",
+            "aliexpress_matches",
+            "--ui-result-json",
+            str(result_path),
+        ]
+        command += self._browser_command_args(slow_mode_override=False)
+        return command, manifest_path, result_path
+
+    def _start_aliexpress_sourcing_process(
+        self,
+        command: list[str],
+        *,
+        item_count: int,
+        manifest_path: Path,
+        result_path: Path,
+    ) -> None:
+        process_kwargs: dict[str, object] = {
+            "cwd": self.script_path.parent,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+        }
+        if os.name == "nt":
+            process_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            process_kwargs["start_new_session"] = True
+        self._append_log(
+            f"[aliexpress-batch] start items={item_count} manifest={manifest_path} result={result_path}\n"
+        )
+        self._append_log(f"$ {' '.join(command)}\n")
+        self.aliexpress_sourcing_status_var.set(
+            f"Sourcing in corso per {item_count} articoli. Il monitoraggio resta indipendente."
+        )
+        self.aliexpress_sourcing_button.configure(state="disabled")
+        self._set_stop_process_buttons_state("normal")
+        self.aliexpress_sourcing_process = subprocess.Popen(command, **process_kwargs)
+        threading.Thread(target=self._read_aliexpress_sourcing_output, args=(result_path,), daemon=True).start()
+
+    def _read_aliexpress_sourcing_output(self, result_path: Path) -> None:
+        process = self.aliexpress_sourcing_process
+        if process is None or process.stdout is None:
+            return
+        for line in process.stdout:
+            self.log_queue.put(line)
+        code = process.wait()
+        self.log_queue.put(f"\nSourcing AliExpress terminato con exit code {code}.\n")
+        self.log_queue.put(f"__ALIEXPRESS_SOURCING_DONE__:{code}:{result_path}")
+
     def _start_batch_contact_selected(self) -> None:
         rows = self._get_selected_rows()
         if not rows:
@@ -5373,7 +5551,7 @@ class ScraperApp:
         threading.Thread(target=self._read_vinted_offer_process_output, daemon=True).start()
 
     def _stop_current_process(self) -> None:
-        if self.process is None:
+        if self.process is None and self.aliexpress_sourcing_process is None:
             messagebox.showinfo("Ferma processo", "Nessun processo in esecuzione.")
             return
         self._stop_auto_monitor()
@@ -5384,10 +5562,14 @@ class ScraperApp:
         self._append_log("[control] Richiesta di stop immediato di tutti i processi attivi del run.\n")
         self._set_runtime_status("Stopping...")
         self._set_stop_process_buttons_state("disabled")
-        self._terminate_process_tree(process)
+        if process is not None:
+            self._terminate_process_tree(process)
         if self.vinted_offer_process is not None:
             self._append_log("[control] Richiesta di stop anche per offerta Vinted in corso.\n")
             self._terminate_process_tree(self.vinted_offer_process)
+        if self.aliexpress_sourcing_process is not None:
+            self._append_log("[control] Stop del batch sourcing AliExpress.\n")
+            self._terminate_process_tree(self.aliexpress_sourcing_process)
 
     def _terminate_process_tree(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:
@@ -6134,7 +6316,9 @@ class ScraperApp:
                     self.vinted_profile_monitor_check_now_button.configure(state="normal")
                 if hasattr(self, "subito_run_button"):
                     self.subito_run_button.configure(state="normal")
-                self._set_stop_process_buttons_state("disabled")
+                self._set_stop_process_buttons_state(
+                    "normal" if self.aliexpress_sourcing_process is not None else "disabled"
+                )
                 self._update_result_actions()
                 if stop_requested:
                     partial_results_loaded = False
@@ -6229,6 +6413,34 @@ class ScraperApp:
                         dedupe_key=f"vinted-offer-live-failed-{code}",
                     )
                     messagebox.showerror("Offerta Vinted fallita", "Il flusso offerta Vinted non e stato completato. Controlla il log.")
+                continue
+            if line.startswith("__ALIEXPRESS_SOURCING_DONE__:"):
+                parts = line.strip().split(":", 2)
+                code = int(parts[1]) if len(parts) > 1 else 1
+                result_path = Path(parts[2]) if len(parts) > 2 and parts[2] else None
+                self.aliexpress_sourcing_process = None
+                if self.process is None and self.vinted_offer_process is None:
+                    self._set_stop_process_buttons_state("disabled")
+                self._update_result_actions()
+                if code == 0 and result_path is not None and result_path.is_file():
+                    try:
+                        payload = json.loads(result_path.read_text(encoding="utf-8"))
+                        row_count = len(payload.get("rows", []) or []) if isinstance(payload, dict) else 0
+                    except Exception:
+                        row_count = 0
+                    self.aliexpress_sourcing_status_var.set(
+                        f"Sourcing completato: {row_count} corrispondenze salvate."
+                    )
+                    messagebox.showinfo(
+                        "Sourcing AliExpress completato",
+                        f"Trovate {row_count} corrispondenze.\n\nRisultato:\n{result_path}",
+                    )
+                else:
+                    self.aliexpress_sourcing_status_var.set("Sourcing non completato. Controlla il log.")
+                    messagebox.showerror(
+                        "Sourcing AliExpress fallito",
+                        "Il batch non e stato completato. Il monitoraggio della piattaforma non e stato interrotto.",
+                    )
                 continue
             self._append_log(line)
         self._maybe_load_live_results()
@@ -6583,13 +6795,14 @@ class ScraperApp:
             active_count = int(meta.get("profile_item_count", 0) or 0)
             new_count = int(meta.get("profile_new_count", 0) or 0)
             gone_count = int(meta.get("profile_gone_count", 0) or 0)
+            sold_count = int(meta.get("profile_sold_count", 0) or 0)
             profile_count = int(meta.get("profile_count", 1) or 1)
             self.result_total_var.set(f"{len(rows)} righe profilo")
             self.result_counts_var.set(
-                f"profili {profile_count} | attivi {active_count} | nuovi {new_count} | spariti {gone_count}"
+                f"profili {profile_count} | attivi {active_count} | venduti {sold_count} | nuovi {new_count} | non disponibili {gone_count}"
             )
             self.vinted_profile_monitor_status_var.set(
-                f"Ultimo ciclo: {profile_count} profili, {active_count} attivi, {new_count} nuovi, {gone_count} spariti."
+                f"Ultimo ciclo: {profile_count} profili, {active_count} attivi, {sold_count} venduti, {new_count} nuovi, {gone_count} non disponibili."
             )
             self.vinted_status_var.set("Monitor profili Vinted aggiornato.")
             self.result_meta_var.set(

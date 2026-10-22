@@ -1,10 +1,11 @@
 # The Main Scraper
 
-Scraper desktop + CLI per tre casi d'uso principali:
+Scraper desktop + CLI per quattro casi d'uso principali:
 
 - lead generation da Google Maps
 - ricerca annunci lavoro da Subito
 - ricerca prodotti da Vinted con dettaglio annuncio e totale calcolato
+- visual sourcing su AliExpress da una foto o da una cartella automatizzata
 
 Il progetto usa `botasaurus` per il browser automation, una GUI Tkinter per l'uso quotidiano e una CLI per run ripetibili, debug e automazioni locali.
 
@@ -19,6 +20,21 @@ Per uso con orchestratori AI, leggi anche [AGENTS.md](/abs/path/C:/Users/utente/
 - estrae telefono, sito, rating, recensioni, categoria
 - opzionalmente analizza i siti pubblici per email, social e segnali tecnici
 - ordina i lead per opportunita commerciale
+
+### AliExpress visual sourcing
+
+- carica direttamente una foto nel DOM della ricerca visuale, senza aprire Finder
+- trova il trigger tramite file input e fallback multilingua, incluso `Carica una foto`
+- accetta una singola immagine oppure tutte le immagini supportate in una cartella
+- estrae link prodotto, immagine, prezzo, rating e ordini/vendite visibili
+- deduplica i prodotti e assegna un ranking basato sui segnali osservabili
+- conserva run e risultati nel database separato `data/aliexpress_sourcing.db`
+- usa l'hash SHA-256 dell'immagine per evitare ricerche ripetute nella finestra cache
+- può restare attivo come job indipendente e rilevare nuove immagini nella cartella
+
+La ricerca visuale restituisce candidati: non certifica che due prodotti siano
+identici, autentici o realizzati con gli stessi materiali. Fornitore, margine,
+conformità e proprietà intellettuale richiedono controlli separati.
 
 ### Subito Jobs
 
@@ -66,6 +82,7 @@ scraper_app/
   contact_runner.py
   sources/
     google_maps.py
+    aliexpress_image.py
     subito.py
     subito_contact.py
     vinted.py
@@ -134,6 +151,37 @@ python main.py browser --url https://www.vinted.it --browser-mode sessione_persi
 ```powershell
 python main.py run google_maps --search "ristoranti" --city "Roma" --max-results 25 --format all --output-dir output
 ```
+
+### Ricerca visuale AliExpress
+
+Una foto:
+
+```powershell
+python main.py run aliexpress_image --image-path "C:\Users\me\Desktop\product.jpg" --max-results 100
+```
+
+Batch automatico da cartella, con un nuovo controllo ogni cinque minuti:
+
+```powershell
+python main.py run aliexpress_image --image-dir "C:\Users\me\Desktop\sourcing-inbox" --watch-interval-seconds 300 --max-price 10 --format none
+```
+
+From the GUI result table, select one or more marketplace listings and use
+**Cerca selezionati su AliExpress**. The GUI writes a batch manifest containing
+the original item ID, link, title and image, then starts visual sourcing in a
+separate process/browser. An active marketplace monitor keeps running. Results
+are stored in `data/aliexpress_sourcing.db`; `aliexpress_source_items` preserves
+the relationship between every source listing and its visual matches.
+
+The same batch can be launched from the CLI:
+
+```bash
+python main.py run aliexpress_image --items-file output/aliexpress_batches/<batch>/selected_items.json --format json
+```
+
+Dal gioco usa `The Main Scraper -> AliExpress visual sourcing` e assegna il job
+al `Sourcing Agent`. Agente, workstation e database sono separati dal
+`Vinted Employee`; l'eventuale passaggio di immagini è un handoff esplicito.
 
 ### Ricerca Vinted
 

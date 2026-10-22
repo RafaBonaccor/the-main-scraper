@@ -333,6 +333,36 @@ class VintedTests(unittest.TestCase):
         self.assertGreater(second["profile_gone_rows"][0]["profile_sold_after_seconds"], 0)
         self.assertTrue(second["profile_gone_rows"][0]["profile_sold_after_text"])
 
+    def test_save_vinted_profile_snapshot_counts_explicitly_sold_items_as_not_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            profile_url = "https://www.vinted.it/member/262102939"
+            save_vinted_profile_snapshot(
+                profile_url,
+                [
+                    {"link": "https://www.vinted.it/items/100-a", "name": "A", "price": "10,00 €"},
+                    {"link": "https://www.vinted.it/items/200-b", "name": "B", "price": "20,00 €"},
+                ],
+                db_path=db_path,
+            )
+            sold = save_vinted_profile_snapshot(
+                profile_url,
+                [
+                    {"link": "https://www.vinted.it/items/100-a", "name": "A", "price": "10,00 €", "profile_item_status": "sold"},
+                    {"link": "https://www.vinted.it/items/200-b", "name": "B", "price": "20,00 €", "profile_item_status": "active"},
+                ],
+                db_path=db_path,
+            )
+            with closing(sqlite3.connect(db_path)) as connection:
+                record = connection.execute(
+                    "SELECT status, present FROM vinted_profile_snapshot_items WHERE snapshot_id = ? AND item_id = '100'",
+                    (sold["profile_snapshot_id"],),
+                ).fetchone()
+
+        self.assertEqual(1, sold["profile_item_count"])
+        self.assertEqual(1, sold["profile_sold_count"])
+        self.assertEqual(("sold", 0), tuple(record))
+
     def test_load_vinted_profile_daily_changes_reads_new_and_gone_for_day(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "scraper.db"

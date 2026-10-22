@@ -16,6 +16,7 @@ Comandi orchestrator-friendly:
 
 - `python main.py status --stdout-json`
 - `python main.py run google_maps ... --stdout-json --format none`
+- `python main.py run aliexpress_image --image-path ... --stdout-json --format none`
 - `python main.py run vinted ... --stdout-json --format none`
 - `python main.py run vinted_descriptions ... --stdout-json --format none`
 - `python main.py run subito ... --stdout-json --format none`
@@ -123,6 +124,19 @@ Ogni riga normalizzata contiene almeno:
 - `total_text`
 - `total_value`
 - `description`
+
+### `run` + `source=aliexpress_image`
+
+This source is independent from Vinted. Each normalized row exposes:
+
+- `id`, `title`, `link`, `image_url`
+- `price_text`, `price_value`
+- `rating`, `sold_count`
+- `result_score`, `result_rank`
+- `query_image_name`, `query_image_hash`, `from_cache`
+
+Treat matches as sourcing candidates, not proof that an item is identical to
+the reference image.
 
 ### `run` + `source=subito`
 

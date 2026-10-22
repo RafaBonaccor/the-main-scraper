@@ -84,6 +84,24 @@ def build_parser() -> argparse.ArgumentParser:
     _add_browser_arguments(google_parser)
     _add_export_arguments(google_parser)
 
+    aliexpress_parser = run_subparsers.add_parser(
+        "aliexpress_image",
+        help="Find sourcing candidates on AliExpress using one image or an automated image folder.",
+    )
+    aliexpress_parser.add_argument("--image-path", default="", help="Local reference image to upload for visual search.")
+    aliexpress_parser.add_argument("--image-dir", default="", help="Folder of reference images processed as a batch.")
+    aliexpress_parser.add_argument("--items-file", default="", help="JSON manifest of selected marketplace items with image URLs or local images.")
+    aliexpress_parser.add_argument("--max-results", default=100, type=int, help="Maximum results collected for each image; 0 means until scrolling stabilizes.")
+    aliexpress_parser.add_argument("--max-price", default="", help="Optional maximum product price.")
+    aliexpress_parser.add_argument("--db-path", default="data/aliexpress_sourcing.db", help="Independent SQLite history for visual sourcing.")
+    aliexpress_parser.add_argument("--reuse-cache-hours", default=24.0, type=float, help="Reuse recent results for the same image hash; 0 disables cache.")
+    aliexpress_parser.add_argument("--force-refresh", action="store_true", help="Ignore cached results and repeat the visual search.")
+    aliexpress_parser.add_argument("--watch-interval-seconds", default=0, type=int, help="Rescan the image folder on this interval; 0 runs once.")
+    aliexpress_parser.add_argument("--refresh-browser-profile", action="store_true")
+    _add_orchestrator_arguments(aliexpress_parser)
+    _add_browser_arguments(aliexpress_parser)
+    _add_export_arguments(aliexpress_parser)
+
     vinted_parser = run_subparsers.add_parser("vinted", help="Extract Vinted search results and save them to SQLite.")
     vinted_parser.add_argument("--search", default="", help="Vinted search term or full catalog URL.")
     vinted_parser.add_argument(
@@ -892,7 +910,7 @@ def _build_status_payload() -> dict:
         "platform": os.name,
         "active_venv_candidate": active_venv,
         "recommended_browser_mode": "sessione_persistente",
-        "supported_sources": ["google_maps", "vinted", "vinted_competitors", "vinted_trends", "vinted_continuous", "vinted_descriptions", "vinted_profile", "subito", "subito_caregiver", "custom_site"],
+        "supported_sources": ["google_maps", "aliexpress_image", "vinted", "vinted_competitors", "vinted_trends", "vinted_continuous", "vinted_descriptions", "vinted_profile", "subito", "subito_caregiver", "custom_site"],
         "supported_contact_sources": ["subito", "vinted", "vinted_upload"],
         "features": {
             "gui": True,
@@ -901,6 +919,7 @@ def _build_status_payload() -> dict:
             "format_none": True,
             "openai_screening": True,
             "vinted_database": True,
+            "aliexpress_visual_sourcing": True,
         },
         "paths": {
             "output_dir": str((project_root / "output").resolve()),
@@ -908,6 +927,7 @@ def _build_status_payload() -> dict:
             "error_logs_dir": str((project_root / "error_logs").resolve()),
             "vinted_db_default": str((project_root / "data" / "scraper.db").resolve()),
             "subito_jobs_db_default": str((project_root / "data" / "subito_jobs.db").resolve()),
+            "aliexpress_sourcing_db_default": str((project_root / "data" / "aliexpress_sourcing.db").resolve()),
             "readme": str((project_root / "README").resolve()),
             "agents_doc": str((project_root / "AGENTS.md").resolve()),
         },
@@ -930,6 +950,16 @@ def _normalize_run_result(source: str, rows: list[dict], meta: dict, export_path
 
 
 def _normalize_meta_summary(source: str, meta: dict) -> dict:
+    if source == "aliexpress_image":
+        return {
+            "row_count": int(meta.get("row_count", 0) or 0),
+            "images_count": int(meta.get("images_count", 0) or 0),
+            "searched_images_count": int(meta.get("searched_images_count", 0) or 0),
+            "cached_images_count": int(meta.get("cached_images_count", 0) or 0),
+            "cycle_index": int(meta.get("cycle_index", 0) or 0),
+            "watch_interval_seconds": int(meta.get("watch_interval_seconds", 0) or 0),
+            "db_path": str(meta.get("db_path", "") or ""),
+        }
     if source in {"vinted", "vinted_competitors"}:
         return {
             "search_term": str(meta.get("search_term", "") or meta.get("search", "") or ""),
@@ -995,6 +1025,23 @@ def _normalize_meta_summary(source: str, meta: dict) -> dict:
 
 
 def _normalize_row(source: str, row: dict) -> dict:
+    if source == "aliexpress_image":
+        return {
+            "id": str(row.get("product_id", "") or ""),
+            "title": str(row.get("title", "") or ""),
+            "link": str(row.get("link", "") or ""),
+            "image_url": str(row.get("image_url", "") or ""),
+            "price_text": str(row.get("price", "") or ""),
+            "price_value": _safe_float_or_none(row.get("price_value")),
+            "rating": _safe_float_or_none(row.get("rating")),
+            "sold_count": _safe_int_or_none(row.get("sold_count")),
+            "result_score": _safe_float_or_none(row.get("result_score")),
+            "result_rank": _safe_int_or_none(row.get("result_rank")),
+            "query_image_name": str(row.get("query_image_name", "") or ""),
+            "query_image_hash": str(row.get("query_image_hash", "") or ""),
+            "from_cache": bool(row.get("from_cache", False)),
+            "last_seen_at": str(row.get("extracted_at", "") or ""),
+        }
     if source in {"vinted", "vinted_competitors"}:
         return {
             "id": str(row.get("item_id", "") or ""),

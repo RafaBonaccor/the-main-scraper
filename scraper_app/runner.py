@@ -10,6 +10,7 @@ from .models import ScrapeOutcome
 from .openai_screening import DEFAULT_REASONING_EFFORT, DEFAULT_SCREENING_MODEL, apply_openai_screening_to_outcome
 from .runtime_controls import consume_skip_current_item_request, consume_stop_after_current_item_request
 from .sources.custom_site import run_custom_site_scraper
+from .sources.aliexpress_image import run_aliexpress_image_search
 from .sources.google_maps import run_google_maps_scraper
 from .sources.subito import run_subito_scraper
 from .subito_monitor import (
@@ -32,6 +33,26 @@ from .vinted_trend_scout import TrendPolicy, VintedTrendStore, parse_trend_queri
 
 
 def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
+    if source == "aliexpress_image":
+        return run_aliexpress_image_search(
+            image_path=kwargs.get("image_path", ""),
+            image_dir=kwargs.get("image_dir", ""),
+            items_file=kwargs.get("items_file", ""),
+            max_results=int(kwargs.get("max_results", 100) or 0),
+            max_price=kwargs.get("max_price", ""),
+            db_path=kwargs.get("db_path", "data/aliexpress_sourcing.db"),
+            reuse_cache_hours=float(kwargs.get("reuse_cache_hours", 24) or 0),
+            force_refresh=bool(kwargs.get("force_refresh", False)),
+            watch_interval_seconds=int(kwargs.get("watch_interval_seconds", 0) or 0),
+            browser_mode=kwargs.get("browser_mode", "chrome_normale"),
+            browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
+            browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
+            refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
+            slow_mode=bool(kwargs.get("slow_mode", False)),
+            action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.0)),
+            page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
+        )
+
     if source == "google_maps":
         return run_google_maps_scraper(
             search=kwargs["search"],

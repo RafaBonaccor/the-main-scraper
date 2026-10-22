@@ -2,6 +2,7 @@ import time
 import json
 import os
 import re
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -31,6 +32,7 @@ from ..vinted_database import (
     summarize_vinted_deal_sales,
 )
 from .vinted import VINTED_BASE_URL, normalize_vinted_image_url, normalize_vinted_item_url
+from .vinted_deal_sales import _sold_status_from_page
 
 
 VINTED_PROFILE_NAVIGATION_TIMEOUT_SECONDS = 20
@@ -170,6 +172,7 @@ def run_vinted_profile_monitor(
                 active=profile_meta.get("profile_item_count", 0),
                 new=profile_meta.get("profile_new_count", 0),
                 gone=profile_meta.get("profile_gone_count", 0),
+                sold=profile_meta.get("profile_sold_count", 0),
                 discord_sent=profile_meta.get("discord_profile_report_sent", False),
                 current_url=profile_meta.get("current_url", ""),
             )
@@ -188,6 +191,7 @@ def run_vinted_profile_monitor(
             active=aggregate_meta.get("profile_item_count", 0),
             new=aggregate_meta.get("profile_new_count", 0),
             gone=aggregate_meta.get("profile_gone_count", 0),
+            sold=aggregate_meta.get("profile_sold_count", 0),
             db_path=aggregate_meta.get("db_path", ""),
         )
         if ui_result_json:
@@ -369,6 +373,12 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         missing_identity_before=missing_identity_before,
     )
     rows = _attach_vinted_profile_identity(rows, profile_url=profile_url, member_id=member_id)
+    if _is_registered_owned_profile(db_path, member_id):
+        rows = _check_owned_profile_listing_status(
+            driver,
+            rows,
+            page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+        )
     missing_identity_after = sum(
         1
         for row in rows
@@ -395,6 +405,7 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         active=snapshot_meta.get("profile_item_count", 0),
         new=snapshot_meta.get("profile_new_count", 0),
         gone=snapshot_meta.get("profile_gone_count", 0),
+        sold=snapshot_meta.get("profile_sold_count", 0),
         still=snapshot_meta.get("profile_still_count", 0),
         incomplete=snapshot_meta.get("profile_snapshot_incomplete", False),
         previous=snapshot_meta.get("profile_previous_item_count", ""),
@@ -438,6 +449,79 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
     return {"rows": output_rows, "meta": meta}
 
 
+def _is_registered_owned_profile(db_path: str, member_id: str) -> bool:
+    """Only detail-check our own inventory; competitor scans stay lightweight."""
+    if not member_id:
+        return False
+    try:
+        with sqlite3.connect(f"file:{Path(db_path).expanduser().resolve()}?mode=ro", uri=True) as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vinted_owned_profiles'"
+            ).fetchone()
+            if not exists:
+                return False
+            return connection.execute(
+                "SELECT 1 FROM vinted_owned_profiles WHERE member_id=? AND active=1 LIMIT 1",
+                (member_id,),
+            ).fetchone() is not None
+    except (OSError, sqlite3.Error):
+        return False
+
+
+def _check_owned_profile_listing_status(
+    driver: Driver,
+    rows: list[dict],
+    *,
+    page_settle_seconds: float,
+) -> list[dict]:
+    checked_rows: list[dict] = []
+    _log_vinted_profile("owned-item-status-check-start", items=len(rows))
+    for index, row in enumerate(rows, start=1):
+        link = str(row.get("link", "") or "").strip()
+        enriched = dict(row)
+        if not link:
+            enriched["profile_item_status"] = "unknown"
+            checked_rows.append(enriched)
+            continue
+        try:
+            driver.get(link, wait=Wait.SHORT, timeout=VINTED_PROFILE_NAVIGATION_TIMEOUT_SECONDS)
+            time.sleep(min(max(page_settle_seconds, 0.25), 1.0))
+            status = _sold_status_from_page(driver)
+            current_url = str(status.get("current_url", "") or "")
+            item_id = str(enriched.get("item_id", "") or "")
+            if bool(status.get("sold")):
+                state = "sold"
+            elif bool(status.get("page_not_found")):
+                state = "unavailable"
+            elif item_id and item_id not in current_url:
+                state = "unknown"
+            else:
+                state = "active"
+            enriched["profile_item_status"] = state
+            enriched["profile_status_checked_at"] = datetime.now().isoformat(timespec="seconds")
+            _log_vinted_profile(
+                "owned-item-status-checked",
+                index=index,
+                total=len(rows),
+                item_id=enriched.get("item_id", ""),
+                status=state,
+                link=link,
+            )
+        except Exception as exc:
+            # A failed navigation is not evidence that an item sold or disappeared.
+            enriched["profile_item_status"] = "unknown"
+            _log_vinted_profile("owned-item-status-error", index=index, item_id=enriched.get("item_id", ""), error=exc)
+        checked_rows.append(enriched)
+    _log_vinted_profile(
+        "owned-item-status-check-finished",
+        checked=len(checked_rows),
+        sold=sum(row.get("profile_item_status") == "sold" for row in checked_rows),
+        active=sum(row.get("profile_item_status") == "active" for row in checked_rows),
+        unresolved=sum(row.get("profile_item_status") in {"unknown", "unavailable"} for row in checked_rows),
+    )
+    return checked_rows
+
+
 def _attach_vinted_profile_identity(rows: list[dict], *, profile_url: str, member_id: str) -> list[dict]:
     enriched_rows: list[dict] = []
     for row in rows:
@@ -468,6 +552,7 @@ def _build_vinted_profile_aggregate_meta(
         "profile_item_count": sum(int(meta.get("profile_item_count", 0) or 0) for meta in profile_metas),
         "profile_new_count": sum(int(meta.get("profile_new_count", 0) or 0) for meta in profile_metas),
         "profile_gone_count": sum(int(meta.get("profile_gone_count", 0) or 0) for meta in profile_metas),
+        "profile_sold_count": sum(int(meta.get("profile_sold_count", 0) or 0) for meta in profile_metas),
         "profile_still_count": sum(int(meta.get("profile_still_count", 0) or 0) for meta in profile_metas),
         "profiles": profile_metas,
         "extracted_at": datetime.now().isoformat(timespec="seconds"),
@@ -510,7 +595,7 @@ def _notify_vinted_profile_report(rows: list[dict], meta: dict, config: dict) ->
 def _build_vinted_profile_report_embeds(rows: list[dict]) -> list[dict[str, object]]:
     embeds: list[dict[str, object]] = []
     for row in rows:
-        if str(row.get("profile_item_status", "") or "") not in {"new", "gone"}:
+        if str(row.get("profile_item_status", "") or "") not in {"new", "gone", "sold"}:
             continue
         image_url = normalize_vinted_image_url(str(row.get("image_url", "") or ""))
         if not image_url:
