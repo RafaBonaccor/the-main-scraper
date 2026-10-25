@@ -373,12 +373,9 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         missing_identity_before=missing_identity_before,
     )
     rows = _attach_vinted_profile_identity(rows, profile_url=profile_url, member_id=member_id)
-    if _is_registered_owned_profile(db_path, member_id):
-        rows = _check_owned_profile_listing_status(
-            driver,
-            rows,
-            page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-        )
+    # Profile monitoring is deliberately profile-only for every seller. Opening
+    # every listing just for registered/owned profiles made their scans slower
+    # and produced inconsistent status data compared with other profiles.
     missing_identity_after = sum(
         1
         for row in rows
@@ -704,11 +701,11 @@ def _read_vinted_profile_items(driver: Driver) -> list[dict]:
 const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
 const links = [...document.querySelectorAll('a[href*="/items/"]')];
 return links.map((link) => {
-  const root = link.closest('[data-testid^="grid-item"], article')
+  const root = link.closest('[data-testid^="product-item-id-"], [data-testid^="grid-item"], article')
     || link.parentElement?.parentElement?.parentElement
     || link.parentElement
     || link;
-  const title = root.querySelector('[data-testid*="description-title"], [data-testid*="item-title"]');
+  const title = root.querySelector('[data-testid*="description-title"], [data-testid*="item-title"], [data-testid*="description-preview"]');
   const price = root.querySelector('[data-testid*="price-text"], [data-testid*="item-price"]');
   const image = root.querySelector('img[alt]');
   const imageSrc = image ? (
@@ -721,7 +718,7 @@ return links.map((link) => {
   ) : '';
   return {
     link: link.href || link.getAttribute('href') || '',
-    title: clean(title ? (title.innerText || title.textContent) : ''),
+    title: clean(title ? (title.innerText || title.textContent) : (link.getAttribute('aria-label') || link.getAttribute('title') || '')),
     price: clean(price ? (price.innerText || price.textContent) : ''),
     image_url: imageSrc,
     image_alt: clean(image ? image.getAttribute('alt') : ''),
