@@ -48,6 +48,8 @@ from scraper_app.sources.vinted import (
     parse_vinted_favorite_count,
     parse_vinted_price,
 )
+from scraper_app.vinted_tabs import navigate_vinted_status_tab, restore_vinted_primary_tab
+from scraper_app.sources.vinted_deal_sales import check_due_vinted_deal_sales_with_driver
 from scraper_app.sources.vinted_profile import normalize_vinted_profile_urls
 from scraper_app.runner import run_scraper
 from scraper_app.vinted_database import (
@@ -78,6 +80,89 @@ from scraper_app.vinted_database import (
 
 
 class VintedTests(unittest.TestCase):
+    def test_detail_inspection_uses_separate_tab_and_restores_search_tab(self) -> None:
+        search_tab = Mock()
+        search_tab.target.target_id = "search-target"
+        status_tab = Mock()
+        browser_session = Mock()
+        browser_session._agent_lab_vinted_primary_tab = None
+        browser_session._agent_lab_vinted_status_tab = None
+        driver = Mock()
+        driver._browser = browser_session
+        driver._tab = search_tab
+        driver.config.arguments = ["--start-minimized"]
+        driver.open_link_in_new_tab.return_value = status_tab
+
+        self.assertTrue(navigate_vinted_status_tab(driver, "https://www.vinted.it/items/123-test"))
+        self.assertIs(driver._tab, status_tab)
+        status_tab.minimize.assert_called_once_with()
+        driver.open_link_in_new_tab.assert_called_once_with(
+            "about:blank",
+            wait=None,
+            timeout=1,
+        )
+
+        self.assertTrue(navigate_vinted_status_tab(driver, "https://www.vinted.it/items/456-test"))
+        self.assertEqual(2, status_tab.send.call_count)
+        status_tab.minimize.assert_called_once_with()
+        self.assertIs(driver._tab, status_tab)
+
+        restore_vinted_primary_tab(driver)
+        self.assertIs(driver._tab, search_tab)
+        search_tab.minimize.assert_not_called()
+        browser_session.connection.send.assert_not_called()
+
+    def test_detail_tab_falls_back_to_original_tab_when_creation_fails(self) -> None:
+        search_tab = Mock()
+        browser_session = Mock()
+        browser_session._agent_lab_vinted_primary_tab = None
+        browser_session._agent_lab_vinted_status_tab = None
+        driver = Mock()
+        driver._browser = browser_session
+        driver._tab = search_tab
+        driver.open_link_in_new_tab.side_effect = RuntimeError("tab creation failed")
+
+        self.assertFalse(navigate_vinted_status_tab(driver, "https://www.vinted.it/items/123-test"))
+        self.assertIs(driver._tab, search_tab)
+
+    @patch("scraper_app.sources.vinted_deal_sales.time.sleep")
+    @patch("scraper_app.sources.vinted_deal_sales.restore_vinted_primary_tab")
+    @patch("scraper_app.sources.vinted_deal_sales.save_vinted_deal_sale_check", return_value={})
+    @patch("scraper_app.sources.vinted_deal_sales._sold_status_from_page", return_value={"sold": False})
+    @patch("scraper_app.sources.vinted_deal_sales.navigate_vinted_status_tab", return_value=True)
+    @patch(
+        "scraper_app.sources.vinted_deal_sales.load_due_vinted_deal_sale_checks",
+        return_value=[
+            {
+                "link": "https://www.vinted.it/items/123-test",
+                "name": "Test charm",
+                "deal_first_seen_at": "2026-10-24T10:00:00",
+            }
+        ],
+    )
+    def test_continuous_sale_checks_use_the_secondary_status_tab(
+        self,
+        load_due,
+        navigate_status_tab,
+        _read_status,
+        _save_check,
+        restore_primary,
+        _sleep,
+    ) -> None:
+        result = check_due_vinted_deal_sales_with_driver(
+            Mock(),
+            db_path="data/scraper.db",
+            interval_seconds=1800,
+            max_items=40,
+            discord_webhook_url="",
+        )
+
+        self.assertEqual(1, result["checked_count"])
+        self.assertEqual(0, result["sold_count"])
+        navigate_status_tab.assert_called_once()
+        restore_primary.assert_called_once()
+        self.assertEqual(40, load_due.call_args.kwargs["limit"])
+
     def test_precise_listing_age_parser_uses_hours_but_rejects_day_labels(self) -> None:
         self.assertEqual(3_600, parse_vinted_precise_listing_age_seconds("1 ora fa"))
         self.assertEqual(7_200, parse_vinted_precise_listing_age_seconds("Caricato 2 ore fa"))

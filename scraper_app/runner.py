@@ -288,6 +288,10 @@ def _run_vinted_competitor_discovery(**kwargs) -> ScrapeOutcome:
             "exclude_known_items": bool(kwargs.get("exclude_known_items", True)),
             "keep_browser_open": bool(kwargs.get("keep_browser_open", True)),
             "run_kind": "competitor_discovery",
+            "separate_status_tab": bool(kwargs.get("separate_status_tab", False)),
+            "monitor_existing_deal_sales_in_search_task": bool(
+                kwargs.get("monitor_existing_deal_sales_in_search_task", False)
+            ),
         }
     )
 
@@ -560,6 +564,8 @@ def _run_vinted_continuous_monitoring(**kwargs) -> ScrapeOutcome:
                         "competitor_interval_seconds": 0,
                         "ui_result_json": "",
                         "db_path": db_path,
+                        "separate_status_tab": True,
+                        "monitor_existing_deal_sales_in_search_task": True,
                     }
                 )
                 competitor_meta = dict(competitor_outcome.meta)
@@ -582,7 +588,14 @@ def _run_vinted_continuous_monitoring(**kwargs) -> ScrapeOutcome:
             last_daily_report_date=last_daily_report_date,
         )
         deal_sale_meta: dict = {}
-        if bool(kwargs.get("discord_deal_notifications", False)):
+        sale_status_meta = competitor_meta.get("deal_sale_status_check", {})
+        sale_checks_ran_in_search_browser = bool(
+            run_competitors
+            and competitor_meta
+            and isinstance(sale_status_meta, dict)
+            and not sale_status_meta.get("error")
+        )
+        if bool(kwargs.get("discord_deal_notifications", False)) and not sale_checks_ran_in_search_browser:
             deal_sale_outcome = _run_vinted_deal_sale_monitor_safely(**automation_browser_kwargs)
             if deal_sale_outcome is not None:
                 deal_sale_meta = dict(deal_sale_outcome.meta)
@@ -663,6 +676,13 @@ def _run_vinted_queries_once(search_specs: list[dict], **kwargs) -> ScrapeOutcom
             action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
             page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
             run_kind=str(kwargs.get("run_kind", "") or "search"),
+            separate_status_tab=bool(kwargs.get("separate_status_tab", False)),
+            monitor_existing_deal_sales_in_search_task=bool(
+                kwargs.get("monitor_existing_deal_sales_in_search_task", False)
+            ),
+            deal_sale_check_interval_seconds=int(kwargs.get("deal_sale_check_interval_seconds", 1800) or 0),
+            deal_sale_check_max_items=int(kwargs.get("deal_sale_check_max_items", 40) or 40),
+            deal_sale_max_tracking_age_hours=float(kwargs.get("deal_sale_max_tracking_age_hours", 72) or 0),
         )
 
     rows: list[dict] = []
@@ -717,6 +737,13 @@ def _run_vinted_queries_once(search_specs: list[dict], **kwargs) -> ScrapeOutcom
                 page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
                 detach_browser_on_complete=not deal_hunter_enabled and is_last,
                 run_kind=str(kwargs.get("run_kind", "") or "search"),
+                separate_status_tab=bool(kwargs.get("separate_status_tab", False)),
+                monitor_existing_deal_sales_in_search_task=bool(
+                    kwargs.get("monitor_existing_deal_sales_in_search_task", False)
+                ),
+                deal_sale_check_interval_seconds=int(kwargs.get("deal_sale_check_interval_seconds", 1800) or 0),
+                deal_sale_check_max_items=int(kwargs.get("deal_sale_check_max_items", 40) or 40),
+                deal_sale_max_tracking_age_hours=float(kwargs.get("deal_sale_max_tracking_age_hours", 72) or 0),
             )
         except Exception as exc:
             search_errors.append(

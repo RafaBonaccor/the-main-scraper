@@ -18,6 +18,7 @@ from ..vinted_database import (
     parse_vinted_precise_listing_age_seconds,
     save_vinted_deal_sale_check,
 )
+from ..vinted_tabs import navigate_vinted_status_tab, restore_vinted_primary_tab
 
 VINTED_DEAL_SALE_NAVIGATION_TIMEOUT_SECONDS = 18
 
@@ -65,15 +66,24 @@ return {
     raise_exception=True,
 )
 def _check_vinted_deal_sales_task(driver: Driver, config: dict) -> dict:
-    rows: list[dict] = []
-    due_before = str(config["due_before"])
     deals = load_due_vinted_deal_sale_checks(
         config["db_path"],
-        due_before=due_before,
+        due_before=str(config["due_before"]),
         limit=int(config["max_items"]),
         first_seen_after=str(config.get("first_seen_after", "") or ""),
     )
     print(f"[vinted-deal-sales] check-start due={len(deals)}", flush=True)
+    return _check_vinted_deal_sales_with_driver(driver, config, deals)
+
+
+def _check_vinted_deal_sales_with_driver(
+    driver: Driver,
+    config: dict,
+    deals: list[dict],
+    *,
+    use_status_tab: bool = False,
+) -> dict:
+    rows: list[dict] = []
     checked = sold_count = errors = notified = 0
     webhook_url = str(config.get("discord_webhook_url", "") or "").strip()
     for deal in deals:
@@ -81,7 +91,12 @@ def _check_vinted_deal_sales_task(driver: Driver, config: dict) -> dict:
         if not link:
             continue
         try:
-            driver.get(link, wait=Wait.SHORT, timeout=VINTED_DEAL_SALE_NAVIGATION_TIMEOUT_SECONDS)
+            if not use_status_tab or not navigate_vinted_status_tab(
+                driver,
+                link,
+                log_prefix="[vinted-deal-sales-tabs]",
+            ):
+                driver.get(link, wait=Wait.SHORT, timeout=VINTED_DEAL_SALE_NAVIGATION_TIMEOUT_SECONDS)
             time.sleep(min(max(float(config.get("page_settle_seconds", 2.0) or 0), 0.25), 2.0))
             status = _sold_status_from_page(driver)
             # A missing/inaccessible page is deliberately not counted as sold: only the explicit cell is proof.
@@ -144,7 +159,55 @@ def _check_vinted_deal_sales_task(driver: Driver, config: dict) -> dict:
         except Exception as exc:
             errors += 1
             print(f"[vinted-deal-sales] check-error link={link} error={exc}", flush=True)
+    if use_status_tab:
+        restore_vinted_primary_tab(driver, log_prefix="[vinted-deal-sales-tabs]")
     return {"rows": rows, "meta": {"due_count": len(deals), "checked_count": checked, "sold_count": sold_count, "errors": errors, "discord_sent": notified}}
+
+
+def check_due_vinted_deal_sales_with_driver(
+    driver: Driver,
+    *,
+    db_path: str,
+    interval_seconds: int = 1800,
+    max_items: int = 40,
+    discord_webhook_url: str = "",
+    page_settle_seconds: float = 2.0,
+    max_tracking_age_hours: float = 72.0,
+) -> dict:
+    """Check due sold/active states in the monitoring task's second tab."""
+    now = datetime.now()
+    due_before = now - timedelta(seconds=max(int(interval_seconds or 0), 0))
+    max_age_hours = max(float(max_tracking_age_hours or 0), 0.0)
+    first_seen_after = (now - timedelta(hours=max_age_hours)).isoformat(timespec="seconds") if max_age_hours > 0 else ""
+    normalized_db_path = str(db_path or DEFAULT_VINTED_DB_PATH)
+    due_before_text = due_before.isoformat(timespec="seconds")
+    deals = load_due_vinted_deal_sale_checks(
+        normalized_db_path,
+        due_before=due_before_text,
+        limit=max(int(max_items or 0), 1),
+        first_seen_after=first_seen_after,
+    )
+    print(f"[vinted-deal-sales] in-search-tab check-start due={len(deals)}", flush=True)
+    if not deals:
+        return {
+            "due_count": 0,
+            "checked_count": 0,
+            "sold_count": 0,
+            "errors": 0,
+            "discord_sent": 0,
+            "max_tracking_age_hours": max_age_hours,
+        }
+    config = {
+        "db_path": normalized_db_path,
+        "due_before": due_before_text,
+        "first_seen_after": first_seen_after,
+        "max_items": max(int(max_items or 0), 1),
+        "discord_webhook_url": discord_webhook_url,
+        "page_settle_seconds": page_settle_seconds,
+    }
+    result = _check_vinted_deal_sales_with_driver(driver, config, deals, use_status_tab=True)
+    result["meta"]["max_tracking_age_hours"] = max_age_hours
+    return result["meta"]
 
 
 def run_vinted_deal_sale_monitor(

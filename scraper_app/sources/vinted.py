@@ -43,6 +43,7 @@ from ..vinted_database import (
     track_vinted_deal_sales,
 )
 from ..vinted_access import emit_vinted_access_signal, read_vinted_access_status, wait_for_vinted_access_status
+from ..vinted_tabs import navigate_vinted_status_tab, restore_vinted_primary_tab
 from ..vinted_deals import (
     VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS,
     annotate_vinted_deal_hunter_row,
@@ -98,6 +99,11 @@ def run_vinted_scraper(
     deal_hunter_url_only_discord: bool = False,
     skip_login_required: bool = False,
     run_kind: str = "search",
+    separate_status_tab: bool = False,
+    monitor_existing_deal_sales_in_search_task: bool = False,
+    deal_sale_check_interval_seconds: int = 1800,
+    deal_sale_check_max_items: int = 40,
+    deal_sale_max_tracking_age_hours: float = 72.0,
 ) -> ScrapeOutcome:
     search_url = build_vinted_search_url(search)
     search_term = extract_vinted_search_term(search_url) or str(search or "").strip()
@@ -144,6 +150,11 @@ def run_vinted_scraper(
         "deal_hunter_url_only_discord": bool(deal_hunter_url_only_discord),
         "skip_login_required": bool(skip_login_required),
         "run_kind": str(run_kind or "search").strip() or "search",
+        "separate_status_tab": bool(separate_status_tab),
+        "monitor_existing_deal_sales_in_search_task": bool(monitor_existing_deal_sales_in_search_task),
+        "deal_sale_check_interval_seconds": max(int(deal_sale_check_interval_seconds or 0), 0),
+        "deal_sale_check_max_items": max(int(deal_sale_check_max_items or 0), 1),
+        "deal_sale_max_tracking_age_hours": max(float(deal_sale_max_tracking_age_hours or 0), 0.0),
     }
     payload = _scrape_vinted_task(config, reuse_driver=bool(keep_browser_open))
     if not payload["meta"].get("db_saved_live"):
@@ -376,6 +387,23 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
             db_path=str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH),
         )
     notification_meta = _notify_new_vinted_deals(rows, config)
+    deal_sale_status_check: dict[str, object] = {}
+    if bool(config.get("monitor_existing_deal_sales_in_search_task", False)):
+        try:
+            from .vinted_deal_sales import check_due_vinted_deal_sales_with_driver
+
+            deal_sale_status_check = check_due_vinted_deal_sales_with_driver(
+                driver,
+                db_path=str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH),
+                interval_seconds=int(config.get("deal_sale_check_interval_seconds", 1800) or 0),
+                max_items=int(config.get("deal_sale_check_max_items", 40) or 40),
+                discord_webhook_url=str(config.get("discord_webhook_url", "") or ""),
+                page_settle_seconds=float(config.get("page_settle_seconds", 2.0) or 2.0),
+                max_tracking_age_hours=float(config.get("deal_sale_max_tracking_age_hours", 72.0) or 0),
+            )
+        except Exception as exc:
+            deal_sale_status_check = {"error": f"{type(exc).__name__}: {exc}"}
+            print(f"[vinted-deal-sales] in-search-tab check-failed error={exc}", flush=True)
     keep_open_seconds = int(config.get("keep_open_seconds", 0) or 0)
     keep_browser_open = bool(config.get("keep_browser_open", False))
     meta = {
@@ -419,6 +447,7 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         "priority_rows_cached": enrichment_meta.get("cached_count", 0),
         "priority_rows_skipped_sold": enrichment_meta.get("skipped_sold_count", 0),
         "deal_sale_tracking_registered": tracked_deals,
+        "deal_sale_status_check": deal_sale_status_check,
         **notification_meta,
     }
     _persist_vinted_live_results(
@@ -1313,7 +1342,9 @@ def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict)
             continue
         detail_started_at = time.monotonic()
         try:
-            driver.get(current_link, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
+            use_status_tab = bool(config.get("separate_status_tab", False))
+            if not use_status_tab or not navigate_vinted_status_tab(driver, current_link):
+                driver.get(current_link, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
             _wait_for_vinted_detail_page_ready(
                 driver,
                 max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
@@ -1408,6 +1439,8 @@ def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict)
             enrichment_meta={"enriched_count": len(targets), "demoted_count": demoted_count},
             live_stage="detail",
         )
+    if bool(config.get("separate_status_tab", False)):
+        restore_vinted_primary_tab(driver)
     return {
         "enriched_count": len(targets),
         "demoted_count": demoted_count,
