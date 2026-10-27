@@ -325,6 +325,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vinted_continuous_parser.add_argument("--profile-url", "--url", dest="profile_url", default="")
     vinted_continuous_parser.add_argument("--profile-urls", default="", help="Newline-separated marketplace member URLs.")
+    vinted_continuous_parser.add_argument("--profile-categories", default="", help="Optional comma-separated profile categories to keep, using labels observed on the profile.")
     vinted_continuous_parser.add_argument("--profiles-file", default="", help="UTF-8 text or JSON file containing monitored profile URLs.")
     vinted_continuous_parser.add_argument("--max-items", default=0, type=int, help="Maximum items read for each monitored profile. Use 0 for all.")
     vinted_continuous_parser.add_argument("--competitor-keywords", default="charm, pandora", help="Comma-separated keywords used for competitor discovery.")
@@ -353,6 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
     vinted_profile_parser.add_argument("--profile-url", "--url", dest="profile_url", default="", help="Single Vinted member URL, e.g. https://www.vinted.it/member/262102939")
     vinted_profile_parser.add_argument("--profile-urls", default="", help="Newline-separated Vinted member URLs. Numeric IDs are accepted too.")
     vinted_profile_parser.add_argument("--profiles-file", default="", help="UTF-8 text or JSON file containing multiple Vinted member URLs.")
+    vinted_profile_parser.add_argument("--profile-categories", default="", help="Optional comma-separated profile categories to monitor. Empty means every category.")
     vinted_profile_parser.add_argument(
         "--max-items",
         default=0,
@@ -399,6 +401,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=10,
         type=int,
         help="Local hour for the once-per-day Discord digest. Default: 10.",
+    )
+    vinted_profile_parser.add_argument(
+        "--check-listing-statuses",
+        action="store_true",
+        help="Open every current listing and record only explicit Sold states before saving the snapshot.",
     )
     _add_orchestrator_arguments(vinted_profile_parser)
     _add_browser_arguments(vinted_profile_parser)

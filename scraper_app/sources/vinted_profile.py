@@ -25,6 +25,7 @@ from ..utils import normalize_whitespace
 from ..vinted_database import (
     DEFAULT_VINTED_DB_PATH,
     extract_vinted_item_id_from_link,
+    load_vinted_profile_known_items,
     load_vinted_profile_daily_changes,
     load_vinted_deal_sales,
     normalize_vinted_member_id,
@@ -37,6 +38,48 @@ from .vinted_deal_sales import _sold_status_from_page
 
 VINTED_PROFILE_NAVIGATION_TIMEOUT_SECONDS = 20
 DEFAULT_AGENT_LAB_RUNTIME_URL = "http://127.0.0.1:8000"
+
+# The wardrobe endpoint requires the page-specific anonymous/CSRF headers.
+# Capture only those two non-secret request values before the profile app makes
+# its initial page-one request; later pages are fetched by that same tab.
+_VINTED_WARDROBE_HEADER_CAPTURE_SCRIPT = r"""
+(() => {
+  const capture = (input, init = {}) => {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (!/\/api\/v2\/wardrobe\/[^/]+\/items/.test(url)) return;
+    const source = init.headers || (input && input.headers) || {};
+    const headers = source instanceof Headers ? Object.fromEntries(source.entries())
+      : Array.isArray(source) ? Object.fromEntries(source)
+      : { ...source };
+    window.__agentLabWardrobeHeaders = headers;
+  };
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = function(input, init) {
+    capture(input, init || {});
+    return originalFetch(input, init);
+  };
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+  const originalSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    this.__agentLabWardrobeUrl = String(url || '');
+    this.__agentLabWardrobeHeaders = {};
+    return originalOpen.call(this, method, url, ...rest);
+  };
+  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    if (/\/api\/v2\/wardrobe\/[^/]+\/items/.test(this.__agentLabWardrobeUrl || '')) {
+      this.__agentLabWardrobeHeaders[String(name)] = String(value);
+    }
+    return originalSetRequestHeader.call(this, name, value);
+  };
+  XMLHttpRequest.prototype.send = function(...args) {
+    if (/\/api\/v2\/wardrobe\/[^/]+\/items/.test(this.__agentLabWardrobeUrl || '')) {
+      window.__agentLabWardrobeHeaders = { ...this.__agentLabWardrobeHeaders };
+    }
+    return originalSend.apply(this, args);
+  };
+})();
+"""
 
 
 def _download_vinted_daily_html_report(*, db_path: str, days: int = 30) -> Path:
@@ -93,6 +136,8 @@ def run_vinted_profile_monitor(
     discord_webhook_url: str = "",
     daily_report_hour: int = 10,
     send_daily_report: bool = True,
+    check_listing_statuses: bool = False,
+    profile_categories: str = "",
 ) -> ScrapeOutcome:
     normalized_profile_urls = normalize_vinted_profile_urls(profile_urls or profile_url)
     if not normalized_profile_urls:
@@ -105,6 +150,8 @@ def run_vinted_profile_monitor(
         max_items=max(int(max_items or 0), 0),
         db_path=str(db_path or DEFAULT_VINTED_DB_PATH),
         discord_report=bool(discord_profile_report),
+        check_listing_statuses=bool(check_listing_statuses),
+        profile_categories=profile_categories or "all",
         keep_browser_open=bool(keep_browser_open),
         browser_mode=browser_mode,
     )
@@ -157,6 +204,8 @@ def run_vinted_profile_monitor(
                     "interval_seconds": normalized_interval,
                     "discord_profile_report": bool(discord_profile_report),
                     "discord_webhook_url": str(discord_webhook_url or "").strip(),
+                    "check_listing_statuses": bool(check_listing_statuses),
+                    "profile_categories": str(profile_categories or ""),
                 },
                 reuse_driver=bool(keep_browser_open),
             )
@@ -360,6 +409,35 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         max_items=max(int(config.get("max_items", 0) or 0), 0),
         page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
     )
+    api_rows = _read_all_vinted_profile_items_via_browser_session(
+        driver,
+        member_id=member_id,
+        max_items=max(int(config.get("max_items", 0) or 0), 0),
+    )
+    if len(api_rows) > len(rows):
+        _log_vinted_profile("profile-wardrobe-pagination-used", dom_rows=len(rows), api_rows=len(api_rows))
+        rows = api_rows
+    declared_item_count = _read_vinted_profile_declared_item_count(driver)
+    paged_rows = _read_vinted_profile_additional_pages(
+        driver,
+        profile_url=profile_url,
+        existing_rows=rows,
+        declared_item_count=declared_item_count,
+        max_items=max(int(config.get("max_items", 0) or 0), 0),
+    )
+    if len(paged_rows) > len(rows):
+        rows = paged_rows
+    category_filters = _normalize_vinted_profile_categories(config.get("profile_categories", ""))
+    if category_filters:
+        before_category_filter = len(rows)
+        rows = _filter_vinted_profile_rows_by_category(rows, category_filters)
+        _log_vinted_profile(
+            "profile-category-filter",
+            member_id=member_id,
+            categories=", ".join(category_filters),
+            before=before_category_filter,
+            after=len(rows),
+        )
     missing_identity_before = sum(
         1
         for row in rows
@@ -373,9 +451,32 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         missing_identity_before=missing_identity_before,
     )
     rows = _attach_vinted_profile_identity(rows, profile_url=profile_url, member_id=member_id)
-    # Profile monitoring is deliberately profile-only for every seller. Opening
-    # every listing just for registered/owned profiles made their scans slower
-    # and produced inconsistent status data compared with other profiles.
+    # Regular monitoring stays profile-only.  The explicit detail action can
+    # opt into visiting every saved listing and records "sold" only when the
+    # listing page itself shows the platform's Sold state.
+    if bool(config.get("check_listing_statuses", False)):
+        known_rows = load_vinted_profile_known_items(profile_url=profile_url, db_path=db_path)
+        if category_filters:
+            known_rows = _filter_vinted_profile_rows_by_category(known_rows, category_filters)
+        missing_rows = _vinted_profile_rows_missing_from_current(current_rows=rows, historical_rows=known_rows)
+        _log_vinted_profile(
+            "listing-status-check-requested",
+            member_id=member_id,
+            current_items=len(rows),
+            historical_items=len(known_rows),
+            missing_items=len(missing_rows),
+        )
+        # The profile API already establishes that these IDs are still live;
+        # opening them again would just waste time and increase rate-limit
+        # risk. Only visit items missing from the new complete profile set to
+        # distinguish an explicit Sold page from a removed/unavailable one.
+        if missing_rows:
+            checked_missing_rows = _check_owned_profile_listing_status(
+                driver,
+                missing_rows,
+                page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+            )
+            rows = [*rows, *checked_missing_rows]
     missing_identity_after = sum(
         1
         for row in rows
@@ -529,6 +630,23 @@ def _attach_vinted_profile_identity(rows: list[dict], *, profile_url: str, membe
     return enriched_rows
 
 
+def _vinted_profile_rows_missing_from_current(
+    *, current_rows: list[dict], historical_rows: list[dict]
+) -> list[dict]:
+    """Return only historic listing IDs no longer found in the latest profile response."""
+    current_links = {
+        str(row.get("link", "") or "").strip()
+        for row in current_rows
+        if str(row.get("link", "") or "").strip()
+    }
+    missing_by_link: dict[str, dict] = {}
+    for row in historical_rows:
+        link = str(row.get("link", "") or "").strip()
+        if link and link not in current_links:
+            missing_by_link.setdefault(link, dict(row))
+    return list(missing_by_link.values())
+
+
 def _build_vinted_profile_aggregate_meta(
     *,
     profile_urls: list[str],
@@ -617,9 +735,14 @@ def _scroll_and_read_vinted_profile_items(
     max_items: int,
     page_settle_seconds: float,
 ) -> list[dict]:
+    # Profile grids use lazy loading and, on some accounts, virtualised cards.
+    # Reaching the document bottom in one jump can therefore leave the grid at
+    # its first page (usually 20 items).  Always let each incremental scroll
+    # settle for three seconds, then read the cards again before proceeding.
+    scroll_settle_seconds = 3.0
     rows_by_link: dict[str, dict] = {}
-    stable_rounds = 0
-    stable_stop_rounds = 8 if max_items <= 0 else 5
+    stable_bottom_rounds = 0
+    stable_stop_rounds = 6 if max_items <= 0 else 4
     max_rounds = 220 if max_items <= 0 else max(20, min(220, (max_items // 8) + 20))
     last_height = 0
     _log_vinted_profile("scroll-start", max_items=max_items, max_rounds=max_rounds)
@@ -636,24 +759,27 @@ def _scroll_and_read_vinted_profile_items(
         scroll_state = _scroll_vinted_profile(driver)
         moved = bool(scroll_state.get("moved"))
         at_bottom = bool(scroll_state.get("at_bottom"))
+        load_more_clicked = bool(scroll_state.get("load_more_clicked"))
         page_height = int(scroll_state.get("height") or 0)
-        height_changed = bool(page_height and page_height != last_height)
-        if page_height:
-            last_height = page_height
-        time.sleep(min(max(float(page_settle_seconds or 0), 0.8), 3.0))
+        height_changed_before_wait = bool(page_height and page_height != last_height)
+        time.sleep(scroll_settle_seconds)
         for row in _read_vinted_profile_items(driver):
             link = str(row.get("link", "") or "").strip()
             if not link:
                 continue
             rows_by_link[link] = row
-        if len(rows_by_link) <= before_count and not moved and at_bottom and not height_changed:
-            stable_rounds += 1
-        elif len(rows_by_link) <= before_count and at_bottom and not height_changed:
-            stable_rounds += 1
-        else:
-            stable_rounds = 0
+        # Read the height only on the next scroll call.  An item increase is
+        # the strongest signal that lazy content arrived; a changed height also
+        # means we must continue even if this particular read was unchanged.
         added_count = max(len(rows_by_link) - before_count, 0)
-        if added_count or stable_rounds >= 2 or (_round + 1) % 5 == 0:
+        height_changed = height_changed_before_wait
+        if page_height:
+            last_height = page_height
+        if at_bottom and added_count == 0 and not height_changed and not load_more_clicked:
+            stable_bottom_rounds += 1
+        else:
+            stable_bottom_rounds = 0
+        if added_count or stable_bottom_rounds >= 2 or (_round + 1) % 5 == 0:
             _log_vinted_profile(
                 "scroll-round",
                 round=_round + 1,
@@ -663,14 +789,16 @@ def _scroll_and_read_vinted_profile_items(
                 at_bottom=at_bottom,
                 height=page_height,
                 height_changed=height_changed,
-                stable_rounds=stable_rounds,
+                load_more_clicked=load_more_clicked,
+                stable_bottom_rounds=stable_bottom_rounds,
+                settle_seconds=scroll_settle_seconds,
             )
-        if stable_rounds >= stable_stop_rounds:
+        if stable_bottom_rounds >= stable_stop_rounds:
             _log_vinted_profile("scroll-stop-stable", round=_round + 1, rows=len(rows_by_link))
             break
     for verify_round in range(1, 4):
         scroll_state = _scroll_vinted_profile(driver)
-        time.sleep(min(max(float(page_settle_seconds or 0), 0.8), 2.0))
+        time.sleep(scroll_settle_seconds)
         before_count = len(rows_by_link)
         for row in _read_vinted_profile_items(driver):
             link = str(row.get("link", "") or "").strip()
@@ -685,6 +813,7 @@ def _scroll_and_read_vinted_profile_items(
             added=added_count,
             at_bottom=bool(scroll_state.get("at_bottom")),
             height=int(scroll_state.get("height") or 0),
+            settle_seconds=scroll_settle_seconds,
         )
         if max_items > 0 and len(rows_by_link) >= max_items:
             break
@@ -693,6 +822,320 @@ def _scroll_and_read_vinted_profile_items(
         rows = rows[:max_items]
     _log_vinted_profile("scroll-finished", rows=len(rows))
     return rows
+
+
+def _read_vinted_profile_declared_item_count(driver: Driver) -> int:
+    try:
+        count = driver.run_js(
+            """
+const text = (document.body?.innerText || '').replace(/\\s+/g, ' ');
+const matches = [...text.matchAll(/(?:^|\\s)([0-9]{1,5})\\s+articoli\\b/gi)];
+return matches.length ? Number(matches[matches.length - 1][1]) : 0;
+            """
+        )
+        return max(int(count or 0), 0)
+    except Exception:
+        return 0
+
+
+def _read_vinted_profile_additional_pages(
+    driver: Driver,
+    *,
+    profile_url: str,
+    existing_rows: list[dict],
+    declared_item_count: int,
+    max_items: int,
+) -> list[dict]:
+    """Collect remaining public wardrobe pages when the profile advertises more than its first grid."""
+    rows_by_link = {
+        str(row.get("link", "") or "").strip(): row
+        for row in existing_rows
+        if str(row.get("link", "") or "").strip()
+    }
+    if max_items > 0 and len(rows_by_link) >= max_items:
+        return list(rows_by_link.values())[:max_items]
+    if declared_item_count <= len(rows_by_link):
+        return list(rows_by_link.values())
+    # The public profile route serves twenty cards per page.  The stated total
+    # gives a bounded loop; the duplicate-page guard handles layouts that do
+    # not honour the `page` query parameter.
+    page_size = 20
+    max_pages = min(max((declared_item_count + page_size - 1) // page_size, 2), 100)
+    _log_vinted_profile(
+        "profile-pages-start",
+        declared_items=declared_item_count,
+        initial_rows=len(rows_by_link),
+        max_pages=max_pages,
+    )
+    duplicate_pages = 0
+    for page in range(2, max_pages + 1):
+        if consume_stop_after_current_item_request():
+            break
+        page_url = f"{profile_url}?page={page}"
+        try:
+            driver.get(page_url, wait=Wait.SHORT, timeout=VINTED_PROFILE_NAVIGATION_TIMEOUT_SECONDS)
+            # Required settle time: page cards can arrive after navigation has
+            # completed, exactly like the lazy cards on page one.
+            time.sleep(3.0)
+            page_rows = _read_vinted_profile_items(driver)
+        except Exception as error:
+            _log_vinted_profile("profile-page-error", page=page, error=type(error).__name__)
+            break
+        before_count = len(rows_by_link)
+        for row in page_rows:
+            link = str(row.get("link", "") or "").strip()
+            if link:
+                rows_by_link[link] = row
+        added_count = len(rows_by_link) - before_count
+        _log_vinted_profile(
+            "profile-page",
+            page=page,
+            rows=len(page_rows),
+            added=added_count,
+            total=len(rows_by_link),
+        )
+        if max_items > 0 and len(rows_by_link) >= max_items:
+            break
+        if added_count == 0:
+            duplicate_pages += 1
+            if duplicate_pages >= 2:
+                _log_vinted_profile("profile-pages-stop-duplicate", page=page, total=len(rows_by_link))
+                break
+        else:
+            duplicate_pages = 0
+        if len(rows_by_link) >= declared_item_count:
+            break
+    rows = list(rows_by_link.values())
+    return rows[:max_items] if max_items > 0 else rows
+
+
+def _read_all_vinted_profile_items_via_browser_session(
+    driver: Driver,
+    *,
+    member_id: str,
+    max_items: int,
+) -> list[dict]:
+    """Read every public wardrobe page through the already-open browser session.
+
+    The endpoint is same-origin, so its cookies and anti-bot context come from
+    the Chrome tab rather than from a separate HTTP client.  If it is rejected
+    or changes shape, the caller simply keeps the DOM-scroll result.
+    """
+    normalized_member_id = normalize_vinted_member_id(member_id)
+    if not normalized_member_id:
+        return []
+    per_page = 96
+    max_pages = max(1, (max_items + per_page - 1) // per_page) if max_items > 0 else 30
+    session_headers = _read_vinted_wardrobe_session_headers(driver)
+    if not session_headers.get("x-csrf-token") or not session_headers.get("x-anon-id"):
+        _log_vinted_profile("profile-api-session-headers-missing", keys=sorted(session_headers))
+        return []
+    collected: dict[str, dict] = {}
+    for page in range(1, max_pages + 1):
+        endpoint = (
+            f"{VINTED_BASE_URL}/api/v2/wardrobe/{normalized_member_id}/items"
+            f"?order=newest_first&page={page}&per_page={per_page}"
+        )
+        try:
+            response = driver.run_js(
+                """
+const endpoint = args.endpoint;
+const captured = args.headers || window.__agentLabWardrobeHeaders || {};
+const pick = (...names) => {
+  for (const name of names) if (captured[name]) return captured[name];
+  return '';
+};
+// Botasaurus waits unreliably for a fetch Promise.  The browser's synchronous
+// XHR runs in this already-authorised page context and returns a concrete
+// object to Python for every wardrobe page.
+try {
+  const request = new XMLHttpRequest();
+  request.open('GET', endpoint, false);
+  request.setRequestHeader('accept', 'application/json, text/plain, */*');
+  request.setRequestHeader('x-requested-with', 'XMLHttpRequest');
+  const csrf = pick('x-csrf-token', 'X-CSRF-Token');
+  const anonId = pick('x-anon-id', 'X-Anon-Id');
+  if (csrf) request.setRequestHeader('x-csrf-token', csrf);
+  if (anonId) request.setRequestHeader('x-anon-id', anonId);
+  request.setRequestHeader('locale', pick('locale', 'Locale') || 'it-IT');
+  request.send(null);
+  return { status: request.status, text: request.responseText || '' };
+} catch (error) {
+  return { error: String(error || 'xhr failed') };
+}
+                """,
+                args={"endpoint": endpoint, "headers": session_headers},
+            )
+            if not isinstance(response, dict):
+                _log_vinted_profile("profile-api-page-invalid", page=page, payload_type=type(response).__name__)
+                break
+            if bool(response.get("timeout")):
+                _log_vinted_profile("profile-api-page-timeout", page=page, timeout_seconds=12)
+                break
+            if response.get("error"):
+                _log_vinted_profile("profile-api-page-error", page=page, error=str(response.get("error"))[:120])
+                break
+            status_code = int(response.get("status", 0) or 0)
+            if status_code != 200:
+                _log_vinted_profile("profile-api-page-unavailable", page=page, status=status_code)
+                break
+            payload = json.loads(str(response.get("text", "") or ""))
+        except Exception as error:
+            _log_vinted_profile("profile-api-page-error", page=page, error=type(error).__name__)
+            break
+        if not isinstance(payload, dict):
+            _log_vinted_profile("profile-api-page-invalid", page=page, payload_type=type(payload).__name__)
+            break
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            _log_vinted_profile("profile-api-page-empty", page=page, collected=len(collected))
+            break
+        page_added = 0
+        for item in items:
+            row = _normalize_vinted_profile_api_item(item)
+            link = str(row.get("link", "") or "").strip()
+            if not link:
+                continue
+            if link not in collected:
+                page_added += 1
+            collected[link] = row
+            if max_items > 0 and len(collected) >= max_items:
+                break
+        _log_vinted_profile(
+            "profile-api-page",
+            page=page,
+            received=len(items),
+            added=page_added,
+            collected=len(collected),
+        )
+        if max_items > 0 and len(collected) >= max_items:
+            break
+        pagination = payload.get("pagination") if isinstance(payload.get("pagination"), dict) else {}
+        total_pages = int(pagination.get("total_pages", 0) or 0)
+        current_page = int(pagination.get("current_page", page) or page)
+        if total_pages and current_page >= total_pages:
+            break
+        if not total_pages and len(items) < per_page:
+            break
+    return list(collected.values())[:max_items] if max_items > 0 else list(collected.values())
+
+
+def _read_vinted_wardrobe_session_headers(driver: Driver) -> dict[str, str]:
+    """Read the page bootstrap values used by Vinted's own wardrobe XHR."""
+    try:
+        payload = driver.run_js(
+            """
+const markup = (document.documentElement?.innerHTML || '').split(String.fromCharCode(92, 34)).join('"');
+const csrf = (markup.match(/"CSRF_TOKEN":"([^"]+)"/) || [])[1] || '';
+const cookieAnon = (document.cookie.match(/(?:^|;\\s*)anon_id=([^;]+)/) || [])[1] || '';
+const bootstrapAnon = (markup.match(/"anonId":"([^"]+)"/) || [])[1] || '';
+return { csrf, anonId: decodeURIComponent(cookieAnon || bootstrapAnon || '') };
+            """
+        )
+    except Exception as error:
+        _log_vinted_profile("profile-api-session-header-error", error=type(error).__name__)
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    csrf = str(payload.get("csrf", "") or "").strip()
+    anon_id = str(payload.get("anonId", "") or "").strip()
+    return {
+        "x-csrf-token": csrf,
+        "x-anon-id": anon_id,
+        "locale": "it-IT",
+    }
+
+
+def _normalize_vinted_profile_api_item(item: object) -> dict:
+    source = item if isinstance(item, dict) else {}
+    item_id = str(source.get("id", source.get("item_id", "")) or "").strip()
+    raw_link = str(source.get("url", source.get("link", "")) or "").strip()
+    if raw_link and raw_link.startswith("/"):
+        raw_link = f"{VINTED_BASE_URL}{raw_link}"
+    link = normalize_vinted_item_url(raw_link)
+    if not link and item_id:
+        link = f"{VINTED_BASE_URL}/items/{item_id}"
+    photo = source.get("photo") if isinstance(source.get("photo"), dict) else {}
+    image_url = (
+        source.get("image_url")
+        or source.get("thumbnail_url")
+        or photo.get("url")
+        or photo.get("full_size_url")
+        or photo.get("thumbnail_url")
+        or ""
+    )
+    price = source.get("price") or source.get("price_numeric") or ""
+    currency = str(source.get("currency", "") or "").strip()
+    price_text = normalize_whitespace(f"{price} {currency}".strip())
+    category = _vinted_profile_item_category(source)
+    return {
+        "source": "vinted_profile",
+        "profile_url": "",
+        "member_id": "",
+        "item_id": extract_vinted_item_id_from_link(link) or item_id,
+        "name": normalize_whitespace(str(source.get("title", source.get("name", "")) or "")) or link,
+        "price": price_text,
+        "link": link,
+        "image_url": normalize_vinted_image_url(str(image_url or "")),
+        "raw_text": normalize_whitespace(str(source.get("description", "") or "")),
+        "category": category,
+        "profile_item_status": "current",
+        "extracted_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _vinted_profile_item_category(source: dict) -> str:
+    """Extract the most specific public category label across wardrobe API variants."""
+    direct_values = (
+        source.get("catalog_name"), source.get("category_name"), source.get("catalog_title"),
+        source.get("category_title"), source.get("catalog"), source.get("category"),
+    )
+    for value in direct_values:
+        if isinstance(value, str) and normalize_whitespace(value):
+            return normalize_whitespace(value)
+        if isinstance(value, dict):
+            for key in ("title", "name", "label"):
+                text = normalize_whitespace(str(value.get(key, "") or ""))
+                if text:
+                    return text
+    path = source.get("catalog_path", source.get("category_path", []))
+    if isinstance(path, list):
+        for value in reversed(path):
+            if isinstance(value, str) and normalize_whitespace(value):
+                return normalize_whitespace(value)
+            if isinstance(value, dict):
+                text = normalize_whitespace(str(value.get("title", value.get("name", "")) or ""))
+                if text:
+                    return text
+    # Some wardrobe responses expose only a catalog id. Keep a conservative
+    # product-name fallback so category filtering remains usable while the
+    # profile's richer catalog labels are unavailable.
+    title = normalize_whitespace(str(source.get("title", source.get("name", "")) or "")).casefold()
+    inferred = (
+        (("charm", "ciondolo", "bedel"), "Charms e ciondoli"),
+        (("braccial", "bracelet", "bangle"), "Braccialetti"),
+        (("collan", "necklace", "catena"), "Collane"),
+        (("anello", "ring"), "Anelli"),
+        (("orecchin", "earring"), "Orecchini"),
+        (("spilla", "brooch", "pin"), "Spille"),
+    )
+    for keywords, label in inferred:
+        if any(keyword in title for keyword in keywords):
+            return label
+    return "Altro"
+
+
+def _normalize_vinted_profile_categories(value: object) -> list[str]:
+    labels = [normalize_whitespace(part) for part in re.split(r"[,\n;]+", str(value or ""))]
+    return list(dict.fromkeys(label for label in labels if label and label.casefold() not in {"all", "tutte", "tutti"}))
+
+
+def _filter_vinted_profile_rows_by_category(rows: list[dict], categories: list[str]) -> list[dict]:
+    expected = {label.casefold() for label in categories}
+    return [
+        row for row in rows
+        if normalize_whitespace(str(row.get("category", "") or "")).casefold() in expected
+    ]
 
 
 def _read_vinted_profile_items(driver: Driver) -> list[dict]:
@@ -707,15 +1150,25 @@ return links.map((link) => {
     || link;
   const title = root.querySelector('[data-testid*="description-title"], [data-testid*="item-title"], [data-testid*="description-preview"]');
   const price = root.querySelector('[data-testid*="price-text"], [data-testid*="item-price"]');
-  const image = root.querySelector('img[alt]');
-  const imageSrc = image ? (
-    image.currentSrc ||
-    image.src ||
-    image.getAttribute('src') ||
-    image.getAttribute('data-src') ||
-    ((image.getAttribute('srcset') || '').split(',')[0] || '').trim().split(/\\s+/)[0] ||
-    ''
-  ) : '';
+  // Product-card links for text and photo can be siblings rather than one
+  // containing the other. Search the card plus its near ancestors.
+  const cardScopes = [root, link];
+  let ancestor = link.parentElement;
+  for (let index = 0; ancestor && index < 6; index += 1, ancestor = ancestor.parentElement) cardScopes.push(ancestor);
+  const firstMatch = (selector) => cardScopes.map((scope) => scope.querySelector(selector)).find(Boolean);
+  // Product-card image markup varies: not every image has an alt attribute
+  // and lazy-loaded cards can expose only data-srcset/srcset.
+  const image = firstMatch('img, picture source, source');
+  const imageUrl = (node) => {
+    if (!node) return '';
+    const srcset = node.getAttribute('srcset') || node.getAttribute('data-srcset') || '';
+    return node.currentSrc || node.src || node.getAttribute('src') || node.getAttribute('data-src') ||
+      ((srcset.split(',')[0] || '').trim().split(/\\s+/)[0]) || '';
+  };
+  const styleNode = firstMatch('[style*="background-image"], [style*="background: url"], [style*="background:url"]')
+    || cardScopes.find((scope) => /url\\(/i.test(scope.getAttribute('style') || ''));
+  const styleUrl = styleNode ? ((styleNode.getAttribute('style') || '').match(/url\\(["']?([^"')]+)["']?\\)/i) || [])[1] || '' : '';
+  const imageSrc = imageUrl(image) || styleUrl;
   return {
     link: link.href || link.getAttribute('href') || '',
     title: clean(title ? (title.innerText || title.textContent) : (link.getAttribute('aria-label') || link.getAttribute('title') || '')),
@@ -763,30 +1216,82 @@ def _scroll_vinted_profile(driver: Driver) -> dict[str, object]:
         payload = driver.run_js(
             """
 const root = document.scrollingElement || document.documentElement || document.body;
-const before = window.scrollY || root.scrollTop || 0;
-const viewport = window.innerHeight || root.clientHeight || 0;
+const cards = [...document.querySelectorAll('a[href*="/items/"]')];
+const lastCard = cards[cards.length - 1] || null;
+const findScrollableAncestor = (element) => {
+  let node = element ? element.parentElement : null;
+  while (node && node !== document.body) {
+    const style = window.getComputedStyle(node);
+    if (node.scrollHeight > node.clientHeight + 24 && /(auto|scroll|overlay)/.test(style.overflowY || '')) return node;
+    node = node.parentElement;
+  }
+  return null;
+};
+const scrollContainer = findScrollableAncestor(lastCard);
+const before = scrollContainer ? scrollContainer.scrollTop : (window.scrollY || root.scrollTop || 0);
+const viewport = scrollContainer ? scrollContainer.clientHeight : (window.innerHeight || root.clientHeight || 0);
 const heightBefore = Math.max(
   root.scrollHeight || 0,
   document.body ? document.body.scrollHeight || 0 : 0,
   document.documentElement ? document.documentElement.scrollHeight || 0 : 0
 );
-const target = Math.max(0, heightBefore - viewport);
-window.scrollTo({ top: target, behavior: 'instant' });
-root.scrollTop = target;
-window.dispatchEvent(new Event('scroll'));
-document.dispatchEvent(new Event('scroll'));
-const after = window.scrollY || root.scrollTop || 0;
+// A direct jump to the bottom does not trigger every lazy-load threshold on
+// Vinted profile grids.  Move roughly one viewport at a time instead.
+const maxScrollBefore = scrollContainer
+  ? Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+  : Math.max(0, heightBefore - viewport);
+const step = Math.max(640, Math.floor(viewport * 0.85));
+const target = Math.min(maxScrollBefore, before + step);
+if (scrollContainer) {
+  scrollContainer.scrollTo({ top: target, behavior: 'smooth' });
+  scrollContainer.dispatchEvent(new Event('scroll', { bubbles: true }));
+  scrollContainer.dispatchEvent(new WheelEvent('wheel', { deltaY: step, bubbles: true, cancelable: true }));
+} else {
+  // Chrome's minimized automation window does not advance smooth scrolling.
+  // Use a deterministic move, then give the page the required three seconds.
+  window.scrollTo({ top: target, behavior: 'instant' });
+  root.scrollTop = target;
+  window.dispatchEvent(new Event('scroll'));
+  document.dispatchEvent(new Event('scroll'));
+  // The observer used by some grids reacts to an actual wheel event rather
+  // than to scrollTop alone.
+  window.dispatchEvent(new WheelEvent('wheel', { deltaY: step, bubbles: true, cancelable: true }));
+}
+const after = scrollContainer ? scrollContainer.scrollTop : (window.scrollY || root.scrollTop || 0);
 const heightAfter = Math.max(
   root.scrollHeight || 0,
   document.body ? document.body.scrollHeight || 0 : 0,
   document.documentElement ? document.documentElement.scrollHeight || 0 : 0
 );
-const maxScroll = Math.max(0, heightAfter - viewport);
+const maxScroll = scrollContainer
+  ? Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+  : Math.max(0, heightAfter - viewport);
 const atBottom = after >= maxScroll - 8;
-if (atBottom && maxScroll > 0) {
-  window.scrollBy(0, -Math.min(240, viewport * 0.25));
-  window.scrollTo({ top: maxScroll, behavior: 'instant' });
-  root.scrollTop = maxScroll;
+const isVisible = (element) => {
+  const style = window.getComputedStyle(element);
+  return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+};
+const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+// Some profile layouts expose the next group with a button instead of an
+// infinite grid.  Treat it as part of the same extraction loop, never as a
+// navigation action chosen by the user.
+let loadMoreClicked = false;
+if (atBottom) {
+  const control = [...document.querySelectorAll('button, a, [role="button"]')].find((element) => {
+    if (!isVisible(element) || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+    const testId = normalize(element.getAttribute('data-testid'));
+    const label = normalize(element.getAttribute('aria-label'));
+    const text = normalize(element.innerText || element.textContent);
+    const value = `${testId} ${label} ${text}`;
+    return /load[ -]?more|show[ -]?more|mostra( altri| altro| di più| di piu)|vedi( altri| altro| di più| di piu)|carica( altri| altro| di più| di piu)|next page|pagina successiva/.test(value);
+  });
+  if (control) {
+    try {
+      control.scrollIntoView({ block: 'center', inline: 'nearest' });
+      control.click();
+      loadMoreClicked = true;
+    } catch (error) {}
+  }
 }
 return {
   before,
@@ -794,8 +1299,10 @@ return {
   height: heightAfter,
   viewport,
   max_scroll: maxScroll,
+  scroll_container: scrollContainer ? 'nested' : 'document',
   moved: Math.abs(after - before) > 2,
   at_bottom: atBottom,
+  load_more_clicked: loadMoreClicked,
 };
             """
         )

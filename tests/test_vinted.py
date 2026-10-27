@@ -50,7 +50,10 @@ from scraper_app.sources.vinted import (
 )
 from scraper_app.vinted_tabs import navigate_vinted_status_tab, restore_vinted_primary_tab
 from scraper_app.sources.vinted_deal_sales import check_due_vinted_deal_sales_with_driver
-from scraper_app.sources.vinted_profile import normalize_vinted_profile_urls
+from scraper_app.sources.vinted_profile import (
+    _read_all_vinted_profile_items_via_browser_session,
+    normalize_vinted_profile_urls,
+)
 from scraper_app.runner import run_scraper
 from scraper_app.vinted_database import (
     annotate_rows_with_vinted_offer_history,
@@ -80,6 +83,40 @@ from scraper_app.vinted_database import (
 
 
 class VintedTests(unittest.TestCase):
+    def test_profile_api_pagination_collects_all_pages(self) -> None:
+        class FakeDriver:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def run_js(self, _script: str, args: dict | None = None) -> dict:
+                if args is None:
+                    return {"csrf": "test-csrf", "anonId": "test-anon"}
+                self.calls.append(args)
+                page = 2 if "page=2" in args["endpoint"] else 1
+                start = 97 if page == 2 else 1
+                end = 98 if page == 2 else 97
+                items = [
+                    {
+                        "id": str(index),
+                        "title": f"Item {index}",
+                        "price": "10.00",
+                        "currency": "EUR",
+                        "url": f"/items/{index}-item-{index}",
+                        "photo": {"url": f"https://images.example/{index}.jpg"},
+                    }
+                    for index in range(start, end)
+                ]
+                return {
+                    "status": 200,
+                    "text": json.dumps({"items": items, "pagination": {"current_page": page, "total_pages": 2}}),
+                }
+
+        driver = FakeDriver()
+        rows = _read_all_vinted_profile_items_via_browser_session(driver, member_id="306388399", max_items=0)
+        self.assertEqual(97, len(rows))
+        self.assertEqual(2, len(driver.calls))
+        self.assertEqual("97", rows[-1]["item_id"])
+
     def test_detail_inspection_uses_separate_tab_and_restores_search_tab(self) -> None:
         search_tab = Mock()
         search_tab.target.target_id = "search-target"
@@ -515,6 +552,25 @@ class VintedTests(unittest.TestCase):
         self.assertEqual(40, partial["profile_missing_item_count"])
         self.assertEqual(0, partial["profile_gone_count"])
         self.assertEqual(0, partial["profile_new_count"])
+        self.assertEqual(1, snapshot_count)
+
+    def test_save_vinted_profile_snapshot_ignores_empty_read_after_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            profile_url = "https://www.vinted.it/member/167398536"
+            rows = [
+                {"link": f"https://www.vinted.it/items/{1000 + index}-item-{index}", "name": f"Item {index}"}
+                for index in range(3)
+            ]
+            save_vinted_profile_snapshot(profile_url, rows, db_path=db_path)
+            empty = save_vinted_profile_snapshot(profile_url, [], db_path=db_path)
+            with closing(sqlite3.connect(db_path)) as connection:
+                snapshot_count = connection.execute("SELECT COUNT(*) FROM vinted_profile_snapshots").fetchone()[0]
+
+        self.assertTrue(empty["profile_snapshot_incomplete"])
+        self.assertTrue(empty["profile_empty_response_guard"])
+        self.assertFalse(empty["profile_snapshot_saved"])
+        self.assertEqual(0, empty["profile_gone_count"])
         self.assertEqual(1, snapshot_count)
 
     def test_search_url_and_term(self) -> None:

@@ -122,6 +122,8 @@ def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
             discord_profile_report=bool(kwargs.get("discord_profile_report", False)),
             discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
             daily_report_hour=int(kwargs.get("daily_report_hour", 10) or 10),
+            check_listing_statuses=bool(kwargs.get("check_listing_statuses", False)),
+            profile_categories=str(kwargs.get("profile_categories", "") or ""),
         )
 
     if source == "vinted_deal_sales":
@@ -543,6 +545,7 @@ def _run_vinted_continuous_monitoring(**kwargs) -> ScrapeOutcome:
                     discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
                     daily_report_hour=int(kwargs.get("daily_report_hour", 10) or 10),
                     send_daily_report=False,
+                    profile_categories=str(kwargs.get("profile_categories", "") or ""),
                 )
                 profile_meta = dict(profile_outcome.meta)
                 for row in profile_outcome.rows:
