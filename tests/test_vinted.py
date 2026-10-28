@@ -51,7 +51,10 @@ from scraper_app.sources.vinted import (
 from scraper_app.vinted_tabs import navigate_vinted_status_tab, restore_vinted_primary_tab
 from scraper_app.sources.vinted_deal_sales import check_due_vinted_deal_sales_with_driver
 from scraper_app.sources.vinted_profile import (
+    _check_profile_listing_status,
     _read_all_vinted_profile_items_via_browser_session,
+    _vinted_profile_rows_missing_from_current,
+    _wait_for_vinted_profile_dom_ready,
     normalize_vinted_profile_urls,
 )
 from scraper_app.runner import run_scraper
@@ -66,6 +69,7 @@ from scraper_app.vinted_database import (
     load_vinted_sold_deal_identity_keys,
     load_vinted_known_item_keys,
     load_vinted_profile_daily_changes,
+    load_vinted_profile_known_items,
     load_due_vinted_deal_sale_checks,
     load_vinted_deal_sales,
     load_vinted_submitted_offer_keys,
@@ -422,6 +426,36 @@ class VintedTests(unittest.TestCase):
             ),
         )
 
+    def test_profile_missing_rows_include_unchecked_gone_and_skip_verified_terminal(self) -> None:
+        current = [{"link": "https://www.vinted.it/items/1-active"}]
+        history = [
+            {"link": "https://www.vinted.it/items/1-active", "profile_item_status": "still_active"},
+            {"link": "https://www.vinted.it/items/2-gone", "profile_item_status": "gone"},
+            {"link": "https://www.vinted.it/items/3-gone-checked", "profile_item_status": "gone", "profile_page_status": "active", "profile_status_checked_at": "2026-10-28T10:00:00"},
+            {"link": "https://www.vinted.it/items/4-sold", "profile_item_status": "sold"},
+            {"link": "https://www.vinted.it/items/5-unavailable", "profile_item_status": "unavailable"},
+        ]
+        self.assertEqual(
+            ["https://www.vinted.it/items/2-gone"],
+            [row["link"] for row in _vinted_profile_rows_missing_from_current(current_rows=current, historical_rows=history)],
+        )
+
+    def test_profile_listing_check_marks_missing_live_listing_gone_not_sold(self) -> None:
+        class FakeDriver:
+            def get(self, *_args, **_kwargs):
+                return None
+
+            def run_js(self, *_args, **_kwargs):
+                return {"sold": False, "page_not_found": False, "current_url": "https://www.vinted.it/items/123-charm", "published_text": ""}
+
+        checked = _check_profile_listing_status(
+            FakeDriver(),
+            [{"link": "https://www.vinted.it/items/123-charm", "item_id": "123"}],
+            page_settle_seconds=0.25,
+        )
+        self.assertEqual("gone", checked[0]["profile_item_status"])
+        self.assertEqual("active", checked[0]["profile_page_status"])
+
     def test_save_vinted_profile_snapshot_tracks_new_and_gone_items(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "scraper.db"
@@ -485,6 +519,45 @@ class VintedTests(unittest.TestCase):
         self.assertEqual(1, sold["profile_sold_count"])
         self.assertEqual(("sold", 0), tuple(record))
 
+    def test_save_profile_missing_live_listing_as_gone_and_preserves_detail_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            profile_url = "https://www.vinted.it/member/262102939"
+            save_vinted_profile_snapshot(
+                profile_url,
+                [
+                    {"link": "https://www.vinted.it/items/100-a", "name": "A", "price": "10,00 €"},
+                    {"link": "https://www.vinted.it/items/200-b", "name": "B", "price": "20,00 €"},
+                ],
+                db_path=db_path,
+            )
+            result = save_vinted_profile_snapshot(
+                profile_url,
+                [
+                    {"link": "https://www.vinted.it/items/200-b", "name": "B", "price": "20,00 €"},
+                    {
+                        "link": "https://www.vinted.it/items/100-a",
+                        "name": "A",
+                        "price": "10,00 €",
+                        "profile_item_status": "gone",
+                        "profile_page_status": "active",
+                        "profile_status_checked_at": "2026-10-29T10:00:00",
+                    },
+                ],
+                db_path=db_path,
+            )
+            with closing(sqlite3.connect(db_path)) as connection:
+                record = connection.execute(
+                    "SELECT status, present, snapshot_json FROM vinted_profile_snapshot_items WHERE snapshot_id = ? AND item_id = '100'",
+                    (result["profile_snapshot_id"],),
+                ).fetchone()
+
+        self.assertEqual("gone", record[0])
+        self.assertEqual(0, record[1])
+        payload = json.loads(record[2])
+        self.assertEqual("active", payload["profile_page_status"])
+        self.assertEqual("2026-10-29T10:00:00", payload["profile_status_checked_at"])
+
     def test_load_vinted_profile_daily_changes_reads_new_and_gone_for_day(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "scraper.db"
@@ -540,19 +613,35 @@ class VintedTests(unittest.TestCase):
             partial_rows = full_rows[:20]
 
             save_vinted_profile_snapshot(profile_url, full_rows, db_path=db_path)
+            # Emulate a legacy false-empty snapshot that marked all items gone.
+            with closing(sqlite3.connect(db_path)) as connection:
+                cursor = connection.execute(
+                    "INSERT INTO vinted_profile_snapshots (member_id, profile_url, checked_at, item_count, new_count, gone_count, still_count) VALUES (?, ?, ?, 0, 0, ?, 0)",
+                    ("167398536", profile_url, "2026-10-28T10:00:00", len(full_rows)),
+                )
+                legacy_snapshot_id = int(cursor.lastrowid)
+                connection.executemany(
+                    "INSERT INTO vinted_profile_snapshot_items (snapshot_id,member_id,profile_url,item_link,item_id,item_name,price_text,image_url,status,present,snapshot_json) VALUES (?, ?, ?, ?, ?, ?, '', '', 'gone', 0, '{}')",
+                    [(legacy_snapshot_id, "167398536", profile_url, row["link"], row["link"].split("/")[-1].split("-")[0], row["name"]) for row in full_rows],
+                )
+                connection.commit()
             partial = save_vinted_profile_snapshot(profile_url, partial_rows, db_path=db_path)
+            known = load_vinted_profile_known_items(profile_url, db_path=db_path)
 
             with closing(sqlite3.connect(db_path)) as connection:
                 snapshot_count = connection.execute("SELECT COUNT(*) FROM vinted_profile_snapshots").fetchone()[0]
 
         self.assertTrue(partial["profile_snapshot_incomplete"])
         self.assertFalse(partial["profile_snapshot_saved"])
-        self.assertEqual(20, partial["profile_item_count"])
+        self.assertEqual(60, partial["profile_item_count"])
         self.assertEqual(60, partial["profile_previous_item_count"])
         self.assertEqual(40, partial["profile_missing_item_count"])
         self.assertEqual(0, partial["profile_gone_count"])
         self.assertEqual(0, partial["profile_new_count"])
-        self.assertEqual(1, snapshot_count)
+        self.assertEqual(2, snapshot_count)
+        self.assertEqual(60, len(partial["profile_current_rows"]))
+        self.assertTrue(all(row["profile_item_status"] == "still_active" for row in partial["profile_current_rows"]))
+        self.assertEqual(60, len(known))
 
     def test_save_vinted_profile_snapshot_ignores_empty_read_after_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1014,11 +1103,27 @@ class VintedTests(unittest.TestCase):
                 "offerText": "",
                 "bodyLength": 220,
             },
+            {
+                "readyState": "complete",
+                "title": "Charm Pandora",
+                "rawPriceText": "12,00 €",
+                "offerText": "",
+                "bodyLength": 220,
+            },
         ]
 
         result = _wait_for_vinted_detail_page_ready(driver, max_wait_seconds=3.0)
 
         self.assertTrue(result)
+        self.assertEqual(3, driver.run_js.call_count)
+        self.assertEqual(2, mocked_sleep.call_count)
+
+    @patch("scraper_app.sources.vinted_profile.time.sleep")
+    def test_profile_dom_wait_requires_two_stable_observations(self, mocked_sleep) -> None:
+        driver = Mock()
+        driver.run_js.side_effect = ["complete|8|one|two|3", "complete|8|one|two|3"]
+
+        self.assertTrue(_wait_for_vinted_profile_dom_ready(driver, max_wait_seconds=0))
         self.assertEqual(2, driver.run_js.call_count)
         self.assertEqual(1, mocked_sleep.call_count)
 
@@ -1823,6 +1928,7 @@ class VintedTests(unittest.TestCase):
         self.assertEqual(["profiles", "competitors"], [row["continuous_component"] for row in outcome.rows])
         self.assertEqual(0, mocked_profiles.call_args.kwargs["interval_seconds"])
         self.assertFalse(mocked_profiles.call_args.kwargs["send_daily_report"])
+        self.assertTrue(mocked_profiles.call_args.kwargs["check_listing_statuses"])
         self.assertEqual("competitor_discovery", mocked_scraper.call_args.kwargs["run_kind"])
         self.assertTrue(mocked_scraper.call_args.kwargs["skip_login_required"])
         self.assertFalse(mocked_scraper.call_args.kwargs["auto_submit_offers"])
@@ -1855,6 +1961,7 @@ class VintedTests(unittest.TestCase):
         )
 
         self.assertEqual(11, mocked_monitor.call_args.kwargs["daily_report_hour"])
+        self.assertTrue(mocked_monitor.call_args.kwargs["check_listing_statuses"])
 
     def test_competitor_status_classification_thresholds(self) -> None:
         self.assertEqual(

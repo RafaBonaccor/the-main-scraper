@@ -404,8 +404,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vinted_profile_parser.add_argument(
         "--check-listing-statuses",
-        action="store_true",
-        help="Open every current listing and record only explicit Sold states before saving the snapshot.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Visit profile-missing listings and verify their detail-page state (default: enabled).",
     )
     _add_orchestrator_arguments(vinted_profile_parser)
     _add_browser_arguments(vinted_profile_parser)

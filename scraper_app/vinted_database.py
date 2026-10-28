@@ -1836,12 +1836,12 @@ def save_vinted_profile_snapshot(
     current_links = {
         str(row.get("link", "") or "")
         for row in normalized_rows
-        if str(row.get("profile_item_status", "") or "").lower() not in {"sold", "unavailable"}
+        if str(row.get("profile_item_status", "") or "").lower() not in {"sold", "unavailable", "gone"}
     }
     active_links = {
         str(row.get("link", "") or "")
         for row in normalized_rows
-        if str(row.get("profile_item_status", "") or "").lower() not in {"sold", "unavailable", "unknown"}
+        if str(row.get("profile_item_status", "") or "").lower() not in {"sold", "unavailable", "unknown", "gone"}
     }
     current_links.discard("")
     sold_links.discard("")
@@ -1855,7 +1855,7 @@ def save_vinted_profile_snapshot(
                 """
                 SELECT id, item_count
                 FROM vinted_profile_snapshots
-                WHERE member_id = ? AND profile_url = ?
+                WHERE member_id = ? AND profile_url = ? AND item_count > 0
                 ORDER BY checked_at DESC, id DESC
                 LIMIT 1
                 """,
@@ -1896,30 +1896,60 @@ def save_vinted_profile_snapshot(
                 )
             )
             if incomplete_snapshot:
+                preserved_rows: list[dict] = []
+                if previous_snapshot is not None:
+                    previous_records = connection.execute(
+                        """
+                        SELECT item_link, item_id, item_name, price_text, image_url, status, snapshot_json
+                        FROM vinted_profile_snapshot_items
+                        WHERE snapshot_id = ? AND present = 1
+                        ORDER BY id
+                        """,
+                        (int(previous_snapshot["id"]),),
+                    ).fetchall()
+                    for record in previous_records:
+                        try:
+                            payload = json.loads(str(record["snapshot_json"] or "{}"))
+                        except (TypeError, json.JSONDecodeError):
+                            payload = {}
+                        row = dict(payload) if isinstance(payload, dict) else {}
+                        row.update(
+                            {
+                                "source": "vinted_profile",
+                                "profile_url": normalized_profile_url,
+                                "member_id": member_id,
+                                "link": str(record["item_link"] or ""),
+                                "item_id": str(record["item_id"] or extract_vinted_item_id_from_link(record["item_link"])),
+                                "name": str(record["item_name"] or row.get("name", "")),
+                                "price": str(record["price_text"] or row.get("price", "")),
+                                "image_url": str(record["image_url"] or row.get("image_url", "")),
+                                "profile_item_status": "still_active",
+                            }
+                        )
+                        preserved_rows.append(row)
                 history_by_link = _load_vinted_profile_item_history(
                     connection,
                     member_id=member_id,
                     profile_url=normalized_profile_url,
-                    links=current_links,
+                    links=previous_links,
                     sold_at=snapshot_at,
                 )
-                for row in normalized_rows:
+                for row in preserved_rows:
                     link = str(row.get("link", "") or "")
                     history = history_by_link.get(link, {})
-                    row["profile_item_status"] = "still_active" if link in previous_links else "current"
                     row["profile_first_seen_at"] = str(history.get("first_seen_at", "") or snapshot_at)
-                    row["profile_last_seen_at"] = str(history.get("last_seen_at", "") or snapshot_at)
+                    row["profile_last_seen_at"] = str(history.get("last_seen_at", "") or row.get("profile_last_seen_at", "") or snapshot_at)
                 return {
                     "db_path": str(path),
                     "profile_snapshot_id": "",
                     "profile_checked_at": snapshot_at,
                     "profile_member_id": member_id,
-                    "profile_item_count": len(active_links),
+                    "profile_item_count": len(preserved_rows) if previous_snapshot is not None else len(active_links),
                     "profile_new_count": 0,
                     "profile_gone_count": 0,
                     "profile_sold_count": sum(1 for row in normalized_rows if row.get("profile_item_status") == "sold"),
-                    "profile_still_count": len(current_links & previous_links),
-                    "profile_current_rows": normalized_rows,
+                    "profile_still_count": len(preserved_rows) if previous_snapshot is not None else len(current_links & previous_links),
+                    "profile_current_rows": preserved_rows if previous_snapshot is not None else normalized_rows,
                     "profile_gone_rows": [],
                     "profile_snapshot_incomplete": True,
                     "profile_snapshot_saved": False,
@@ -1931,7 +1961,12 @@ def save_vinted_profile_snapshot(
                 }
 
             new_links = current_links - previous_links
-            gone_links = previous_links - current_links - sold_links - unavailable_links
+            explicit_gone_links = {
+                str(row.get("link", "") or "")
+                for row in normalized_rows
+                if str(row.get("profile_item_status", "") or "").lower() == "gone"
+            }
+            gone_links = (previous_links - current_links - sold_links - unavailable_links) | explicit_gone_links
             still_links = current_links & previous_links
             history_by_link = _load_vinted_profile_item_history(
                 connection,
@@ -1978,6 +2013,7 @@ def save_vinted_profile_snapshot(
                 history = history_by_link.get(link, {})
                 if status in {"gone", "sold", "unavailable"}:
                     row = {
+                        **row,
                         "source": "vinted_profile",
                         "profile_url": normalized_profile_url,
                         "member_id": member_id,
@@ -1989,9 +2025,9 @@ def save_vinted_profile_snapshot(
                         "profile_item_status": status,
                         "profile_first_seen_at": str(history.get("first_seen_at", "") or ""),
                         "profile_last_seen_at": str(history.get("last_seen_at", "") or ""),
-                        "profile_sold_after_seconds": history.get("sold_after_seconds"),
-                        "profile_sold_after_text": str(history.get("sold_after_text", "") or ""),
-                        "profile_sold_at": snapshot_at if status == "sold" else "",
+                        "profile_sold_after_seconds": row.get("profile_sold_after_seconds", history.get("sold_after_seconds")),
+                        "profile_sold_after_text": str(row.get("profile_sold_after_text", "") or history.get("sold_after_text", "") or ""),
+                        "profile_sold_at": str(row.get("profile_sold_at", "") or (snapshot_at if status == "sold" else "")),
                         "extracted_at": snapshot_at,
                     }
                 connection.execute(
@@ -2024,7 +2060,7 @@ def save_vinted_profile_snapshot(
         link = str(row.get("link", "") or "")
         history = history_by_link.get(link, {})
         detected_status = str(row.get("profile_item_status", "") or "").lower()
-        if detected_status in {"sold", "unavailable", "unknown"}:
+        if detected_status in {"sold", "unavailable", "unknown", "gone"}:
             continue
         row["profile_item_status"] = "new" if link in new_links else "still_active"
         row["profile_first_seen_at"] = str(history.get("first_seen_at", "") or snapshot_at)
@@ -2088,7 +2124,7 @@ def load_vinted_profile_known_items(
                 SELECT psi.*, s.checked_at
                 FROM vinted_profile_snapshot_items psi
                 JOIN vinted_profile_snapshots s ON s.id = psi.snapshot_id
-                WHERE psi.member_id = ? AND psi.profile_url = ?
+                WHERE psi.member_id = ? AND psi.profile_url = ? AND s.item_count > 0
                 ORDER BY s.checked_at DESC, psi.id DESC
                 """,
                 (member_id, normalized_profile_url),
@@ -2117,6 +2153,7 @@ def load_vinted_profile_known_items(
                 "price": str(record["price_text"] or row.get("price", "")),
                 "image_url": str(record["image_url"] or row.get("image_url", "")),
                 "profile_last_seen_at": str(row.get("profile_last_seen_at", "") or record["checked_at"] or ""),
+                "profile_item_status": str(row.get("profile_item_status", "") or record["status"] or ""),
             }
         )
         rows_by_link[link] = row
@@ -2155,6 +2192,7 @@ def load_vinted_profile_daily_changes(
         JOIN vinted_profile_snapshots s ON s.id = psi.snapshot_id
         WHERE s.checked_at >= ?
           AND s.checked_at <= ?
+          AND s.item_count > 0
           AND LOWER(psi.status) IN ('new', 'gone', 'sold')
     """
     params: list[object] = [since_at, until_at]

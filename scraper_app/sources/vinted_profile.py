@@ -2,7 +2,6 @@ import time
 import json
 import os
 import re
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -10,7 +9,7 @@ from urllib.request import urlopen
 
 from botasaurus.browser import Driver, Wait, browser
 
-from ..browser_helpers import DEFAULT_COOKIE_REJECT_TEXTS, click_first_matching_text, current_page_url
+from ..browser_helpers import DEFAULT_COOKIE_REJECT_TEXTS, click_first_matching_text, current_page_url, navigate_with_retries
 from ..browser_runtime import resolve_browser_arguments, resolve_browser_profile
 from ..discord_notifications import (
     build_vinted_profile_daily_report_discord_message,
@@ -25,10 +24,12 @@ from ..utils import normalize_whitespace
 from ..vinted_database import (
     DEFAULT_VINTED_DB_PATH,
     extract_vinted_item_id_from_link,
+    format_vinted_elapsed_seconds,
     load_vinted_profile_known_items,
     load_vinted_profile_daily_changes,
     load_vinted_deal_sales,
     normalize_vinted_member_id,
+    parse_vinted_precise_listing_age_seconds,
     save_vinted_profile_snapshot,
     summarize_vinted_deal_sales,
 )
@@ -115,6 +116,55 @@ def _log_vinted_profile(message: str, **fields: object) -> None:
         print(f"[vinted-profile] {message}", flush=True)
 
 
+def _wait_for_vinted_profile_dom_ready(
+    driver: Driver,
+    *,
+    max_wait_seconds: float,
+    poll_interval_seconds: float = 0.2,
+) -> bool:
+    """Wait for a stable profile shell without waiting on every network request."""
+    deadline = time.monotonic() + max(float(max_wait_seconds or 0), 8.0)
+    poll_interval = max(float(poll_interval_seconds or 0.2), 0.05)
+    previous_signature = ""
+    stable_observations = 0
+    while True:
+        try:
+            signature = str(
+                driver.run_js(
+                    """
+const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+const h1 = clean(document.querySelector('h1')?.innerText || document.querySelector('h1')?.textContent || '');
+const notFound = /^(?:page\\s+)?not found$/i.test(h1) || /^pagina non trovata$/i.test(h1)
+  || Boolean(document.querySelector('video[poster*="error-page/notfound"], img[src*="error-page/notfound"]'));
+const links = [...document.querySelectorAll('a[href*="/items/"]')];
+const sample = links.slice(0, 6).map((node) => node.href).join('|');
+const readyState = document.readyState || '';
+const bodyLength = clean(document.body?.innerText || document.body?.textContent || '').length;
+const ready = notFound || ((readyState === 'interactive' || readyState === 'complete') && (links.length > 0 || h1 || bodyLength > 180));
+return ready ? `${notFound ? 'not-found' : readyState}|${links.length}|${sample}|${Math.floor(bodyLength / 160)}` : '';
+                    """
+                )
+                or ""
+            ).strip()
+        except Exception:
+            signature = ""
+        if signature and signature == previous_signature:
+            stable_observations += 1
+        elif signature:
+            previous_signature = signature
+            stable_observations = 1
+        else:
+            previous_signature = ""
+            stable_observations = 0
+        if stable_observations >= 2:
+            _log_vinted_profile("profile-dom-ready", stable_observations=stable_observations, signature=signature[:120])
+            return True
+        if time.monotonic() >= deadline:
+            _log_vinted_profile("profile-dom-timeout", stable_observations=stable_observations)
+            return False
+        time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.05)))
+
+
 def run_vinted_profile_monitor(
     profile_url: str,
     profile_urls: list[str] | None = None,
@@ -136,7 +186,7 @@ def run_vinted_profile_monitor(
     discord_webhook_url: str = "",
     daily_report_hour: int = 10,
     send_daily_report: bool = True,
-    check_listing_statuses: bool = False,
+    check_listing_statuses: bool = True,
     profile_categories: str = "",
 ) -> ScrapeOutcome:
     normalized_profile_urls = normalize_vinted_profile_urls(profile_urls or profile_url)
@@ -182,8 +232,9 @@ def run_vinted_profile_monitor(
                 profiles=len(normalized_profile_urls),
                 profile_url=current_profile_url,
             )
-            payload = _scrape_vinted_profile_task(
-                {
+            try:
+                payload = _scrape_vinted_profile_task(
+                    {
                     "profile_url": current_profile_url,
                     "profile_index": index,
                     "profile_count": len(normalized_profile_urls),
@@ -206,9 +257,31 @@ def run_vinted_profile_monitor(
                     "discord_webhook_url": str(discord_webhook_url or "").strip(),
                     "check_listing_statuses": bool(check_listing_statuses),
                     "profile_categories": str(profile_categories or ""),
-                },
-                reuse_driver=bool(keep_browser_open),
-            )
+                    },
+                    reuse_driver=bool(keep_browser_open),
+                )
+            except Exception as error:
+                # One inaccessible profile must never cancel the other profiles
+                # or turn a transient browser readiness issue into a failed
+                # continuous-monitoring job. No snapshot is written here, so
+                # existing active listings cannot be falsely marked as gone.
+                error_text = f"{type(error).__name__}: {error}"
+                _log_vinted_profile(
+                    "profile-task-error",
+                    cycle=cycle_index,
+                    index=index,
+                    profile_url=current_profile_url,
+                    error=error_text,
+                )
+                profile_metas.append(
+                    {
+                        "profile_url": current_profile_url,
+                        "member_id": normalize_vinted_member_id(current_profile_url),
+                        "row_count": 0,
+                        "profile_error": error_text,
+                    }
+                )
+                continue
             cycle_rows.extend(payload["rows"])
             profile_metas.append(payload["meta"])
             profile_meta = payload["meta"]
@@ -392,8 +465,36 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         member_id=member_id,
         db_path=db_path,
     )
-    driver.get(profile_url, wait=Wait.SHORT, timeout=VINTED_PROFILE_NAVIGATION_TIMEOUT_SECONDS)
-    time.sleep(min(max(float(config.get("page_settle_seconds", 3.0) or 0), 0.5), 5.0))
+    navigated = navigate_with_retries(
+        driver,
+        profile_url,
+        wait=Wait.SHORT,
+        timeout_seconds=VINTED_PROFILE_NAVIGATION_TIMEOUT_SECONDS,
+    )
+    navigation_url = str(current_page_url(driver) or "")
+    if not navigated and member_id and normalize_vinted_member_id(navigation_url) == member_id:
+        # Vinted may canonicalize /member/<id> to /member/<id>-<slug>;
+        # the shared URL matcher treated that redirect as a failed navigation.
+        navigated = True
+        _log_vinted_profile(
+            "profile-navigation-canonical-redirect-accepted",
+            member_id=member_id,
+            requested_url=profile_url,
+            current_url=navigation_url,
+        )
+    if not navigated:
+        _log_vinted_profile(
+            "profile-navigation-failed",
+            member_id=member_id,
+            requested_url=profile_url,
+            current_url=navigation_url,
+        )
+        raise RuntimeError("profile navigation did not reach the requested URL")
+    if not _wait_for_vinted_profile_dom_ready(
+        driver,
+        max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
+    ):
+        raise TimeoutError("profile DOM did not become stable")
     cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
     if cookie_action:
         time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
@@ -451,14 +552,35 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         missing_identity_before=missing_identity_before,
     )
     rows = _attach_vinted_profile_identity(rows, profile_url=profile_url, member_id=member_id)
-    # Regular monitoring stays profile-only.  The explicit detail action can
-    # opt into visiting every saved listing and records "sold" only when the
-    # listing page itself shows the platform's Sold state.
+    # Verify profile-missing listings on their detail pages for both owned and
+    # competitor profiles. A missing profile card alone is never proof of sale.
     if bool(config.get("check_listing_statuses", False)):
         known_rows = load_vinted_profile_known_items(profile_url=profile_url, db_path=db_path)
         if category_filters:
             known_rows = _filter_vinted_profile_rows_by_category(known_rows, category_filters)
         missing_rows = _vinted_profile_rows_missing_from_current(current_rows=rows, historical_rows=known_rows)
+        current_unique = {str(row.get("link", "") or "").strip() for row in rows if str(row.get("link", "") or "").strip()}
+        historical_unique = {str(row.get("link", "") or "").strip() for row in known_rows if str(row.get("link", "") or "").strip()}
+        likely_incomplete = bool(
+            historical_unique
+            and (
+                not current_unique
+                or (
+                    len(historical_unique) >= 12
+                    and len(historical_unique - current_unique) >= max(8, int(len(historical_unique) * 0.25))
+                    and len(historical_unique - current_unique) / len(historical_unique) >= 0.35
+                )
+            )
+        )
+        if likely_incomplete:
+            _log_vinted_profile(
+                "listing-status-check-skipped-incomplete-profile-read",
+                member_id=member_id,
+                current_items=len(current_unique),
+                historical_items=len(historical_unique),
+                candidate_missing=len(missing_rows),
+            )
+            missing_rows = []
         _log_vinted_profile(
             "listing-status-check-requested",
             member_id=member_id,
@@ -466,12 +588,8 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
             historical_items=len(known_rows),
             missing_items=len(missing_rows),
         )
-        # The profile API already establishes that these IDs are still live;
-        # opening them again would just waste time and increase rate-limit
-        # risk. Only visit items missing from the new complete profile set to
-        # distinguish an explicit Sold page from a removed/unavailable one.
         if missing_rows:
-            checked_missing_rows = _check_owned_profile_listing_status(
+            checked_missing_rows = _check_profile_listing_status(
                 driver,
                 missing_rows,
                 page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
@@ -495,6 +613,17 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         rows=rows,
         db_path=db_path,
     )
+    if bool(snapshot_meta.get("profile_snapshot_incomplete")):
+        # Keep the last complete inventory visible when this read was empty or
+        # incomplete. The DB intentionally retains the older trusted snapshot.
+        rows = list(snapshot_meta.get("profile_current_rows", rows) or [])
+        _log_vinted_profile(
+            "incomplete-read-preserved-last-complete-inventory",
+            member_id=member_id,
+            displayed_rows=len(rows),
+            previous_count=snapshot_meta.get("profile_previous_item_count", 0),
+            missing_count=snapshot_meta.get("profile_missing_item_count", 0),
+        )
     _log_vinted_profile(
         "snapshot-saved",
         profile_url=profile_url,
@@ -547,33 +676,14 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
     return {"rows": output_rows, "meta": meta}
 
 
-def _is_registered_owned_profile(db_path: str, member_id: str) -> bool:
-    """Only detail-check our own inventory; competitor scans stay lightweight."""
-    if not member_id:
-        return False
-    try:
-        with sqlite3.connect(f"file:{Path(db_path).expanduser().resolve()}?mode=ro", uri=True) as connection:
-            exists = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vinted_owned_profiles'"
-            ).fetchone()
-            if not exists:
-                return False
-            return connection.execute(
-                "SELECT 1 FROM vinted_owned_profiles WHERE member_id=? AND active=1 LIMIT 1",
-                (member_id,),
-            ).fetchone() is not None
-    except (OSError, sqlite3.Error):
-        return False
-
-
-def _check_owned_profile_listing_status(
+def _check_profile_listing_status(
     driver: Driver,
     rows: list[dict],
     *,
     page_settle_seconds: float,
 ) -> list[dict]:
     checked_rows: list[dict] = []
-    _log_vinted_profile("owned-item-status-check-start", items=len(rows))
+    _log_vinted_profile("profile-missing-item-status-check-start", items=len(rows))
     for index, row in enumerate(rows, start=1):
         link = str(row.get("link", "") or "").strip()
         enriched = dict(row)
@@ -594,11 +704,31 @@ def _check_owned_profile_listing_status(
             elif item_id and item_id not in current_url:
                 state = "unknown"
             else:
-                state = "active"
+                # The page is still live, but the item is absent from the
+                # seller's profile: retain it as profile-gone, not sold.
+                state = "gone"
             enriched["profile_item_status"] = state
+            enriched["profile_page_status"] = "active" if state == "gone" else state
             enriched["profile_status_checked_at"] = datetime.now().isoformat(timespec="seconds")
+            if state == "sold":
+                listing_age_text = str(status.get("published_text", "") or "").strip()
+                listing_age_seconds = parse_vinted_precise_listing_age_seconds(listing_age_text)
+                if listing_age_seconds is not None:
+                    enriched["profile_sold_after_seconds"] = listing_age_seconds
+                    enriched["profile_sold_after_text"] = format_vinted_elapsed_seconds(listing_age_seconds)
+                    enriched["profile_sold_duration_source"] = "listing_age"
+                else:
+                    first_seen = str(enriched.get("profile_first_seen_at", "") or "")
+                    try:
+                        elapsed = max(int((datetime.now() - datetime.fromisoformat(first_seen)).total_seconds()), 0)
+                    except ValueError:
+                        elapsed = 0
+                    enriched["profile_sold_after_seconds"] = elapsed
+                    enriched["profile_sold_after_text"] = format_vinted_elapsed_seconds(elapsed)
+                    enriched["profile_sold_duration_source"] = "profile_first_seen"
+                enriched["profile_sold_at"] = datetime.now().isoformat(timespec="seconds")
             _log_vinted_profile(
-                "owned-item-status-checked",
+                "profile-missing-item-status-checked",
                 index=index,
                 total=len(rows),
                 item_id=enriched.get("item_id", ""),
@@ -608,13 +738,16 @@ def _check_owned_profile_listing_status(
         except Exception as exc:
             # A failed navigation is not evidence that an item sold or disappeared.
             enriched["profile_item_status"] = "unknown"
-            _log_vinted_profile("owned-item-status-error", index=index, item_id=enriched.get("item_id", ""), error=exc)
+            _log_vinted_profile("profile-missing-item-status-error", index=index, item_id=enriched.get("item_id", ""), error=exc)
         checked_rows.append(enriched)
     _log_vinted_profile(
-        "owned-item-status-check-finished",
+        "profile-missing-item-status-check-finished",
         checked=len(checked_rows),
         sold=sum(row.get("profile_item_status") == "sold" for row in checked_rows),
-        active=sum(row.get("profile_item_status") == "active" for row in checked_rows),
+        live_but_missing=sum(
+            row.get("profile_item_status") == "gone" and row.get("profile_page_status") == "active"
+            for row in checked_rows
+        ),
         unresolved=sum(row.get("profile_item_status") in {"unknown", "unavailable"} for row in checked_rows),
     )
     return checked_rows
@@ -642,7 +775,10 @@ def _vinted_profile_rows_missing_from_current(
     missing_by_link: dict[str, dict] = {}
     for row in historical_rows:
         link = str(row.get("link", "") or "").strip()
-        if link and link not in current_links:
+        status = str(row.get("profile_item_status", "") or "").strip().lower()
+        page_status = str(row.get("profile_page_status", "") or "").strip().lower()
+        already_detail_checked = bool(row.get("profile_status_checked_at")) and page_status in {"active", "sold", "unavailable"}
+        if link and link not in current_links and status not in {"sold", "unavailable"} and not already_detail_checked:
             missing_by_link.setdefault(link, dict(row))
     return list(missing_by_link.values())
 
