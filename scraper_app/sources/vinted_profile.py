@@ -26,6 +26,7 @@ from ..vinted_database import (
     extract_vinted_item_id_from_link,
     format_vinted_elapsed_seconds,
     load_vinted_profile_known_items,
+    load_vinted_profile_latest_snapshot_items,
     load_vinted_profile_daily_changes,
     load_vinted_deal_sales,
     normalize_vinted_member_id,
@@ -529,16 +530,6 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
     if len(paged_rows) > len(rows):
         rows = paged_rows
     category_filters = _normalize_vinted_profile_categories(config.get("profile_categories", ""))
-    if category_filters:
-        before_category_filter = len(rows)
-        rows = _filter_vinted_profile_rows_by_category(rows, category_filters)
-        _log_vinted_profile(
-            "profile-category-filter",
-            member_id=member_id,
-            categories=", ".join(category_filters),
-            before=before_category_filter,
-            after=len(rows),
-        )
     missing_identity_before = sum(
         1
         for row in rows
@@ -556,11 +547,51 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
     # competitor profiles. A missing profile card alone is never proof of sale.
     if bool(config.get("check_listing_statuses", False)):
         known_rows = load_vinted_profile_known_items(profile_url=profile_url, db_path=db_path)
+        latest_snapshot_rows = load_vinted_profile_latest_snapshot_items(profile_url=profile_url, db_path=db_path)
+        # Compare against the last complete inventory, not every listing ever
+        # observed. Also carry forward unresolved items already marked gone:
+        # otherwise a later snapshot can overwrite the inventory before their
+        # detail page is checked.
+        missing_rows = _vinted_profile_rows_missing_from_current(
+            current_rows=rows,
+            historical_rows=latest_snapshot_rows,
+        )
+        current_links = {
+            str(row.get("link", "") or "").strip()
+            for row in rows
+            if str(row.get("link", "") or "").strip()
+        }
+        pending_gone_rows = [
+            row
+            for row in known_rows
+            if str(row.get("profile_item_status", "") or "").strip().lower() == "gone"
+            and not str(row.get("profile_status_checked_at", "") or "").strip()
+            and str(row.get("link", "") or "").strip() not in current_links
+        ]
         if category_filters:
-            known_rows = _filter_vinted_profile_rows_by_category(known_rows, category_filters)
-        missing_rows = _vinted_profile_rows_missing_from_current(current_rows=rows, historical_rows=known_rows)
+            pending_gone_rows = _filter_vinted_profile_rows_by_category(pending_gone_rows, category_filters)
+        missing_by_link = {
+            str(row.get("link", "") or "").strip(): dict(row)
+            for row in [*missing_rows, *pending_gone_rows]
+            if str(row.get("link", "") or "").strip()
+        }
+        missing_rows = list(missing_by_link.values())
+        if category_filters:
+            before_category_filter = len(missing_rows)
+            missing_rows = _filter_vinted_profile_rows_by_category(missing_rows, category_filters)
+            _log_vinted_profile(
+                "profile-status-category-filter",
+                member_id=member_id,
+                categories=", ".join(category_filters),
+                missing_before=before_category_filter,
+                missing_after=len(missing_rows),
+            )
         current_unique = {str(row.get("link", "") or "").strip() for row in rows if str(row.get("link", "") or "").strip()}
-        historical_unique = {str(row.get("link", "") or "").strip() for row in known_rows if str(row.get("link", "") or "").strip()}
+        historical_unique = {
+            str(row.get("link", "") or "").strip()
+            for row in latest_snapshot_rows
+            if str(row.get("link", "") or "").strip()
+        }
         likely_incomplete = bool(
             historical_unique
             and (
@@ -580,7 +611,11 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
                 historical_items=len(historical_unique),
                 candidate_missing=len(missing_rows),
             )
-            missing_rows = []
+            # Do not inspect rows inferred from an untrusted current read, but
+            # still finish previously-confirmed profile-gone checks. This lets
+            # a bad inventory response never block status checks already queued
+            # by an earlier complete snapshot.
+            missing_rows = pending_gone_rows
         _log_vinted_profile(
             "listing-status-check-requested",
             member_id=member_id,
@@ -588,6 +623,7 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
             historical_items=len(known_rows),
             missing_items=len(missing_rows),
         )
+        checked_missing_rows: list[dict] = []
         if missing_rows:
             checked_missing_rows = _check_profile_listing_status(
                 driver,
@@ -595,6 +631,11 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
                 page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
             )
             rows = [*rows, *checked_missing_rows]
+        if likely_incomplete:
+            # Keep the last trusted inventory and persist only the detail-page
+            # outcomes from known gone listings. Never turn an inconsistent
+            # profile response into a mass new/gone snapshot.
+            rows = [*latest_snapshot_rows, *checked_missing_rows]
     missing_identity_after = sum(
         1
         for row in rows
@@ -1268,10 +1309,19 @@ def _normalize_vinted_profile_categories(value: object) -> list[str]:
 
 def _filter_vinted_profile_rows_by_category(rows: list[dict], categories: list[str]) -> list[dict]:
     expected = {label.casefold() for label in categories}
-    return [
-        row for row in rows
-        if normalize_whitespace(str(row.get("category", "") or "")).casefold() in expected
-    ]
+    selected: list[dict] = []
+    for row in rows:
+        category = normalize_whitespace(str(row.get("category", "") or ""))
+        if not category:
+            category = _vinted_profile_item_category(row)
+        searchable = " ".join(
+            normalize_whitespace(str(row.get(key, "") or ""))
+            for key in ("name", "title", "brand", "category_path")
+        ).casefold()
+        category_key = category.casefold()
+        if category_key in expected or any(label in category_key or label in searchable for label in expected):
+            selected.append(row)
+    return selected
 
 
 def _read_vinted_profile_items(driver: Driver) -> list[dict]:

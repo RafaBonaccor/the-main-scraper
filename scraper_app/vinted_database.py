@@ -1879,7 +1879,10 @@ def save_vinted_profile_snapshot(
             previous_count = len(previous_links)
             current_count = len(current_links)
             confirmed_terminal_links = previous_links & (sold_links | unavailable_links)
-            missing_count = max(previous_count - current_count - len(confirmed_terminal_links), 0)
+            # Count missing IDs, not just the difference in total inventory
+            # sizes. A bad page/API response can return 330 unrelated IDs while
+            # still reporting 330 items, which must not be saved as 330 gone / 330 new.
+            missing_count = len(previous_links - current_links - confirmed_terminal_links)
             missing_ratio = (missing_count / previous_count) if previous_count else 0.0
             # A blank grid/API response is never proof that an established
             # seller removed their entire inventory. This can happen during a
@@ -2158,6 +2161,87 @@ def load_vinted_profile_known_items(
         )
         rows_by_link[link] = row
     return list(rows_by_link.values())
+
+
+def load_vinted_profile_latest_snapshot_items(
+    profile_url: str,
+    db_path: str | Path = DEFAULT_VINTED_DB_PATH,
+) -> list[dict]:
+    """Return the inventory from the latest non-empty profile snapshot.
+
+    Profile comparisons must use the last complete inventory, not every item
+    ever observed. Historical rows remain available through
+    ``load_vinted_profile_known_items`` for unresolved gone-item follow-up.
+    """
+    path = Path(db_path).expanduser().resolve()
+    normalized_profile_url = str(profile_url or "").strip()
+    member_id = normalize_vinted_member_id(normalized_profile_url)
+    if not member_id or not path.is_file():
+        return []
+    try:
+        with closing(sqlite3.connect(path)) as connection:
+            connection.row_factory = sqlite3.Row
+            _create_schema(connection)
+            snapshots = connection.execute(
+                """
+                SELECT id, checked_at, item_count, new_count, gone_count
+                FROM vinted_profile_snapshots
+                WHERE member_id = ? AND profile_url = ? AND item_count > 0
+                ORDER BY checked_at DESC, id DESC
+                """,
+                (member_id, normalized_profile_url),
+            ).fetchall()
+            snapshot = next(
+                (
+                    record
+                    for record in snapshots
+                    if not (
+                        int(record["item_count"] or 0) >= 12
+                        and int(record["new_count"] or 0) >= max(8, int(int(record["item_count"]) * 0.25))
+                        and int(record["gone_count"] or 0) >= max(8, int(int(record["item_count"]) * 0.25))
+                    )
+                ),
+                None,
+            )
+            if snapshot is None:
+                return []
+            records = connection.execute(
+                """
+                SELECT * FROM vinted_profile_snapshot_items
+                WHERE snapshot_id = ? AND present = 1
+                ORDER BY id ASC
+                """,
+                (int(snapshot["id"]),),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError(f"Database Vinted non valido: {exc}") from exc
+
+    rows: list[dict] = []
+    for record in records:
+        link = str(record["item_link"] or "").strip()
+        if not link:
+            continue
+        try:
+            payload = json.loads(str(record["snapshot_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        row = dict(payload) if isinstance(payload, dict) else {}
+        row.update(
+            {
+                "source": "vinted_profile",
+                "profile_url": normalized_profile_url,
+                "member_id": member_id,
+                "link": link,
+                "item_id": str(record["item_id"] or row.get("item_id", "") or extract_vinted_item_id_from_link(link)),
+                "name": str(record["item_name"] or row.get("name", "")),
+                "price": str(record["price_text"] or row.get("price", "")),
+                "image_url": str(record["image_url"] or row.get("image_url", "")),
+                "profile_last_seen_at": str(row.get("profile_last_seen_at", "") or snapshot["checked_at"] or ""),
+                "profile_item_status": str(row.get("profile_item_status", "") or record["status"] or ""),
+            }
+        )
+        rows.append(row)
+    return rows
 
 
 def load_vinted_profile_daily_changes(

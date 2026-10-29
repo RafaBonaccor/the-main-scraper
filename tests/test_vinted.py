@@ -52,6 +52,7 @@ from scraper_app.vinted_tabs import navigate_vinted_status_tab, restore_vinted_p
 from scraper_app.sources.vinted_deal_sales import check_due_vinted_deal_sales_with_driver
 from scraper_app.sources.vinted_profile import (
     _check_profile_listing_status,
+    _filter_vinted_profile_rows_by_category,
     _read_all_vinted_profile_items_via_browser_session,
     _vinted_profile_rows_missing_from_current,
     _wait_for_vinted_profile_dom_ready,
@@ -70,6 +71,7 @@ from scraper_app.vinted_database import (
     load_vinted_known_item_keys,
     load_vinted_profile_daily_changes,
     load_vinted_profile_known_items,
+    load_vinted_profile_latest_snapshot_items,
     load_due_vinted_deal_sale_checks,
     load_vinted_deal_sales,
     load_vinted_submitted_offer_keys,
@@ -440,6 +442,21 @@ class VintedTests(unittest.TestCase):
             [row["link"] for row in _vinted_profile_rows_missing_from_current(current_rows=current, historical_rows=history)],
         )
 
+    def test_profile_category_filter_matches_category_or_legacy_item_title(self) -> None:
+        rows = [
+            {"link": "https://www.vinted.it/items/1", "category": "Charm e ciondoli", "name": "Charm Disney"},
+            {"link": "https://www.vinted.it/items/2", "category": "Altro", "name": "Charm Pandora in argento"},
+            {"link": "https://www.vinted.it/items/3", "category": "Anelli", "name": "Anello argento"},
+        ]
+        self.assertEqual(
+            ["https://www.vinted.it/items/2"],
+            [row["link"] for row in _filter_vinted_profile_rows_by_category(rows, ["pandora"])],
+        )
+        self.assertEqual(
+            ["https://www.vinted.it/items/1"],
+            [row["link"] for row in _filter_vinted_profile_rows_by_category(rows, ["charm e ciondoli"])],
+        )
+
     def test_profile_listing_check_marks_missing_live_listing_gone_not_sold(self) -> None:
         class FakeDriver:
             def get(self, *_args, **_kwargs):
@@ -642,6 +659,44 @@ class VintedTests(unittest.TestCase):
         self.assertEqual(60, len(partial["profile_current_rows"]))
         self.assertTrue(all(row["profile_item_status"] == "still_active" for row in partial["profile_current_rows"]))
         self.assertEqual(60, len(known))
+
+    def test_load_vinted_profile_latest_snapshot_items_uses_latest_complete_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            profile_url = "https://www.vinted.it/member/306388399"
+            first_rows = [
+                {"link": f"https://www.vinted.it/items/{item_id}-item", "name": f"Pandora {item_id}"}
+                for item_id in ("100", "200")
+            ]
+            latest_rows = [first_rows[0], {"link": "https://www.vinted.it/items/300-item", "name": "Pandora 300"}]
+            save_vinted_profile_snapshot(profile_url, first_rows, db_path=db_path)
+            save_vinted_profile_snapshot(profile_url, latest_rows, db_path=db_path)
+
+            loaded = load_vinted_profile_latest_snapshot_items(profile_url, db_path=db_path)
+
+        self.assertEqual({row["link"] for row in latest_rows}, {row["link"] for row in loaded})
+        self.assertNotIn("https://www.vinted.it/items/200-item", {row["link"] for row in loaded})
+
+    def test_same_count_but_disjoint_profile_read_is_rejected_as_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            profile_url = "https://www.vinted.it/member/306388399"
+            previous_rows = [
+                {"link": f"https://www.vinted.it/items/{item_id}-old", "name": f"Old {item_id}"}
+                for item_id in range(100, 120)
+            ]
+            unrelated_rows = [
+                {"link": f"https://www.vinted.it/items/{item_id}-other", "name": f"Other {item_id}"}
+                for item_id in range(200, 220)
+            ]
+            save_vinted_profile_snapshot(profile_url, previous_rows, db_path=db_path)
+
+            result = save_vinted_profile_snapshot(profile_url, unrelated_rows, db_path=db_path)
+            latest_inventory = load_vinted_profile_latest_snapshot_items(profile_url, db_path=db_path)
+
+        self.assertTrue(result["profile_snapshot_incomplete"])
+        self.assertFalse(result["profile_snapshot_saved"])
+        self.assertEqual({row["link"] for row in previous_rows}, {row["link"] for row in latest_inventory})
 
     def test_save_vinted_profile_snapshot_ignores_empty_read_after_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
