@@ -17,6 +17,8 @@ from scraper_app.sources.vinted import (
     _build_detached_vinted_browser_command,
     _build_detached_vinted_browser_profile,
     _build_vinted_detail_row,
+    _arm_vinted_item_timeout,
+    _disarm_vinted_item_timeout,
     _card_payload_to_row,
     _detach_vinted_browser_if_requested,
     _enrich_vinted_priority_rows,
@@ -49,10 +51,18 @@ from scraper_app.sources.vinted import (
     parse_vinted_price,
 )
 from scraper_app.vinted_tabs import navigate_vinted_status_tab, restore_vinted_primary_tab
-from scraper_app.sources.vinted_deal_sales import check_due_vinted_deal_sales_with_driver
+from scraper_app.sources.vinted_deal_sales import (
+    _check_vinted_deal_sales_with_driver,
+    _archive_sold_dom_image,
+    check_due_vinted_deal_sales_with_driver,
+    run_vinted_sold_image_backfill,
+)
 from scraper_app.sources.vinted_profile import (
     _check_profile_listing_status,
+    _extract_profile_base_price_text,
     _filter_vinted_profile_rows_by_category,
+    _normalize_vinted_profile_api_item,
+    _read_vinted_profile_items,
     _read_all_vinted_profile_items_via_browser_session,
     _vinted_profile_rows_missing_from_current,
     _wait_for_vinted_profile_dom_ready,
@@ -68,6 +78,7 @@ from scraper_app.vinted_database import (
     list_vinted_search_runs,
     load_vinted_completed_detail_rows,
     load_vinted_sold_deal_identity_keys,
+    load_vinted_sold_deals_missing_dom_image,
     load_vinted_known_item_keys,
     load_vinted_profile_daily_changes,
     load_vinted_profile_known_items,
@@ -81,14 +92,290 @@ from scraper_app.vinted_database import (
     save_vinted_offer_results,
     save_vinted_deal_notifications,
     save_vinted_deal_sale_check,
+    save_vinted_sold_dom_image_metadata,
     summarize_vinted_deal_sales,
     save_vinted_rows,
     update_vinted_competitors_for_sellers,
     update_vinted_search_run,
+    backup_vinted_database,
+    record_vinted_procacciatore_observations,
+    track_qualified_vinted_procacciatore_observations,
 )
 
 
 class VintedTests(unittest.TestCase):
+    def setUp(self) -> None:
+        connectivity = patch("scraper_app.runner.wait_for_internet_connection", return_value=False)
+        internet = patch("scraper_app.runner.internet_connection_available", return_value=True)
+        connectivity.start()
+        internet.start()
+        self.addCleanup(connectivity.stop)
+        self.addCleanup(internet.stop)
+
+    def test_item_watchdog_interrupts_blocking_main_thread_call(self) -> None:
+        previous_handler = _arm_vinted_item_timeout(1, "https://www.vinted.it/items/example")
+        try:
+            with self.assertRaisesRegex(TimeoutError, "listing hard timeout"):
+                import time
+
+                time.sleep(2)
+        finally:
+            _disarm_vinted_item_timeout(previous_handler)
+
+    def test_procacciatore_observations_are_snapshotted_and_upserted_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "procacciatore.db"
+            row = {"link": "https://vinted.test/items/123", "item_id": "123", "name": "Anello",
+                   "search_term": "anelli", "price_value": 15.0, "price": "15 €", "favorite_count": 8}
+            first = record_vinted_procacciatore_observations([row], db_path)
+            row["favorite_count"] = 11
+            second = record_vinted_procacciatore_observations([row], db_path)
+            with closing(sqlite3.connect(db_path)) as connection:
+                listing = connection.execute(
+                    "SELECT first_seen_at,last_seen_at,price_value,favorite_count,times_seen FROM vinted_procacciatore_listings"
+                ).fetchone()
+                snapshots = connection.execute("SELECT COUNT(*) FROM vinted_procacciatore_snapshots").fetchone()[0]
+            self.assertEqual({"observed": 1, "snapshots": 1}, first)
+            self.assertEqual({"observed": 1, "snapshots": 0}, second)
+            self.assertEqual(15.0, listing[2])
+            self.assertEqual(11, listing[3])
+            self.assertEqual(2, listing[4])
+            self.assertEqual(1, snapshots)
+
+    def test_qualified_procacciatore_category_listing_is_backfilled_for_sale_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "procacciatore.db"
+            row = {
+                "link": "https://www.vinted.it/items/123",
+                "item_id": "123",
+                "name": "Collana argento",
+                "search_term": "https://www.vinted.it/catalog/21-jewellery",
+                "search_url": "https://www.vinted.it/catalog/21-jewellery",
+                "price_value": 15.0,
+                "price": "15 €",
+                "favorite_count": 30,
+                "published_at": "un'ora fa",
+                "detail_category_path": "Donna > Accessori > Gioielli > Collane",
+                "detail_catalog_ids": ["1904", "1187", "21", "164"],
+                "detail_relevance_checked": True,
+            }
+            save_vinted_rows([row], db_path)
+            record_vinted_procacciatore_observations([row], db_path)
+
+            result = track_qualified_vinted_procacciatore_observations(
+                db_path,
+                min_favorites=30,
+                max_age_hours=72,
+                min_price=15,
+            )
+
+            self.assertEqual({"eligible": 1, "tracked": 1}, result)
+            with closing(sqlite3.connect(db_path)) as connection:
+                tracked = connection.execute(
+                    "SELECT item_link,item_name,status,payload_json FROM vinted_deal_sale_tracking"
+                ).fetchone()
+            self.assertEqual("https://www.vinted.it/items/123", tracked[0])
+            self.assertEqual("Collana argento", tracked[1])
+            self.assertEqual("active", tracked[2])
+            self.assertIn("un'ora fa", tracked[3])
+
+    def test_procacciatore_database_receives_its_own_daily_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "procacciatore.db"
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute("CREATE TABLE test_data (value TEXT)")
+                connection.execute("INSERT INTO test_data VALUES ('independent')")
+                connection.commit()
+
+            backup = backup_vinted_database(db_path)
+
+            self.assertIsNotNone(backup)
+            self.assertEqual("procacciatore", backup.stem.split("-")[0])
+            with closing(sqlite3.connect(backup)) as connection:
+                self.assertEqual("independent", connection.execute("SELECT value FROM test_data").fetchone()[0])
+
+    def test_profile_price_fallback_uses_base_and_ignores_commission_total(self) -> None:
+        self.assertEqual(
+            "€12.00",
+            _extract_profile_base_price_text(
+                "Charm portafortuna €12.00, €13.30 include la commissione Vinted"
+            ),
+        )
+        self.assertEqual(
+            "12,00 €",
+            _extract_profile_base_price_text(
+                "Charm portafortuna 12,00 €, 13,30 € incl. la commissione Vinted"
+            ),
+        )
+        self.assertEqual("", _extract_profile_base_price_text("€13.30 incl. commissione Vinted"))
+
+    def test_profile_api_and_dom_rows_fall_back_to_base_price_from_card_text(self) -> None:
+        listing_text = "Charm Tokyo €15.00, €16.45 include la commissione Vinted"
+        api_row = _normalize_vinted_profile_api_item(
+            {
+                "id": "10524725727",
+                "url": "/items/10524725727-charm-tokyo",
+                "title": listing_text,
+                "price": "",
+            }
+        )
+        dom_driver = Mock()
+        dom_driver.run_js.return_value = [
+            {
+                "link": "https://www.vinted.it/items/10524725727-charm-tokyo",
+                "title": "Charm Tokyo",
+                "price": "",
+                "raw_text": listing_text,
+            }
+        ]
+
+        self.assertEqual("€15.00", api_row["price"])
+        self.assertEqual("€15.00", _read_vinted_profile_items(dom_driver)[0]["price"])
+
+    def test_historical_dom_image_backfill_runs_resumable_batches(self) -> None:
+        item = {"item_id": "9014", "link": "https://www.vinted.it/items/9014-test"}
+        with (
+            patch(
+                "scraper_app.sources.vinted_deal_sales.load_vinted_sold_deals_missing_dom_image",
+                side_effect=[[item], [], []],
+            ) as load_pending,
+            patch(
+                "scraper_app.sources.vinted_deal_sales._backfill_vinted_sold_dom_images_task",
+                return_value={"meta": {"checked_count": 1, "captured_count": 1, "error_count": 0}},
+            ) as backfill_task,
+            patch("scraper_app.sources.vinted_deal_sales.time.sleep"),
+        ):
+            outcome = run_vinted_sold_image_backfill(
+                db_path="/tmp/scraper.db",
+                limit=0,
+                batch_size=1,
+                cooldown_seconds=0,
+            )
+
+        self.assertEqual(1, outcome.meta["captured_count"])
+        self.assertEqual(1, outcome.meta["batches_completed"])
+        self.assertEqual("all_candidates_classified", outcome.meta["stop_reason"])
+        self.assertEqual(3, load_pending.call_count)
+        backfill_task.assert_called_once()
+        self.assertFalse(backfill_task.call_args.kwargs["reuse_driver"])
+
+    def test_dom_image_backfill_does_not_modify_confirmed_sale_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            row = {
+                "item_id": "9013",
+                "name": "Historical charm",
+                "link": "https://www.vinted.it/items/9013-historical-charm",
+            }
+            save_vinted_deal_notifications([row], db_path=db_path, webhook_target="https://discord.test/webhook")
+            save_vinted_deal_sale_check(row, sold=True, checked_at="2026-10-28T12:00:00", db_path=db_path)
+
+            pending = load_vinted_sold_deals_missing_dom_image(db_path)
+            self.assertEqual([row["link"]], [item["link"] for item in pending])
+            image_path = Path(temp_dir) / "9013.jpg"
+            image_path.write_bytes(b"archived-image")
+            self.assertTrue(
+                save_vinted_sold_dom_image_metadata(
+                    row["link"],
+                    {"sold_dom_image_path": str(image_path), "archive_image_path": str(image_path)},
+                    db_path=db_path,
+                )
+            )
+            sales = load_vinted_deal_sales(db_path)
+            self.assertEqual("2026-10-28T12:00:00", sales[0]["deal_sold_at"])
+            self.assertEqual(str(image_path), sales[0]["sold_dom_image_path"])
+            self.assertEqual([], load_vinted_sold_deals_missing_dom_image(db_path))
+
+    def test_terminal_backfill_checks_are_not_requeued(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            row = {
+                "item_id": "9015",
+                "name": "Unavailable historical charm",
+                "link": "https://www.vinted.it/items/9015-unavailable",
+            }
+            save_vinted_deal_notifications([row], db_path=db_path, webhook_target="https://discord.test/webhook")
+            save_vinted_deal_sale_check(row, sold=True, checked_at="2026-10-28T12:00:00", db_path=db_path)
+
+            self.assertEqual(1, len(load_vinted_sold_deals_missing_dom_image(db_path)))
+            self.assertTrue(
+                save_vinted_sold_dom_image_metadata(
+                    row["link"],
+                    {
+                        "sold_dom_image_check_status": "page_not_found",
+                        "sold_dom_image_checked_at": "2026-10-29T12:00:00",
+                    },
+                    db_path=db_path,
+                )
+            )
+            self.assertEqual([], load_vinted_sold_deals_missing_dom_image(db_path))
+
+    def test_sold_detail_image_is_archived_and_attached_to_sale_record(self) -> None:
+        deal = {
+            "item_id": "9012",
+            "name": "Charm sold",
+            "link": "https://www.vinted.it/items/9012-charm-sold",
+            "deal_first_seen_at": "2026-10-29T10:00:00",
+        }
+        driver = Mock()
+        with (
+            patch("scraper_app.sources.vinted_deal_sales.time.sleep"),
+            patch(
+                "scraper_app.sources.vinted_deal_sales._sold_status_from_page",
+                return_value={
+                    "sold": True,
+                    "product_image_url": "https://images1.vinted.net/item.jpg",
+                    "product_image_width": 1200,
+                    "product_image_height": 1200,
+                    "published_text": "2 ore fa",
+                },
+            ),
+            patch(
+                "scraper_app.sources.vinted_deal_sales._archive_sold_dom_image",
+                return_value="/tmp/deal_archive/sold_dom/9012-image.jpg",
+            ) as archive_image,
+            patch(
+                "scraper_app.sources.vinted_deal_sales.save_vinted_deal_sale_check",
+                return_value={"sold_at": "2026-10-29T12:00:00"},
+            ) as save_check,
+        ):
+            result = _check_vinted_deal_sales_with_driver(
+                driver,
+                {"db_path": "/tmp/scraper.db", "page_settle_seconds": 0},
+                [deal],
+            )
+
+        archive_image.assert_called_once_with(
+            "https://images1.vinted.net/item.jpg", "9012", "/tmp/scraper.db"
+        )
+        persisted_row = save_check.call_args.args[0]
+        self.assertEqual("/tmp/deal_archive/sold_dom/9012-image.jpg", persisted_row["archive_image_path"])
+        self.assertEqual("https://images1.vinted.net/item.jpg", persisted_row["image_url"])
+        self.assertEqual(1, result["meta"]["sold_count"])
+
+    def test_sold_dom_image_archiver_keeps_real_image_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_bytes = b"\xff\xd8\xffreal-jpeg-data"
+
+            class FakeResponse:
+                def __enter__(self):
+                    from io import BytesIO
+
+                    return BytesIO(image_bytes)
+
+                def __exit__(self, *_args):
+                    return False
+
+            with patch("scraper_app.sources.vinted_deal_sales.urlopen", return_value=FakeResponse()):
+                image_path = _archive_sold_dom_image(
+                    "https://images1.vinted.net/item.jpg", "9012", Path(temp_dir) / "scraper.db"
+                )
+
+            archived = Path(image_path)
+            self.assertTrue(archived.is_file())
+            self.assertEqual(image_bytes, archived.read_bytes())
+            self.assertIn("deal_archive/sold_dom", str(archived))
+
     def test_profile_api_pagination_collects_all_pages(self) -> None:
         class FakeDriver:
             def __init__(self) -> None:
@@ -660,6 +947,66 @@ class VintedTests(unittest.TestCase):
         self.assertTrue(all(row["profile_item_status"] == "still_active" for row in partial["profile_current_rows"]))
         self.assertEqual(60, len(known))
 
+    def test_authoritative_wardrobe_replaces_contaminated_inventory_without_fake_sales(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            profile_url = "https://www.vinted.it/member/225753959"
+            polluted = [
+                {"link": f"https://www.vinted.it/items/{1000 + index}-item", "name": f"Item {index}"}
+                for index in range(64)
+            ]
+            save_vinted_profile_snapshot(profile_url, polluted, db_path=db_path)
+            verified = [
+                {**row, "profile_inventory_source": "wardrobe_api"}
+                for row in polluted[:21]
+            ]
+
+            result = save_vinted_profile_snapshot(
+                profile_url, verified, db_path=db_path, authoritative_inventory=True
+            )
+            current = load_vinted_profile_latest_snapshot_items(profile_url, db_path=db_path)
+
+        self.assertTrue(result["profile_rebaseline"])
+        self.assertTrue(result["db_saved_live"])
+        self.assertEqual(21, result["profile_item_count"])
+        self.assertEqual(0, result["profile_new_count"])
+        self.assertEqual(0, result["profile_gone_count"])
+        self.assertEqual(21, len(current))
+
+    def test_ignored_owned_listing_is_not_tracked_again_after_next_profile_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "scraper.db"
+            profile_url = "https://www.vinted.it/member/225753959"
+            rows = [
+                {"link": f"https://www.vinted.it/items/{item_id}-item", "item_id": item_id, "name": item_id}
+                for item_id in ("1000", "1001")
+            ]
+            save_vinted_profile_snapshot(profile_url, rows, db_path=db_path)
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute(
+                    "INSERT INTO vinted_owned_profile_ignored_items VALUES (?, ?, ?)",
+                    ("225753959", "1001", "2026-11-07T10:00:00"),
+                )
+                connection.commit()
+
+            next_scan = save_vinted_profile_snapshot(profile_url, rows, db_path=db_path)
+            current = load_vinted_profile_latest_snapshot_items(profile_url, db_path=db_path)
+            known = load_vinted_profile_known_items(profile_url, db_path=db_path)
+            daily = load_vinted_profile_daily_changes(
+                db_path=db_path, since_at="2000-01-01", until_at="2100-01-01", profile_urls=[profile_url]
+            )
+            with closing(sqlite3.connect(db_path)) as connection:
+                historical = connection.execute(
+                    "SELECT COUNT(*) FROM vinted_profile_snapshot_items WHERE member_id = '225753959' AND item_id = '1001'"
+                ).fetchone()[0]
+
+        self.assertEqual(1, next_scan["profile_item_count"])
+        self.assertEqual(0, next_scan["profile_gone_count"])
+        self.assertEqual(["1000"], [row["item_id"] for row in current])
+        self.assertEqual(["1000"], [row["item_id"] for row in known])
+        self.assertNotIn("1001", {row["item_id"] for row in daily})
+        self.assertEqual(1, historical)
+
     def test_load_vinted_profile_latest_snapshot_items_uses_latest_complete_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "scraper.db"
@@ -1135,13 +1482,10 @@ class VintedTests(unittest.TestCase):
         self.assertEqual((1.0, 2.0), _vinted_timing_config(False, 1.0, 2.0))
 
     @patch("scraper_app.sources.vinted.time.sleep")
-    @patch("scraper_app.sources.vinted.time.monotonic")
     def test_wait_for_vinted_detail_page_ready_returns_early_when_page_is_ready(
         self,
-        mocked_monotonic,
         mocked_sleep,
     ) -> None:
-        mocked_monotonic.side_effect = [10.0, 10.05, 10.1]
         driver = Mock()
         driver.run_js.side_effect = [
             {
@@ -1398,6 +1742,8 @@ class VintedTests(unittest.TestCase):
                         "seller_name": "Seller Charm",
                         "seller_profile_url": "https://www.vinted.it/member/987654321",
                         "seller_member_id": "987654321",
+                        "detail_catalog_ids": ["165"],
+                        "detail_category_path": "Gioielli > Braccialetti",
                         "evaluation_label": "da valutare assolutamente",
                         "link": "https://www.vinted.it/items/9425130935-charm-pandora",
                         "search_term": "charm",
@@ -1988,6 +2334,41 @@ class VintedTests(unittest.TestCase):
         self.assertTrue(mocked_scraper.call_args.kwargs["skip_login_required"])
         self.assertFalse(mocked_scraper.call_args.kwargs["auto_submit_offers"])
         self.assertTrue(mocked_scraper.call_args.kwargs["discord_deal_notifications"])
+
+    @patch("scraper_app.runner.run_vinted_scraper")
+    @patch("scraper_app.runner.run_vinted_profile_monitor")
+    def test_continuous_monitoring_checks_owned_profiles_without_competitor_category_filter(
+        self,
+        mocked_profiles,
+        mocked_scraper,
+    ) -> None:
+        mocked_profiles.return_value = Mock(
+            source="vinted_profile",
+            rows=[{"item_id": "1", "name": "Profile item", "link": "https://www.vinted.it/items/1"}],
+            meta={"profile_item_count": 1, "profile_sold_count": 0},
+        )
+        mocked_scraper.return_value = Mock(source="vinted", rows=[], meta={"row_count": 0, "db_path": "data/scraper.db"})
+
+        outcome = run_scraper(
+            "vinted_continuous",
+            profile_urls="https://www.vinted.it/member/306388399",
+            owned_profile_urls=(
+                "https://www.vinted.it/member/225753959\n"
+                "https://www.vinted.it/member/3178210259"
+            ),
+            profile_categories="pandora",
+            competitor_keywords="charm",
+            competitor_category="Gioielli donna",
+            article_interval_seconds=0,
+            profile_interval_seconds=0,
+            db_path="data/scraper.db",
+        )
+
+        self.assertEqual(2, mocked_profiles.call_count)
+        self.assertEqual(["pandora", ""], [call.kwargs["profile_categories"] for call in mocked_profiles.call_args_list])
+        self.assertTrue(all(call.kwargs["check_listing_statuses"] for call in mocked_profiles.call_args_list))
+        self.assertEqual(2, outcome.meta["owned_profile_count"])
+        self.assertEqual(["profiles", "owned_profiles"], [row["continuous_component"] for row in outcome.rows[:2]])
 
     @patch("scraper_app.runner.run_vinted_description_extractor")
     def test_vinted_descriptions_runner_does_not_pass_profile_monitor_kwargs(self, mocked_extractor) -> None:

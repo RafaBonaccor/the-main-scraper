@@ -167,12 +167,22 @@ def browser_mode_requires_custom_dir(raw_mode: str) -> bool:
 
 def resolve_browser_profile(config: dict) -> str | None:
     browser_mode = normalize_browser_mode(str(config.get("browser_mode", "chrome_normale") or "chrome_normale"))
-    if browser_mode == "isolated":
-        return None
-
     cached_profile_root = str(config.get("_resolved_browser_profile_root", "") or "").strip()
     if cached_profile_root:
         return _finalize_browser_profile(config, cached_profile_root)
+
+    if browser_mode == "isolated":
+        # Use a unique, job-owned profile instead of Botasaurus' untagged
+        # /tmp/bota profile. That makes isolated Chrome safe to reap after a
+        # job exits and keeps it separate from the user's normal Chrome.
+        runtime_profiles_dir = Path(RUNTIME_PROFILES_DIR)
+        runtime_profiles_dir.mkdir(parents=True, exist_ok=True)
+        profile_root = tempfile.mkdtemp(
+            prefix=f"iso_p{os.getpid()}_",
+            dir=runtime_profiles_dir,
+        )
+        config["_resolved_browser_profile_root"] = profile_root
+        return profile_root
 
     user_data_dir = str(config.get("browser_user_data_dir", "") or "").strip()
     if browser_mode == "profilo_personalizzato" and user_data_dir:
@@ -190,7 +200,8 @@ def resolve_browser_profile(config: dict) -> str | None:
 
     if browser_mode == "chrome_normale":
         if bool(config.get("close_existing_runtime_browser", False)):
-            closed_count = close_runtime_chrome_instances()
+            # Keep cleanup scoped to this job; other jobs own separate Chrome copies.
+            closed_count = close_runtime_chrome_instances(owner_pid=os.getpid())
             if closed_count:
                 print(f"[browser-runtime] closed previous scraper Chrome processes={closed_count}", flush=True)
         source_user_data_dir = user_data_dir or default_chrome_user_data_dir()
@@ -228,14 +239,16 @@ def _finalize_browser_profile(config: dict, profile_root: str) -> str:
     return profile_root
 
 
-def close_runtime_chrome_instances() -> int:
-    """Terminate only Chrome instances created with scraper-owned temp profiles.
+def close_runtime_chrome_instances(*, owner_pid: int | None = None) -> int:
+    """Terminate only Chrome instances owned by one scraper process.
 
-    It intentionally never touches the user's normal Chrome profile. This is
-    used by autonomous monitoring before a new component obtains a browser.
+    Disposable profile copies embed their creating process ID. This prevents
+    one concurrent scraper job from killing another job's live Chrome session.
+    Legacy profile copies without an owner marker are deliberately left alone.
     """
     if sys.platform != "darwin":
         return 0
+    owner_marker = f"_p{int(owner_pid or os.getpid())}_"
     try:
         completed = subprocess.run(
             ["ps", "-axo", "pid=,command="],
@@ -253,7 +266,12 @@ def close_runtime_chrome_instances() -> int:
             continue
         pid = int(match.group(1))
         command = match.group(2)
-        if runtime_root not in command or "--user-data-dir=" not in command or "Google Chrome" not in command:
+        if (
+            runtime_root not in command
+            or owner_marker not in command
+            or "--user-data-dir=" not in command
+            or "Google Chrome" not in command
+        ):
             continue
         target_pids.add(pid)
     for pid in target_pids:
@@ -277,6 +295,152 @@ def close_runtime_chrome_instances() -> int:
         except OSError:
             pass
     return len(target_pids)
+
+
+def close_orphaned_job_chrome_instances(*, stale_botasaurus_seconds: int = 1800) -> int:
+    """Close stale job-owned Chrome, never the user's regular Chrome profile.
+
+    Managed profiles encode their owning PID in the profile directory. Legacy
+    Botasaurus profiles are considered only when their root Chrome process has
+    been reparented to launchd, is older than the grace period, and has no
+    DevTools client belonging to a currently running scraper job.
+    """
+    if sys.platform != "darwin":
+        return 0
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,etime=,command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return 0
+
+    process_rows: list[tuple[int, int, float, str]] = []
+    process_ids: set[int] = set()
+    for raw_line in str(completed.stdout or "").splitlines():
+        match = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$", raw_line)
+        if not match:
+            continue
+        pid, ppid = int(match.group(1)), int(match.group(2))
+        process_ids.add(pid)
+        process_rows.append((pid, ppid, _parse_process_elapsed_seconds(match.group(3)), match.group(4)))
+
+    job_pids = {
+        pid
+        for pid, _ppid, _elapsed, command in process_rows
+        if str(WORKSPACE_ROOT / "main.py") in command and " run " in command
+    }
+    active_job_tree = set(job_pids)
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid, _elapsed, _command in process_rows:
+            if ppid in active_job_tree and pid not in active_job_tree:
+                active_job_tree.add(pid)
+                changed = True
+
+    managed_root = str(RUNTIME_PROFILES_DIR)
+    botasaurus_root = str(Path(tempfile.gettempdir()) / "bota")
+    orphan_profiles: set[str] = set()
+    for pid, ppid, elapsed_seconds, command in process_rows:
+        # Only inspect the Chrome browser process itself, not helpers.
+        if "Google Chrome.app/Contents/MacOS/Google Chrome " not in command or "Google Chrome Helper" in command:
+            continue
+        profile_match = re.search(r"--user-data-dir=(?:\"([^\"]+)\"|(\S+))", command)
+        if not profile_match:
+            continue
+        profile = str(profile_match.group(1) or profile_match.group(2) or "").rstrip("/")
+        if profile.startswith(managed_root + "/"):
+            owner_match = re.search(r"_p(\d+)_", profile)
+            owner_pid = int(owner_match.group(1)) if owner_match else None
+            if owner_pid is not None and owner_pid not in process_ids:
+                orphan_profiles.add(profile)
+            continue
+        if not profile.startswith(botasaurus_root + "/"):
+            continue
+        if ppid in active_job_tree or elapsed_seconds < max(int(stale_botasaurus_seconds), 0):
+            continue
+        port_match = re.search(r"--remote-debugging-port(?:=|\s+)(\d+)", command)
+        if not port_match:
+            continue
+        try:
+            connections = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{port_match.group(1)}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            continue
+        has_active_job_client = False
+        for line in str(connections.stdout or "").splitlines()[1:]:
+            if "ESTABLISHED" not in line:
+                continue
+            fields = line.split()
+            if len(fields) > 1 and fields[1].isdigit() and int(fields[1]) in active_job_tree:
+                has_active_job_client = True
+                break
+        if not has_active_job_client:
+            orphan_profiles.add(profile)
+
+    if not orphan_profiles:
+        return 0
+    target_pids = {
+        pid
+        for pid, _ppid, _elapsed, command in process_rows
+        for profile in orphan_profiles
+        if f"--user-data-dir={profile}" in command or f'--user-data-dir="{profile}"' in command
+    }
+    for pid in target_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+    if target_pids:
+        time.sleep(0.5)
+    still_running: set[int] = set()
+    for pid in target_pids:
+        try:
+            os.kill(pid, 0)
+            still_running.add(pid)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+    for pid in still_running:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    if target_pids:
+        print(
+            f"[browser-runtime] closed orphan job Chrome processes={len(target_pids)} "
+            f"profiles={len(orphan_profiles)}",
+            flush=True,
+        )
+    return len(target_pids)
+
+
+def _parse_process_elapsed_seconds(value: str) -> float:
+    raw = str(value or "").strip()
+    try:
+        if "-" in raw:
+            days, raw = raw.split("-", 1)
+            day_seconds = int(days) * 86400
+        else:
+            day_seconds = 0
+        parts = [int(part) for part in raw.split(":")]
+        if len(parts) == 3:
+            return day_seconds + parts[0] * 3600 + parts[1] * 60 + parts[2]
+        if len(parts) == 2:
+            return day_seconds + parts[0] * 60 + parts[1]
+        return day_seconds + float(raw)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def resolve_browser_arguments(config: dict) -> list[str]:
@@ -305,7 +469,10 @@ def prepare_chrome_normale_profile_copy(source_user_data_dir: str, profile_direc
     # and terminated long-running monitor jobs. mkdtemp is atomic and gives each
     # process/session its own disposable copy.
     RUNTIME_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
-    target_root = Path(tempfile.mkdtemp(prefix=f"cn_{_slug(profile_name)}_", dir=RUNTIME_PROFILES_DIR))
+    target_root = Path(tempfile.mkdtemp(
+        prefix=f"cn_{_slug(profile_name)}_p{os.getpid()}_",
+        dir=RUNTIME_PROFILES_DIR,
+    ))
     _ensure_runtime_target(target_root)
 
     for root_file_name in ("Local State", "First Run"):

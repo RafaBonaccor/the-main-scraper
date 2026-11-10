@@ -1,9 +1,14 @@
+import atexit
 import json
+import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 from .date_filter import apply_age_filter_to_outcome
+from .browser_runtime import close_orphaned_job_chrome_instances, close_runtime_chrome_instances
+from .connectivity import internet_connection_available, wait_for_internet_connection
 from .exporters import write_outcome_json
 from .location_filter import apply_geo_sorting_to_outcome
 from .models import ScrapeOutcome
@@ -12,6 +17,7 @@ from .runtime_controls import consume_skip_current_item_request, consume_stop_af
 from .sources.custom_site import run_custom_site_scraper
 from .sources.aliexpress_image import run_aliexpress_image_search
 from .sources.google_maps import run_google_maps_scraper
+from .sources.linkedin_posts import run_linkedin_feed_scan
 from .sources.subito import run_subito_scraper
 from .subito_monitor import (
     DEFAULT_CAREGIVER_LOCATIONS,
@@ -24,15 +30,145 @@ from .subito_monitor import (
     row_matches_location_target,
 )
 from .sources.vinted import run_vinted_description_extractor, run_vinted_scraper
-from .sources.vinted_deal_sales import run_vinted_deal_sale_monitor
-from .sources.vinted_profile import maybe_send_vinted_profile_daily_report, run_vinted_profile_monitor
+from .sources.vinted_deal_sales import run_vinted_deal_sale_monitor, run_vinted_sold_image_backfill
+from .sources.vinted_profile import (
+    maybe_send_vinted_profile_daily_report,
+    normalize_vinted_profile_url,
+    normalize_vinted_profile_urls,
+    run_vinted_profile_monitor,
+)
 from .sources.vinted_trend_sales import run_vinted_trend_sale_checks
 from .utils import build_subito_search_url, parse_text_list
 from .vinted_gateway import build_vinted_deal_hunter_search_specs
+from .vinted_database import track_qualified_vinted_procacciatore_observations
 from .vinted_trend_scout import TrendPolicy, VintedTrendStore, parse_trend_queries, row_matches_trend_query
+
+_BROWSER_SOURCES = {
+    "linkedin_posts",
+    "aliexpress_image",
+    "custom_site",
+    "google_maps",
+    "subito",
+    "subito_caregiver",
+    "vinted",
+    "vinted_competitors",
+    "vinted_continuous",
+    "vinted_descriptions",
+    "vinted_profile",
+    "vinted_trends",
+}
+_CHROME_CLEANUP_REGISTERED = False
+_ORPHAN_CHROME_SWEEPER_STARTED = False
+_ORPHAN_CHROME_SWEEP_INTERVAL_SECONDS = 300
+_VINTED_DEAL_HUNTER_RETRY_BASE_SECONDS = 15
+_VINTED_DEAL_HUNTER_RETRY_MAX_SECONDS = 300
+
+
+def _start_orphan_chrome_sweeper() -> None:
+    """Periodically reap detached job browsers, without touching user Chrome."""
+    global _ORPHAN_CHROME_SWEEPER_STARTED
+    if _ORPHAN_CHROME_SWEEPER_STARTED:
+        return
+    _ORPHAN_CHROME_SWEEPER_STARTED = True
+
+    def sweep() -> None:
+        while True:
+            time.sleep(_ORPHAN_CHROME_SWEEP_INTERVAL_SECONDS)
+            try:
+                closed = close_orphaned_job_chrome_instances()
+                if closed:
+                    print(f"[browser-runtime] periodic-orphan-cleanup processes={closed}", flush=True)
+            except Exception as exc:
+                print(f"[browser-runtime] periodic-orphan-cleanup error={exc}", flush=True)
+
+    threading.Thread(target=sweep, name="orphan-chrome-sweeper", daemon=True).start()
 
 
 def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
+    global _CHROME_CLEANUP_REGISTERED
+    network_waited = wait_for_internet_connection(
+        label=source,
+        should_stop=consume_stop_after_current_item_request,
+    )
+    if network_waited is None:
+        return ScrapeOutcome(source=source, rows=[], meta={"stopped": True, "network_paused": True})
+    if source in _BROWSER_SOURCES:
+        closed = close_orphaned_job_chrome_instances()
+        if closed:
+            print(f"[browser-runtime] startup-orphan-cleanup processes={closed}", flush=True)
+        _start_orphan_chrome_sweeper()
+        if not _CHROME_CLEANUP_REGISTERED:
+            owner_pid = os.getpid()
+            atexit.register(close_runtime_chrome_instances, owner_pid=owner_pid)
+            _CHROME_CLEANUP_REGISTERED = True
+    retry_attempt = 0
+    while True:
+        try:
+            return _run_scraper_impl(source, **kwargs)
+        except Exception as exc:
+            if source not in _BROWSER_SOURCES or not _is_retryable_browser_error(exc):
+                raise
+            retry_attempt += 1
+            retry_seconds = min(15 * (2 ** min(retry_attempt - 1, 10)), _VINTED_DEAL_HUNTER_RETRY_MAX_SECONDS)
+            print(
+                f"[network] {source}: operazione interrotta da errore di rete/browser "
+                f"error={type(exc).__name__}: {exc} retry_attempt={retry_attempt} retry_in={retry_seconds}s",
+                flush=True,
+            )
+            if not internet_connection_available():
+                if wait_for_internet_connection(
+                    label=source,
+                    should_stop=consume_stop_after_current_item_request,
+                ) is None:
+                    return ScrapeOutcome(source=source, rows=[], meta={"stopped": True, "network_paused": True})
+                retry_attempt = 0
+                continue
+            if not _wait_for_vinted_procacciatore_retry(retry_seconds):
+                return ScrapeOutcome(source=source, rows=[], meta={"stopped": True, "network_paused": False})
+
+
+def _is_retryable_browser_error(error: Exception) -> bool:
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True
+    message = f"{type(error).__name__}: {error}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection refused",
+            "connection aborted",
+            "network is unreachable",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "could not resolve",
+            "document did not become ready",
+            "page did not load",
+            "err_internet_disconnected",
+            "err_name_not_resolved",
+            "websocket is not connected",
+        )
+    )
+
+
+def _run_scraper_impl(source: str, **kwargs) -> ScrapeOutcome:
+    if source == "linkedin_posts":
+        return run_linkedin_feed_scan(
+            scroll_rounds=int(kwargs.get("scroll_rounds", 0)),
+            target_popular_posts=int(kwargs.get("target_popular_posts", 50)),
+            target_new_posts=int(kwargs.get("target_new_posts", 10)),
+            min_reactions=int(kwargs.get("min_reactions", 1000)),
+            min_post_age_days=int(kwargs.get("min_post_age_days", 1)),
+            max_post_age_days=int(kwargs.get("max_post_age_days", 3)),
+            show_browser=bool(kwargs.get("show_browser", False)),
+            scan_started_at=str(kwargs.get("scan_started_at", "")),
+            db_path=str(kwargs.get("db_path", "data/linkedin_posts.db")),
+            browser_mode=str(kwargs.get("browser_mode", "chrome_normale")),
+            browser_user_data_dir=str(kwargs.get("browser_user_data_dir", "")),
+            browser_profile_directory=str(kwargs.get("browser_profile_directory", "Default")),
+        )
+
     if source == "aliexpress_image":
         return run_aliexpress_image_search(
             image_path=kwargs.get("image_path", ""),
@@ -141,6 +277,21 @@ def run_scraper(source: str, **kwargs) -> ScrapeOutcome:
             page_settle_seconds=float(kwargs.get("page_settle_seconds", 2.0) or 2.0),
         )
 
+    if source == "vinted_sold_image_backfill":
+        return run_vinted_sold_image_backfill(
+            db_path=kwargs.get("db_path", "data/scraper.db"),
+            limit=int(kwargs.get("limit", 10) or 0),
+            batch_size=int(kwargs.get("batch_size", 40) or 40),
+            delay_seconds=float(kwargs.get("delay_seconds", 3.0) or 3.0),
+            cooldown_seconds=float(kwargs.get("cooldown_seconds", 180.0) or 0),
+            rate_limit_cooldown_seconds=float(kwargs.get("rate_limit_cooldown_seconds", 900.0) or 900.0),
+            browser_mode=kwargs.get("browser_mode", "chrome_normale"),
+            browser_user_data_dir=kwargs.get("browser_user_data_dir", ""),
+            browser_profile_directory=kwargs.get("browser_profile_directory", "Default"),
+            refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
+            page_settle_seconds=float(kwargs.get("page_settle_seconds", 1.5) or 1.5),
+        )
+
     if source == "subito":
         return _run_subito_search(**kwargs)
 
@@ -201,6 +352,86 @@ def _resolve_vinted_profile_urls(kwargs: dict) -> list[str]:
 
 
 def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
+    """Run Procacciatore discovery alongside an independent due-sales worker."""
+    deal_hunter_enabled = int(kwargs.get("deal_hunter_min_favorites", 0) or 0) > 0
+    if not deal_hunter_enabled:
+        return _run_vinted_queries_impl(**kwargs)
+
+    db_path = str(kwargs.get("db_path", "") or "")
+    if Path(db_path).name == "procacciatore.db":
+        registered = track_qualified_vinted_procacciatore_observations(
+            db_path,
+            min_favorites=int(kwargs.get("deal_hunter_min_favorites", 30) or 30),
+            max_age_hours=float(kwargs.get("deal_hunter_max_age_hours", 72) or 72),
+            min_price=_parse_optional_nonnegative_float(kwargs.get("deal_hunter_min_price")) or 0.0,
+        )
+        print(
+            "[vinted-deal-sales] procacciatore-backfill "
+            f"eligible={registered['eligible']} tracked={registered['tracked']}",
+            flush=True,
+        )
+
+    stop_event, worker = _start_vinted_deal_sales_background_monitor(kwargs)
+    worker.start()
+    run_kwargs = dict(kwargs)
+    run_kwargs["_parallel_deal_sales_worker"] = True
+    try:
+        return _run_vinted_queries_impl(**run_kwargs)
+    finally:
+        stop_event.set()
+        # Sale-page navigation can occasionally stall; never hold up the
+        # completed search/cancel path waiting for that disposable worker.
+        worker.join(timeout=5)
+
+
+def _start_vinted_deal_sales_background_monitor(kwargs) -> tuple[threading.Event, threading.Thread]:
+    """Poll due sale checks in a separate isolated Chrome while discovery runs."""
+    stop_event = threading.Event()
+    monitor_kwargs = dict(kwargs)
+    monitor_kwargs.update(
+        {
+            # Never share or close the catalog browser. Sale checks are public
+            # read-only requests and use their own disposable Chrome profile.
+            "browser_mode": "isolated",
+            "keep_browser_open": False,
+            "close_existing_runtime_browser": False,
+        }
+    )
+    poll_seconds = max(15, min(int(kwargs.get("deal_sale_worker_poll_seconds", 30) or 30), 300))
+
+    def _worker() -> None:
+        print(
+            f"[vinted-deal-sales] parallel-worker-start poll_seconds={poll_seconds} "
+            f"due_interval_seconds={int(monitor_kwargs.get('deal_sale_check_interval_seconds', 1800) or 0)}",
+            flush=True,
+        )
+        while not stop_event.is_set():
+            if wait_for_internet_connection(
+                label="procacciatore-controllo-vendite",
+                should_stop=stop_event.is_set,
+            ) is None:
+                stop_event.set()
+                return
+            started = time.monotonic()
+            outcome = _run_vinted_deal_sale_monitor_safely(**monitor_kwargs)
+            if outcome is not None:
+                meta = dict(outcome.meta)
+                if int(meta.get("checked_count", 0) or 0) or int(meta.get("errors", 0) or 0):
+                    print(
+                        "[vinted-deal-sales] parallel-worker-batch "
+                        f"due={meta.get('due_count', 0)} checked={meta.get('checked_count', 0)} "
+                        f"sold={meta.get('sold_count', 0)} errors={meta.get('errors', 0)}",
+                        flush=True,
+                    )
+            elapsed = time.monotonic() - started
+            stop_event.wait(max(poll_seconds - elapsed, 0.0))
+        print("[vinted-deal-sales] parallel-worker-stop", flush=True)
+
+    worker = threading.Thread(target=_worker, name="vinted-deal-sales", daemon=True)
+    return stop_event, worker
+
+
+def _run_vinted_queries_impl(**kwargs) -> ScrapeOutcome:
     search_specs = _resolve_vinted_search_specs(kwargs)
     if not search_specs:
         raise ValueError("Inserisci una ricerca Vinted o un searches-file valido.")
@@ -211,13 +442,58 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
     if deal_hunter_enabled and deal_hunter_loop_seconds > 0:
         latest_outcome: ScrapeOutcome | None = None
         cycle_index = 0
+        retry_attempt = 0
         while True:
             if consume_stop_after_current_item_request():
                 break
-            cycle_index += 1
-            print(f"[deal-hunter] ciclo interno {cycle_index} avviato.", flush=True)
-            latest_outcome = _run_vinted_queries_once(search_specs, **kwargs)
-            _monitor_vinted_deal_sales_after_hunt(latest_outcome, **kwargs)
+            if wait_for_internet_connection(
+                label="procacciatore",
+                should_stop=consume_stop_after_current_item_request,
+            ) is None:
+                break
+            next_cycle_index = cycle_index + 1
+            print(f"[deal-hunter] ciclo interno {next_cycle_index} avviato.", flush=True)
+            try:
+                latest_outcome = _run_vinted_queries_once(search_specs, **kwargs)
+                cycle_index = next_cycle_index
+                retry_attempt = 0
+            except Exception as exc:
+                # A transient network/navigation failure must not terminate the
+                # long-running Procacciatore job. Completed rows are already
+                # persisted live, so retrying the cycle is safe and known items
+                # are filtered by the existing DB logic.
+                retry_attempt += 1
+                retry_seconds = min(
+                    _VINTED_DEAL_HUNTER_RETRY_BASE_SECONDS * (2 ** min(retry_attempt - 1, 10)),
+                    _VINTED_DEAL_HUNTER_RETRY_MAX_SECONDS,
+                )
+                print(
+                    "[deal-hunter] ciclo non completato "
+                    f"error={type(exc).__name__}: {exc} retry_attempt={retry_attempt} "
+                    f"retry_in={retry_seconds}s",
+                    flush=True,
+                )
+                if not internet_connection_available():
+                    if wait_for_internet_connection(
+                        label="procacciatore",
+                        should_stop=consume_stop_after_current_item_request,
+                    ) is None:
+                        break
+                    retry_attempt = 0
+                    continue
+                if not _wait_for_vinted_procacciatore_retry(retry_seconds):
+                    break
+                continue
+            try:
+                _monitor_vinted_deal_sales_after_hunt(latest_outcome, **kwargs)
+            except Exception as exc:
+                # The auxiliary sold-status check is best-effort and must not
+                # take down the independent discovery loop.
+                print(
+                    f"[deal-hunter] controllo vendite non riuscito; continuo la ricerca "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
             if consume_stop_after_current_item_request():
                 break
             print(
@@ -240,9 +516,21 @@ def _run_vinted_queries(**kwargs) -> ScrapeOutcome:
     return outcome
 
 
+def _wait_for_vinted_procacciatore_retry(seconds: int) -> bool:
+    """Wait before retrying a failed Procacciatore cycle, remaining stoppable."""
+    remaining = max(int(seconds or 0), 0)
+    while remaining > 0:
+        if consume_stop_after_current_item_request():
+            return False
+        interval = min(1, remaining)
+        time.sleep(interval)
+        remaining -= interval
+    return not consume_stop_after_current_item_request()
+
+
 def _monitor_vinted_deal_sales_after_hunt(outcome: ScrapeOutcome, **kwargs) -> None:
     """Check previously notified deals opportunistically, without breaking the deal hunt."""
-    if not bool(kwargs.get("discord_deal_notifications", False)):
+    if bool(kwargs.get("_parallel_deal_sales_worker", False)) or not bool(kwargs.get("discord_deal_notifications", False)):
         return
     sale_outcome = _run_vinted_deal_sale_monitor_safely(**kwargs)
     if sale_outcome is not None:
@@ -302,6 +590,11 @@ def _run_vinted_competitor_discovery(**kwargs) -> ScrapeOutcome:
     while True:
         if consume_stop_after_current_item_request():
             break
+        if wait_for_internet_connection(
+            label="vinted-competitor-discovery",
+            should_stop=consume_stop_after_current_item_request,
+        ) is None:
+            break
         cycle_index += 1
         print(f"[competitor-discovery] ciclo {cycle_index} avviato.", flush=True)
         try:
@@ -312,6 +605,13 @@ def _run_vinted_competitor_discovery(**kwargs) -> ScrapeOutcome:
             print(f"[competitor-discovery] ciclo {cycle_index} errore transitorio: {exc}", flush=True)
             if interval_seconds <= 0:
                 raise
+            if not internet_connection_available():
+                if wait_for_internet_connection(
+                    label="vinted-competitor-discovery",
+                    should_stop=consume_stop_after_current_item_request,
+                ) is None:
+                    break
+                continue
             deadline = time.monotonic() + interval_seconds
             while time.monotonic() < deadline:
                 if consume_stop_after_current_item_request():
@@ -387,6 +687,11 @@ def _run_vinted_trend_scout(**kwargs) -> ScrapeOutcome:
     latest_meta: dict = {}
     while True:
         if consume_stop_after_current_item_request():
+            break
+        if wait_for_internet_connection(
+            label="vinted-trend-scout",
+            should_stop=consume_stop_after_current_item_request,
+        ) is None:
             break
         cycle += 1
         due_queries = store.due_queries(max(int(kwargs.get("trend_queries_per_cycle", 3) or 3), 1))
@@ -469,9 +774,14 @@ def _run_vinted_trend_scout(**kwargs) -> ScrapeOutcome:
 
 
 def _run_vinted_continuous_monitoring(**kwargs) -> ScrapeOutcome:
-    profile_urls = _resolve_vinted_profile_urls(kwargs)
+    profile_urls = normalize_vinted_profile_urls(_resolve_vinted_profile_urls(kwargs))
+    owned_profile_urls = normalize_vinted_profile_urls(kwargs.get("owned_profile_urls", ""))
+    # Keep a profile in only one group: owned profiles use the full inventory,
+    # while the regular profile group may intentionally apply a category filter.
+    owned_profile_keys = {normalize_vinted_profile_url(url) for url in owned_profile_urls}
+    profile_urls = [url for url in profile_urls if normalize_vinted_profile_url(url) not in owned_profile_keys]
     competitor_specs = _resolve_vinted_competitor_search_specs(kwargs)
-    if not profile_urls and not competitor_specs:
+    if not profile_urls and not owned_profile_urls and not competitor_specs:
         raise ValueError("Inserisci almeno un profilo o una keyword competitor per il monitoraggio continuo.")
 
     article_interval_seconds = max(
@@ -503,8 +813,20 @@ def _run_vinted_continuous_monitoring(**kwargs) -> ScrapeOutcome:
     while True:
         if consume_stop_after_current_item_request():
             break
+        network_waited = wait_for_internet_connection(
+            label="vinted-monitoraggio-continuo",
+            should_stop=consume_stop_after_current_item_request,
+        )
+        if network_waited is None:
+            break
+        # If connectivity dropped during the previous component pass, retry
+        # due work immediately after the gate opens instead of honoring a
+        # stale one-hour profile/competitor deadline.
+        if network_waited:
+            next_profile_run_at = 0.0
+            next_competitor_run_at = 0.0
         now = time.monotonic()
-        run_profiles = bool(profile_urls) and not profile_single_run_complete and now >= next_profile_run_at
+        run_profiles = bool(profile_urls or owned_profile_urls) and not profile_single_run_complete and now >= next_profile_run_at
         run_competitors = bool(competitor_specs) and not competitor_single_run_complete and now >= next_competitor_run_at
         if not run_profiles and not run_competitors:
             due_times = [due_at for due_at in (next_profile_run_at, next_competitor_run_at) if due_at > now]
@@ -518,42 +840,86 @@ def _run_vinted_continuous_monitoring(**kwargs) -> ScrapeOutcome:
         )
         rows: list[dict] = []
         profile_meta: dict = {}
+        owned_profile_meta: dict = {}
         competitor_meta: dict = {}
         errors: list[dict[str, str]] = []
 
         if run_profiles:
             profile_cycle_index += 1
-            try:
-                profile_outcome = run_vinted_profile_monitor(
-                    profile_url="",
-                    profile_urls=profile_urls,
-                    max_items=int(kwargs.get("max_items", 0) or 0),
-                    interval_seconds=0,
-                    db_path=db_path,
-                    ui_result_json="",
-                    browser_mode=str(kwargs.get("browser_mode", "chrome_normale") or "chrome_normale"),
-                    browser_user_data_dir=str(kwargs.get("browser_user_data_dir", "") or ""),
-                    browser_profile_directory=str(kwargs.get("browser_profile_directory", "Default") or "Default"),
-                    keep_browser_open=False,
-                    close_existing_runtime_browser=True,
-                    refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
-                    keep_open_seconds=0,
-                    slow_mode=bool(kwargs.get("slow_mode", False)),
-                    action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5) or 1.5),
-                    page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0) or 3.0),
-                    discord_profile_report=bool(kwargs.get("discord_profile_report", False)),
-                    discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
-                    daily_report_hour=int(kwargs.get("daily_report_hour", 10) or 10),
-                    send_daily_report=False,
-                    check_listing_statuses=True,
-                    profile_categories=str(kwargs.get("profile_categories", "") or ""),
+            if profile_urls:
+                try:
+                    profile_outcome = run_vinted_profile_monitor(
+                        profile_url="",
+                        profile_urls=profile_urls,
+                        max_items=int(kwargs.get("max_items", 0) or 0),
+                        interval_seconds=0,
+                        db_path=db_path,
+                        ui_result_json="",
+                        browser_mode=str(kwargs.get("browser_mode", "chrome_normale") or "chrome_normale"),
+                        browser_user_data_dir=str(kwargs.get("browser_user_data_dir", "") or ""),
+                        browser_profile_directory=str(kwargs.get("browser_profile_directory", "Default") or "Default"),
+                        keep_browser_open=False,
+                        close_existing_runtime_browser=True,
+                        refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
+                        keep_open_seconds=0,
+                        slow_mode=bool(kwargs.get("slow_mode", False)),
+                        action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5) or 1.5),
+                        page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0) or 3.0),
+                        discord_profile_report=bool(kwargs.get("discord_profile_report", False)),
+                        discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
+                        daily_report_hour=int(kwargs.get("daily_report_hour", 10) or 10),
+                        send_daily_report=False,
+                        check_listing_statuses=True,
+                        profile_categories=str(kwargs.get("profile_categories", "") or ""),
+                    )
+                    profile_meta = dict(profile_outcome.meta)
+                    for row in profile_outcome.rows:
+                        rows.append({**row, "continuous_component": "profiles"})
+                except Exception as exc:
+                    errors.append({"component": "profiles", "error": str(exc)})
+                    print(f"[continuous-monitoring] profiles-error cycle={cycle_index} error={exc}", flush=True)
+            if owned_profile_urls and not consume_stop_after_current_item_request():
+                print(
+                    f"[continuous-monitoring] owned-profiles-start cycle={cycle_index} count={len(owned_profile_urls)} full_inventory=True",
+                    flush=True,
                 )
-                profile_meta = dict(profile_outcome.meta)
-                for row in profile_outcome.rows:
-                    rows.append({**row, "continuous_component": "profiles"})
-            except Exception as exc:
-                errors.append({"component": "profiles", "error": str(exc)})
-                print(f"[continuous-monitoring] profiles-error cycle={cycle_index} error={exc}", flush=True)
+                try:
+                    owned_outcome = run_vinted_profile_monitor(
+                        profile_url="",
+                        profile_urls=owned_profile_urls,
+                        max_items=int(kwargs.get("max_items", 0) or 0),
+                        interval_seconds=0,
+                        db_path=db_path,
+                        ui_result_json="",
+                        browser_mode=str(kwargs.get("browser_mode", "chrome_normale") or "chrome_normale"),
+                        browser_user_data_dir=str(kwargs.get("browser_user_data_dir", "") or ""),
+                        browser_profile_directory=str(kwargs.get("browser_profile_directory", "Default") or "Default"),
+                        keep_browser_open=False,
+                        close_existing_runtime_browser=True,
+                        refresh_browser_profile=bool(kwargs.get("refresh_browser_profile", False)),
+                        keep_open_seconds=0,
+                        slow_mode=bool(kwargs.get("slow_mode", False)),
+                        action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5) or 1.5),
+                        page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0) or 3.0),
+                        discord_profile_report=bool(kwargs.get("discord_profile_report", False)),
+                        discord_webhook_url=str(kwargs.get("discord_webhook_url", "") or ""),
+                        daily_report_hour=int(kwargs.get("daily_report_hour", 10) or 10),
+                        send_daily_report=False,
+                        check_listing_statuses=True,
+                        profile_categories="",
+                    )
+                    owned_profile_meta = dict(owned_outcome.meta)
+                    for row in owned_outcome.rows:
+                        rows.append({**row, "continuous_component": "owned_profiles"})
+                    print(
+                        f"[continuous-monitoring] owned-profiles-finished cycle={cycle_index} "
+                        f"profiles={len(owned_profile_urls)} items={owned_profile_meta.get('profile_item_count', 0)} "
+                        f"sold={owned_profile_meta.get('profile_sold_count', 0)}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    errors.append({"component": "owned_profiles", "error": str(exc)})
+                    print(f"[continuous-monitoring] owned-profiles-error cycle={cycle_index} error={exc}", flush=True)
             if profile_interval_seconds <= 0:
                 profile_single_run_complete = True
             else:
@@ -613,10 +979,12 @@ def _run_vinted_continuous_monitoring(**kwargs) -> ScrapeOutcome:
                 "profile_interval_seconds": profile_interval_seconds,
                 "profile_cycle": profile_cycle_index,
                 "competitor_cycle": competitor_cycle_index,
-                "profile_count": len(profile_urls),
+                "profile_count": len(profile_urls) + len(owned_profile_urls),
+                "owned_profile_count": len(owned_profile_urls),
                 "competitor_search_count": len(competitor_specs),
                 "continuous_deal_notifications": bool(kwargs.get("discord_deal_notifications", False)),
                 "profile_meta": profile_meta,
+                "owned_profile_meta": owned_profile_meta,
                 "competitor_meta": competitor_meta,
                 "deal_sale_monitor": deal_sale_meta,
                 "component_errors": errors,
@@ -651,6 +1019,7 @@ def _run_vinted_queries_once(search_specs: list[dict], **kwargs) -> ScrapeOutcom
     if not search_specs:
         raise ValueError("Inserisci una ricerca Vinted o un searches-file valido.")
     deal_hunter_enabled = int(kwargs.get("deal_hunter_min_favorites", 0) or 0) > 0
+    run_kind = str(kwargs.get("run_kind", "") or ("procacciatore" if deal_hunter_enabled else "search"))
 
     if len(search_specs) == 1:
         spec = search_specs[0]
@@ -679,10 +1048,12 @@ def _run_vinted_queries_once(search_specs: list[dict], **kwargs) -> ScrapeOutcom
             slow_mode=bool(kwargs.get("slow_mode", False)),
             action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
             page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
-            run_kind=str(kwargs.get("run_kind", "") or "search"),
+            run_kind=run_kind,
             separate_status_tab=bool(kwargs.get("separate_status_tab", False)),
-            monitor_existing_deal_sales_in_search_task=bool(
-                kwargs.get("monitor_existing_deal_sales_in_search_task", False)
+            monitor_existing_deal_sales_in_search_task=(
+                False
+                if bool(kwargs.get("_parallel_deal_sales_worker", False))
+                else bool(kwargs.get("monitor_existing_deal_sales_in_search_task", False) or deal_hunter_enabled)
             ),
             deal_sale_check_interval_seconds=int(kwargs.get("deal_sale_check_interval_seconds", 1800) or 0),
             deal_sale_check_max_items=int(kwargs.get("deal_sale_check_max_items", 40) or 40),
@@ -740,10 +1111,12 @@ def _run_vinted_queries_once(search_specs: list[dict], **kwargs) -> ScrapeOutcom
                 action_delay_seconds=float(kwargs.get("action_delay_seconds", 1.5)),
                 page_settle_seconds=float(kwargs.get("page_settle_seconds", 3.0)),
                 detach_browser_on_complete=not deal_hunter_enabled and is_last,
-                run_kind=str(kwargs.get("run_kind", "") or "search"),
+                run_kind=run_kind,
                 separate_status_tab=bool(kwargs.get("separate_status_tab", False)),
-                monitor_existing_deal_sales_in_search_task=bool(
-                    kwargs.get("monitor_existing_deal_sales_in_search_task", False)
+                monitor_existing_deal_sales_in_search_task=(
+                    False
+                    if bool(kwargs.get("_parallel_deal_sales_worker", False))
+                    else bool(kwargs.get("monitor_existing_deal_sales_in_search_task", False) or deal_hunter_enabled)
                 ),
                 deal_sale_check_interval_seconds=int(kwargs.get("deal_sale_check_interval_seconds", 1800) or 0),
                 deal_sale_check_max_items=int(kwargs.get("deal_sale_check_max_items", 40) or 40),

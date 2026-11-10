@@ -30,8 +30,12 @@ class VintedDealsTests(unittest.TestCase):
     def test_parse_relative_age_hours_supports_italian_values(self) -> None:
         self.assertEqual(24.0, parse_vinted_relative_age_hours("ieri"))
         self.assertEqual(24.0, parse_vinted_relative_age_hours("un giorno fa"))
+        self.assertEqual(1.0, parse_vinted_relative_age_hours("un'ora fa"))
+        self.assertEqual(1.0, parse_vinted_relative_age_hours("un’ora fa"))
         self.assertEqual(3.0, parse_vinted_relative_age_hours("3 ore fa"))
         self.assertEqual(48.0, parse_vinted_relative_age_hours("2 giorni fa"))
+        self.assertFalse(is_vinted_deal_hunter_match(30, "3 giorni fa", min_favorites=30, max_age_hours=72))
+        self.assertTrue(is_vinted_deal_hunter_match(30, "3 giorni fa", min_favorites=30, max_age_hours=720))
 
     def test_deal_hunter_candidate_and_match(self) -> None:
         self.assertTrue(is_vinted_deal_hunter_candidate(70))
@@ -164,6 +168,38 @@ class VintedDealsTests(unittest.TestCase):
         self.assertTrue(relevance["category_match"])
         self.assertTrue(relevance["query_match"])
         self.assertTrue(relevance["match"])
+
+    def test_category_only_url_does_not_become_a_keyword_filter(self) -> None:
+        row = annotate_vinted_deal_hunter_row(
+            {
+                "search_term": "https://www.vinted.it/catalog/21-jewellery",
+                "search_url": "https://www.vinted.it/catalog/21-jewellery",
+                "name": "Collana argento",
+                "detail_category_path": "Donna > Accessori > Gioielli > Collane",
+                "detail_catalog_ids": ["1904", "1187", "21", "164"],
+                "favorite_count": 30,
+                "published_at": "un'ora fa",
+                "price_value": 15.0,
+            },
+            min_favorites=30,
+            max_age_hours=72,
+            min_price=15,
+        )
+
+        self.assertTrue(row["deal_hunter_match"])
+
+    def test_category_url_still_rejects_a_detail_outside_jewelry(self) -> None:
+        relevance = evaluate_vinted_deal_relevance(
+            {
+                "search_term": "https://www.vinted.it/catalog/21-jewellery",
+                "search_url": "https://www.vinted.it/catalog/21-jewellery",
+                "name": "Bobina vintage",
+                "detail_category_path": "Hobby e collezionismo > Cucito",
+                "detail_catalog_ids": ["4824", "5151"],
+            }
+        )
+
+        self.assertFalse(relevance["match"])
 
     def test_annotation_demotes_irrelevant_numeric_deal(self) -> None:
         row = annotate_vinted_deal_hunter_row(

@@ -448,7 +448,7 @@ class ScraperApp:
         self.vinted_deal_hunter_terms_var = tk.StringVar(value=", ".join(VINTED_DEAL_HUNTER_DEFAULT_TERMS))
         self.vinted_deal_hunter_category_var = tk.StringVar(value=VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL)
         self.vinted_deal_hunter_max_results_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH))
-        self.vinted_deal_hunter_min_price_var = tk.StringVar(value="")
+        self.vinted_deal_hunter_min_price_var = tk.StringVar(value="15")
         self.vinted_deal_hunter_max_price_var = tk.StringVar(value="")
         self.vinted_deal_hunter_min_favorites_var = tk.StringVar(value=str(VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES))
         self.vinted_deal_hunter_max_age_hours_var = tk.StringVar(value=str(int(VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS)))
@@ -464,6 +464,7 @@ class ScraperApp:
         self.vinted_profile_monitor_urls_seed = "https://www.vinted.it/member/262102939"
         self.vinted_profile_monitor_url_rows: list[dict[str, object]] = []
         self.vinted_db_path_var = tk.StringVar(value=str((script_path.parent / "data" / "scraper.db").resolve()))
+        self.vinted_deal_hunter_db_path = (script_path.parent / "data" / "procacciatore.db").resolve()
         self.vinted_db_filter_var = tk.StringVar()
         self.vinted_db_limit_var = tk.StringVar(value="500")
         self.vinted_signal_filter_var = tk.StringVar(value="tutti")
@@ -1885,6 +1886,13 @@ class ScraperApp:
             wraplength=760,
             justify="left",
         ).grid(row=6, column=0, columnspan=8, sticky="w", pady=(8, 0))
+        ttk.Label(
+            deal_hunter_frame,
+            text=f"Archivio indipendente (non condivide lo storico charm/Pandora): {self.vinted_deal_hunter_db_path}",
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).grid(row=7, column=0, columnspan=10, sticky="w", pady=(4, 0))
 
         profile_monitor_section = CollapsibleSection(card, "Monitor profili Vinted", expanded=False)
         profile_monitor_section.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(0, 10))
@@ -3477,9 +3485,7 @@ class ScraperApp:
         self.vinted_deal_hunter_status_var.set(f"Preset pronto: {len(specs)} ricerche ruotate nel loop.")
 
     def _build_vinted_deal_hunter_command(self) -> list[str]:
-        db_path = self.vinted_db_path_var.get().strip()
-        if not db_path:
-            raise ValueError("Inserisci il percorso del database SQLite.")
+        db_path = str(self.vinted_deal_hunter_db_path)
         keep_open_seconds = self.vinted_keep_open_seconds_var.get().strip() or "0"
         if self.vinted_keep_browser_open_var.get() and not keep_open_seconds.isdigit():
             raise ValueError("I secondi per tenere aperto il browser Vinted devono essere un intero maggiore o uguale a zero.")
@@ -3632,7 +3638,7 @@ class ScraperApp:
 
     def _show_vinted_deal_sales_analytics(self) -> None:
         """Open a compact historical view of deals verified as sold."""
-        raw_db_path = self.vinted_db_path_var.get().strip() or "data/scraper.db"
+        raw_db_path = str(self.vinted_deal_hunter_db_path)
         try:
             rows = load_vinted_deal_sales(raw_db_path, limit=500)
             summary = summarize_vinted_deal_sales(rows)
@@ -4945,7 +4951,7 @@ class ScraperApp:
         self.vinted_deal_hunter_terms_var.set(", ".join(VINTED_DEAL_HUNTER_DEFAULT_TERMS))
         self.vinted_deal_hunter_category_var.set(VINTED_DEAL_HUNTER_DEFAULT_CATEGORY_LABEL)
         self.vinted_deal_hunter_max_results_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_MAX_RESULTS_PER_SEARCH))
-        self.vinted_deal_hunter_min_price_var.set("")
+        self.vinted_deal_hunter_min_price_var.set("15")
         self.vinted_deal_hunter_max_price_var.set("")
         self.vinted_deal_hunter_min_favorites_var.set(str(VINTED_DEAL_HUNTER_DEFAULT_MIN_FAVORITES))
         self.vinted_deal_hunter_max_age_hours_var.set(str(int(VINTED_DEAL_HUNTER_DEFAULT_MAX_AGE_HOURS)))

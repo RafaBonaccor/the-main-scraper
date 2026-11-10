@@ -1,0 +1,5 @@
+# Optional dependencies for scraper_app.vinted_image_embeddings only.
+# Install into the main-scraper virtualenv; this does not affect scraper runtime.
+Pillow>=10.0
+torch>=2.2
+transformers>=4.45

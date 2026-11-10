@@ -1,7 +1,7 @@
 import json
 import re
 import unicodedata
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .utils import normalize_whitespace
 
@@ -68,8 +68,23 @@ def evaluate_vinted_deal_relevance(row: dict) -> dict[str, object]:
     category_path = str(row.get("detail_category_path", "") or "").strip()
     checked = bool(row.get("detail_relevance_checked") or detail_catalog_ids or category_path)
     category_match = not expected_catalog_id or expected_catalog_id in detail_catalog_ids
+    if not category_match and expected_catalog_id == "21" and category_path:
+        # Vinted's main jewelry catalog occasionally omits the catalog ID from
+        # the detail payload; the structured category breadcrumb is an
+        # equivalent positive signal for this broad catalog.
+        normalized_category_path = _normalize_match_text(category_path)
+        category_match = any(token in normalized_category_path.split() for token in ("gioielli", "gioiello", "jewellery", "jewelry"))
 
-    search_term = _normalize_match_text(row.get("search_term"))
+    raw_search_term = str(row.get("search_term", "") or "").strip()
+    if raw_search_term.lower().startswith(("http://", "https://")):
+        # A category-only URL is not a text query. If it also has a search_text
+        # parameter, retain that keyword while validating the catalog ID above.
+        try:
+            query_terms = parse_qs(urlsplit(raw_search_term).query).get("search_text", [])
+        except ValueError:
+            query_terms = []
+        raw_search_term = str(query_terms[0] if query_terms else "").strip()
+    search_term = _normalize_match_text(raw_search_term)
     searchable_text = _normalize_match_text(
         f"{row.get('name', '')} {category_path}"
     )
@@ -182,9 +197,13 @@ def coerce_vinted_favorite_count(value: object) -> int | None:
 
 
 def parse_vinted_relative_age_hours(published_at: object) -> float | None:
-    text = normalize_whitespace(str(published_at or "")).lower()
+    text = normalize_whitespace(str(published_at or "")).lower().replace("’", "'")
     if not text:
         return None
+    if re.match(r"^un'ora\s+fa$", text):
+        text = "1 ora fa"
+    else:
+        text = re.sub(r"^(?:un|uno|una)\s+", "1 ", text)
     if text in {"ora", "adesso"}:
         return 0.0
     if text == "ieri":
@@ -253,6 +272,12 @@ def is_vinted_deal_hunter_match(
     if age_hours is None:
         return False
     if age_hours > normalized_max_age_hours:
+        return False
+    # Day-level labels are rounded/coarse. If they sit exactly on the age
+    # limit (for example "3 giorni fa" with a 72h limit), treat age as
+    # unverified rather than claiming it is definitely within the window.
+    age_label = normalize_whitespace(str(published_at or "")).lower()
+    if age_hours >= normalized_max_age_hours and re.match(r"^\d+\s+(?:giorn\w*|days?)\s+fa$", age_label):
         return False
     normalized_max_price = normalize_vinted_deal_hunter_max_price(max_price)
     normalized_min_price = normalize_vinted_deal_hunter_min_price(min_price)

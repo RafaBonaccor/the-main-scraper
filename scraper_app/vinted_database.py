@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 
 
 DEFAULT_VINTED_DB_PATH = Path("data") / "scraper.db"
+DEFAULT_PROCACCIATORE_DB_PATH = Path("data") / "procacciatore.db"
 VINTED_ITEM_ID_PATTERN = re.compile(r"/items/(\d+)")
 
 
@@ -38,7 +39,7 @@ def ensure_vinted_database(db_path: str | Path = DEFAULT_VINTED_DB_PATH) -> Path
 def backup_vinted_database(db_path: str | Path = DEFAULT_VINTED_DB_PATH) -> Path | None:
     """Create one verified, immutable SQLite backup per day."""
     path = Path(db_path).expanduser().resolve()
-    if path.name != "scraper.db" or not path.is_file() or path.stat().st_size <= 0:
+    if not path.is_file() or path.stat().st_size <= 0:
         return None
     backup_dir = path.parent / "backups" / "daily"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -383,9 +384,70 @@ def track_vinted_deal_sales(rows: list[dict], db_path: str | Path = DEFAULT_VINT
     with closing(sqlite3.connect(path)) as connection:
         _create_schema(connection)
         for row in valid_rows:
-            _upsert_vinted_deal_sale_tracking(connection, row=row, first_seen_at=now)
+            tracking_first_seen = str(row.get("tracking_first_seen_at", "") or now)
+            _upsert_vinted_deal_sale_tracking(connection, row=row, first_seen_at=tracking_first_seen)
         connection.commit()
     return len(valid_rows)
+
+
+def track_qualified_vinted_procacciatore_observations(
+    db_path: str | Path = DEFAULT_PROCACCIATORE_DB_PATH,
+    *,
+    min_favorites: int = 30,
+    max_age_hours: float = 72.0,
+    min_price: float = 15.0,
+) -> dict[str, int]:
+    """Backfill already-observed, qualified jewelry into sale lifecycle tracking."""
+    path = Path(db_path).expanduser().resolve()
+    if not path.is_file():
+        return {"eligible": 0, "tracked": 0}
+    from .vinted_deals import annotate_vinted_deal_hunter_row
+
+    try:
+        with closing(sqlite3.connect(path)) as connection:
+            connection.row_factory = sqlite3.Row
+            records = connection.execute(
+                """SELECT p.item_link,p.item_id,p.item_name,p.search_term,p.image_url,
+                          p.first_seen_at,p.price_value,p.price_text,p.favorite_count,
+                          i.published_at,i.detail_category_path,i.detail_catalog_ids
+                   FROM vinted_procacciatore_listings AS p
+                   JOIN vinted_items AS i ON i.link=p.item_link
+                   WHERE p.favorite_count >= ? AND p.price_value >= ?""",
+                (max(int(min_favorites), 0), max(float(min_price), 0.0)),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError(f"Database Procacciatore non valido: {exc}") from exc
+
+    eligible_by_link: dict[str, dict] = {}
+    for record in records:
+        search_value = str(record["search_term"] or "").strip()
+        row = {
+            "link": str(record["item_link"] or ""),
+            "item_id": str(record["item_id"] or ""),
+            "name": str(record["item_name"] or ""),
+            "search_term": search_value,
+            "search_url": search_value if search_value.startswith(("http://", "https://")) else "",
+            "image_url": str(record["image_url"] or ""),
+            "published_at": str(record["published_at"] or ""),
+            "detail_category_path": str(record["detail_category_path"] or ""),
+            "detail_catalog_ids": str(record["detail_catalog_ids"] or ""),
+            "detail_relevance_checked": bool(record["detail_category_path"] or record["detail_catalog_ids"]),
+            "price_value": record["price_value"],
+            "price": str(record["price_text"] or ""),
+            "favorite_count": record["favorite_count"],
+            "tracking_first_seen_at": str(record["first_seen_at"] or ""),
+        }
+        qualified = annotate_vinted_deal_hunter_row(
+            row,
+            min_favorites=min_favorites,
+            max_age_hours=max_age_hours,
+            min_price=min_price,
+        )
+        if qualified.get("deal_hunter_match"):
+            eligible_by_link[row["link"]] = qualified
+
+    eligible = list(eligible_by_link.values())
+    return {"eligible": len(eligible), "tracked": track_vinted_deal_sales(eligible, db_path=path)}
 
 
 def load_vinted_sold_deal_identity_keys(
@@ -726,6 +788,87 @@ def load_vinted_deal_sales(
         )
         rows.append(row)
     return rows
+
+
+def load_vinted_sold_deals_missing_dom_image(
+    db_path: str | Path = DEFAULT_VINTED_DB_PATH,
+    *,
+    limit: int = 0,
+) -> list[dict]:
+    """Return confirmed historical sales that have no usable full DOM image yet."""
+    path = Path(db_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Database Vinted non trovato: {path}")
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        records = connection.execute(
+            """SELECT item_link,item_id,item_name,first_seen_at,last_checked_at,sold_at,payload_json
+               FROM vinted_deal_sale_tracking
+               WHERE status='sold' AND sold_at<>'' ORDER BY sold_at DESC,item_id"""
+        ).fetchall()
+    results: list[dict] = []
+    for record in records:
+        try:
+            payload = json.loads(str(record["payload_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        row = payload if isinstance(payload, dict) else {}
+        image_path = str(row.get("sold_dom_image_path", "") or "").strip()
+        if image_path and Path(image_path).is_file():
+            continue
+        check_status = str(row.get("sold_dom_image_check_status", "") or "").strip().lower()
+        if check_status in {"page_not_found", "no_product_image", "error"}:
+            # The historical audit persists terminal outcomes so a missing
+            # image is classified once instead of hammering the same dead URL.
+            continue
+        row.update(
+            {
+                "link": str(record["item_link"] or row.get("link", "")),
+                "item_id": str(record["item_id"] or row.get("item_id", "")),
+                "name": str(record["item_name"] or row.get("name", "")),
+                "deal_first_seen_at": str(record["first_seen_at"] or ""),
+                "deal_sold_at": str(record["sold_at"] or ""),
+            }
+        )
+        results.append(row)
+        if int(limit or 0) > 0 and len(results) >= int(limit):
+            break
+    return results
+
+
+def save_vinted_sold_dom_image_metadata(
+    link: str,
+    image_metadata: dict,
+    *,
+    db_path: str | Path = DEFAULT_VINTED_DB_PATH,
+) -> bool:
+    """Attach a backfilled image to a sold record without changing its sale timestamps/status."""
+    normalized_link = str(link or "").strip()
+    if not normalized_link:
+        return False
+    path = Path(db_path).expanduser().resolve()
+    with closing(sqlite3.connect(path)) as connection:
+        _create_schema(connection)
+        record = connection.execute(
+            "SELECT payload_json FROM vinted_deal_sale_tracking WHERE item_link=? AND status='sold'",
+            (normalized_link,),
+        ).fetchone()
+        if record is None:
+            return False
+        try:
+            payload = json.loads(str(record[0] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.update(image_metadata)
+        connection.execute(
+            "UPDATE vinted_deal_sale_tracking SET payload_json=? WHERE item_link=? AND status='sold'",
+            (json.dumps(payload, ensure_ascii=False), normalized_link),
+        )
+        connection.commit()
+    return True
 
 
 def summarize_vinted_deal_sales(rows: list[dict]) -> dict[str, object]:
@@ -1797,15 +1940,40 @@ def delete_vinted_search_run(
     }
 
 
+def load_vinted_profile_ignored_item_ids(
+    profile_url: str,
+    db_path: str | Path = DEFAULT_VINTED_DB_PATH,
+) -> set[str]:
+    """Read per-profile manual exclusions without changing the raw archive."""
+    path = Path(db_path).expanduser().resolve()
+    member_id = normalize_vinted_member_id(profile_url)
+    if not member_id or not path.is_file():
+        return set()
+    with closing(sqlite3.connect(path)) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vinted_owned_profile_ignored_items'"
+        ).fetchone()
+        if not exists:
+            return set()
+        return {
+            str(row[0]) for row in connection.execute(
+                "SELECT item_id FROM vinted_owned_profile_ignored_items WHERE member_id = ?", (member_id,)
+            ).fetchall()
+        }
+
+
 def save_vinted_profile_snapshot(
     profile_url: str,
     rows: list[dict],
     db_path: str | Path = DEFAULT_VINTED_DB_PATH,
+    *,
+    authoritative_inventory: bool = False,
 ) -> dict[str, object]:
     path = Path(db_path).expanduser().resolve()
     ensure_vinted_database(path)
     normalized_profile_url = str(profile_url or "").strip()
     member_id = normalize_vinted_member_id(normalized_profile_url)
+    ignored_item_ids = load_vinted_profile_ignored_item_ids(normalized_profile_url, db_path=path)
     snapshot_at = datetime.now().isoformat(timespec="seconds")
     normalized_rows: list[dict] = []
     seen_links: set[str] = set()
@@ -1817,6 +1985,8 @@ def save_vinted_profile_snapshot(
             continue
         seen_links.add(link)
         item_id = str(row.get("item_id", "") or "").strip() or extract_vinted_item_id_from_link(link)
+        if item_id in ignored_item_ids:
+            continue
         normalized = dict(row)
         normalized["link"] = link
         normalized["item_id"] = item_id
@@ -1874,6 +2044,7 @@ def save_vinted_profile_snapshot(
                         (int(previous_snapshot["id"]),),
                     ).fetchall()
                     if str(record[0] or "")
+                    and extract_vinted_item_id_from_link(str(record[0])) not in ignored_item_ids
                 }
 
             previous_count = len(previous_links)
@@ -1898,6 +2069,15 @@ def save_vinted_profile_snapshot(
                     and missing_ratio >= 0.35
                 )
             )
+            # A complete member-scoped wardrobe response can correct an older
+            # DOM snapshot polluted by recommendations. Keep that old snapshot
+            # for audit, but do not classify its unverified links as sales/gone.
+            trusted_rebaseline = bool(authoritative_inventory and current_count > 0 and incomplete_snapshot)
+            if trusted_rebaseline:
+                # This is a corrected baseline, not a discovery cycle. Old
+                # document links may even use different slugs for the same ID.
+                previous_links = set(current_links)
+                incomplete_snapshot = False
             if incomplete_snapshot:
                 preserved_rows: list[dict] = []
                 if previous_snapshot is not None:
@@ -2099,6 +2279,7 @@ def save_vinted_profile_snapshot(
         "profile_still_count": len(still_links),
         "profile_current_rows": normalized_rows,
         "profile_gone_rows": gone_rows,
+        "profile_rebaseline": trusted_rebaseline,
         "db_saved_live": True,
     }
 
@@ -2118,6 +2299,7 @@ def load_vinted_profile_known_items(
     member_id = normalize_vinted_member_id(normalized_profile_url)
     if not member_id or not path.is_file():
         return []
+    ignored_item_ids = load_vinted_profile_ignored_item_ids(normalized_profile_url, db_path=path)
     try:
         with closing(sqlite3.connect(path)) as connection:
             connection.row_factory = sqlite3.Row
@@ -2138,7 +2320,7 @@ def load_vinted_profile_known_items(
     rows_by_link: dict[str, dict] = {}
     for record in records:
         link = str(record["item_link"] or "").strip()
-        if not link or link in rows_by_link:
+        if not link or link in rows_by_link or str(record["item_id"] or extract_vinted_item_id_from_link(link)) in ignored_item_ids:
             continue
         try:
             payload = json.loads(str(record["snapshot_json"] or "{}"))
@@ -2178,6 +2360,7 @@ def load_vinted_profile_latest_snapshot_items(
     member_id = normalize_vinted_member_id(normalized_profile_url)
     if not member_id or not path.is_file():
         return []
+    ignored_item_ids = load_vinted_profile_ignored_item_ids(normalized_profile_url, db_path=path)
     try:
         with closing(sqlite3.connect(path)) as connection:
             connection.row_factory = sqlite3.Row
@@ -2219,7 +2402,7 @@ def load_vinted_profile_latest_snapshot_items(
     rows: list[dict] = []
     for record in records:
         link = str(record["item_link"] or "").strip()
-        if not link:
+        if not link or str(record["item_id"] or extract_vinted_item_id_from_link(link)) in ignored_item_ids:
             continue
         try:
             payload = json.loads(str(record["snapshot_json"] or "{}"))
@@ -2278,6 +2461,10 @@ def load_vinted_profile_daily_changes(
           AND s.checked_at <= ?
           AND s.item_count > 0
           AND LOWER(psi.status) IN ('new', 'gone', 'sold')
+          AND NOT EXISTS (
+              SELECT 1 FROM vinted_owned_profile_ignored_items ignored
+              WHERE ignored.member_id = psi.member_id AND ignored.item_id = psi.item_id
+          )
     """
     params: list[object] = [since_at, until_at]
     if profile_member_ids:
@@ -2550,6 +2737,41 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_vinted_deal_sale_tracking_due
         ON vinted_deal_sale_tracking(status, last_checked_at, first_seen_at);
 
+        -- Procacciatore-only catalog observations. Kept in its dedicated DB and
+        -- separate from qualified deal-sale lifecycle tracking.
+        CREATE TABLE IF NOT EXISTS vinted_procacciatore_listings (
+            item_link TEXT NOT NULL,
+            search_term TEXT NOT NULL DEFAULT '',
+            item_id TEXT NOT NULL DEFAULT '',
+            item_name TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT '',
+            image_url TEXT NOT NULL DEFAULT '',
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            first_price_value REAL,
+            price_value REAL,
+            price_text TEXT NOT NULL DEFAULT '',
+            favorite_count INTEGER,
+            times_seen INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(item_link, search_term)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_procacciatore_listings_seen
+        ON vinted_procacciatore_listings(last_seen_at DESC);
+
+        CREATE TABLE IF NOT EXISTS vinted_procacciatore_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_link TEXT NOT NULL,
+            search_term TEXT NOT NULL DEFAULT '',
+            observed_at TEXT NOT NULL,
+            price_value REAL,
+            favorite_count INTEGER,
+            UNIQUE(item_link, search_term, observed_at)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_procacciatore_snapshots_listing
+        ON vinted_procacciatore_snapshots(item_link, search_term, observed_at);
+
         CREATE TABLE IF NOT EXISTS vinted_item_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             item_link TEXT NOT NULL,
@@ -2601,6 +2823,13 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_vinted_profile_snapshot_items_status
         ON vinted_profile_snapshot_items(snapshot_id, status);
+
+        CREATE TABLE IF NOT EXISTS vinted_owned_profile_ignored_items (
+            member_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            ignored_at TEXT NOT NULL,
+            PRIMARY KEY (member_id, item_id)
+        );
 
         CREATE TABLE IF NOT EXISTS vinted_owned_profiles (
             member_id TEXT PRIMARY KEY,
@@ -2655,6 +2884,88 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_vinted_competitors_status_score ON vinted_competitors(status, score DESC)"
     )
+
+
+def record_vinted_procacciatore_observations(
+    rows: list[dict],
+    db_path: str | Path = DEFAULT_PROCACCIATORE_DB_PATH,
+    *,
+    snapshot_interval_seconds: int = 1800,
+) -> dict[str, int]:
+    """Persist catalog supply and periodic like/price observations for Procacciatore."""
+    path = Path(db_path).expanduser().resolve()
+    ensure_vinted_database(path)
+    valid = [row for row in rows if isinstance(row, dict) and str(row.get("link", "") or "").strip()]
+    if not valid:
+        return {"observed": 0, "snapshots": 0}
+    now = datetime.now().replace(microsecond=0)
+    now_text = now.isoformat()
+    interval = max(60, int(snapshot_interval_seconds or 1800))
+    snapshots = 0
+    with closing(sqlite3.connect(path)) as connection:
+        _create_schema(connection)
+        for row in valid:
+            link = str(row.get("link", "") or "").strip()
+            term = str(row.get("search_term", "") or row.get("query_label", "") or "").strip()
+            price = row.get("price_value")
+            try:
+                price = float(price) if price not in (None, "") else None
+            except (TypeError, ValueError):
+                price = None
+            likes = row.get("favorite_count")
+            try:
+                likes = max(0, int(likes)) if likes not in (None, "") else None
+            except (TypeError, ValueError):
+                likes = None
+            existing = connection.execute(
+                "SELECT first_seen_at, first_price_value, price_value, favorite_count FROM vinted_procacciatore_listings WHERE item_link=? AND search_term=?",
+                (link, term),
+            ).fetchone()
+            first_price = price if existing is None else existing[1]
+            if first_price is None and existing is not None:
+                first_price = existing[2]
+            connection.execute(
+                """INSERT INTO vinted_procacciatore_listings
+                   (item_link,search_term,item_id,item_name,category,image_url,first_seen_at,last_seen_at,
+                    first_price_value,price_value,price_text,favorite_count,times_seen)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)
+                   ON CONFLICT(item_link,search_term) DO UPDATE SET
+                     item_id=COALESCE(NULLIF(excluded.item_id,''),item_id),
+                     item_name=COALESCE(NULLIF(excluded.item_name,''),item_name),
+                     category=COALESCE(NULLIF(excluded.category,''),category),
+                     image_url=COALESCE(NULLIF(excluded.image_url,''),image_url),
+                     last_seen_at=excluded.last_seen_at,
+                     first_price_value=COALESCE(first_price_value,excluded.first_price_value),
+                     price_value=COALESCE(excluded.price_value,price_value),
+                     price_text=COALESCE(NULLIF(excluded.price_text,''),price_text),
+                     favorite_count=COALESCE(excluded.favorite_count,favorite_count),
+                     times_seen=times_seen+1""",
+                (
+                    link, term, str(row.get("item_id", "") or ""), str(row.get("name", "") or ""),
+                    str(row.get("detail_category_path", "") or row.get("category", "") or ""),
+                    str(row.get("image_url", "") or ""),
+                    str(existing[0]) if existing else now_text, now_text, first_price, price,
+                    str(row.get("price", "") or row.get("price_text", "") or ""), likes,
+                ),
+            )
+            latest = connection.execute(
+                "SELECT observed_at FROM vinted_procacciatore_snapshots WHERE item_link=? AND search_term=? ORDER BY observed_at DESC LIMIT 1",
+                (link, term),
+            ).fetchone()
+            due = latest is None
+            if latest:
+                try:
+                    due = (now - datetime.fromisoformat(str(latest[0]))).total_seconds() >= interval
+                except ValueError:
+                    due = True
+            if due and (price is not None or likes is not None):
+                connection.execute(
+                    "INSERT OR IGNORE INTO vinted_procacciatore_snapshots(item_link,search_term,observed_at,price_value,favorite_count) VALUES(?,?,?,?,?)",
+                    (link, term, now_text, price, likes),
+                )
+                snapshots += 1
+        connection.commit()
+    return {"observed": len(valid), "snapshots": snapshots}
 
 
 def _ensure_vinted_search_hits_tag_column(connection: sqlite3.Connection) -> None:

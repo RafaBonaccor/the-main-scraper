@@ -11,6 +11,7 @@ from botasaurus.browser import Driver, Wait, browser
 
 from ..browser_helpers import DEFAULT_COOKIE_REJECT_TEXTS, click_first_matching_text, current_page_url, navigate_with_retries
 from ..browser_runtime import resolve_browser_arguments, resolve_browser_profile
+from ..connectivity import wait_for_internet_connection
 from ..discord_notifications import (
     build_vinted_profile_daily_report_discord_message,
     build_vinted_profile_report_discord_message,
@@ -26,6 +27,7 @@ from ..vinted_database import (
     extract_vinted_item_id_from_link,
     format_vinted_elapsed_seconds,
     load_vinted_profile_known_items,
+    load_vinted_profile_ignored_item_ids,
     load_vinted_profile_latest_snapshot_items,
     load_vinted_profile_daily_changes,
     load_vinted_deal_sales,
@@ -40,6 +42,14 @@ from .vinted_deal_sales import _sold_status_from_page
 
 VINTED_PROFILE_NAVIGATION_TIMEOUT_SECONDS = 20
 DEFAULT_AGENT_LAB_RUNTIME_URL = "http://127.0.0.1:8000"
+_PROFILE_CURRENCY_AMOUNT_PATTERN = re.compile(
+    r"(?:€|â‚¬)\s*(?:\d{1,3}(?:[ .]\d{3})+|\d+)(?:[,.]\d{1,2})?"
+    r"|(?:\d{1,3}(?:[ .]\d{3})+|\d+)(?:[,.]\d{1,2})?\s*(?:€|â‚¬)",
+    re.IGNORECASE,
+)
+_PROFILE_COMMISSION_MARKER_PATTERN = re.compile(
+    r"\b(?:incl\.?|include(?:s|d)?)\b", re.IGNORECASE
+)
 
 # The wardrobe endpoint requires the page-specific anonymous/CSRF headers.
 # Capture only those two non-secret request values before the profile app makes
@@ -213,6 +223,11 @@ def run_vinted_profile_monitor(
     last_daily_report_date = ""
     while True:
         if consume_stop_after_current_item_request():
+            break
+        if wait_for_internet_connection(
+            label="vinted-profili",
+            should_stop=consume_stop_after_current_item_request,
+        ) is None:
             break
         cycle_index += 1
         cycle_rows: list[dict] = []
@@ -516,19 +531,24 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         member_id=member_id,
         max_items=max(int(config.get("max_items", 0) or 0), 0),
     )
-    if len(api_rows) > len(rows):
-        _log_vinted_profile("profile-wardrobe-pagination-used", dom_rows=len(rows), api_rows=len(api_rows))
+    # The member-scoped wardrobe endpoint is stronger ownership evidence than
+    # document-wide item links, which can include recommendations and ads.
+    if api_rows:
+        _log_vinted_profile("profile-wardrobe-api-used", dom_rows=len(rows), api_rows=len(api_rows))
+        for row in api_rows:
+            row["profile_inventory_source"] = "wardrobe_api"
         rows = api_rows
     declared_item_count = _read_vinted_profile_declared_item_count(driver)
-    paged_rows = _read_vinted_profile_additional_pages(
-        driver,
-        profile_url=profile_url,
-        existing_rows=rows,
-        declared_item_count=declared_item_count,
-        max_items=max(int(config.get("max_items", 0) or 0), 0),
-    )
-    if len(paged_rows) > len(rows):
-        rows = paged_rows
+    if not api_rows:
+        paged_rows = _read_vinted_profile_additional_pages(
+            driver,
+            profile_url=profile_url,
+            existing_rows=rows,
+            declared_item_count=declared_item_count,
+            max_items=max(int(config.get("max_items", 0) or 0), 0),
+        )
+        if len(paged_rows) > len(rows):
+            rows = paged_rows
     category_filters = _normalize_vinted_profile_categories(config.get("profile_categories", ""))
     missing_identity_before = sum(
         1
@@ -543,6 +563,11 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         missing_identity_before=missing_identity_before,
     )
     rows = _attach_vinted_profile_identity(rows, profile_url=profile_url, member_id=member_id)
+    ignored_item_ids = load_vinted_profile_ignored_item_ids(profile_url, db_path=db_path)
+    if ignored_item_ids:
+        before_ignore = len(rows)
+        rows = [row for row in rows if str(row.get("item_id", "") or "") not in ignored_item_ids]
+        _log_vinted_profile("profile-items-ignored", member_id=member_id, ignored=before_ignore - len(rows))
     # Verify profile-missing listings on their detail pages for both owned and
     # competitor profiles. A missing profile card alone is never proof of sale.
     if bool(config.get("check_listing_statuses", False)):
@@ -631,7 +656,7 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
                 page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
             )
             rows = [*rows, *checked_missing_rows]
-        if likely_incomplete:
+        if likely_incomplete and not api_rows:
             # Keep the last trusted inventory and persist only the detail-page
             # outcomes from known gone listings. Never turn an inconsistent
             # profile response into a mass new/gone snapshot.
@@ -653,6 +678,7 @@ def _scrape_vinted_profile_task(driver: Driver, config: dict) -> dict:
         profile_url=profile_url,
         rows=rows,
         db_path=db_path,
+        authoritative_inventory=bool(api_rows),
     )
     if bool(snapshot_meta.get("profile_snapshot_incomplete")):
         # Keep the last complete inventory visible when this read was empty or
@@ -1145,26 +1171,29 @@ try {
             )
             if not isinstance(response, dict):
                 _log_vinted_profile("profile-api-page-invalid", page=page, payload_type=type(response).__name__)
-                break
+                return []
             if bool(response.get("timeout")):
                 _log_vinted_profile("profile-api-page-timeout", page=page, timeout_seconds=12)
-                break
+                return []
             if response.get("error"):
                 _log_vinted_profile("profile-api-page-error", page=page, error=str(response.get("error"))[:120])
-                break
+                return []
             status_code = int(response.get("status", 0) or 0)
             if status_code != 200:
                 _log_vinted_profile("profile-api-page-unavailable", page=page, status=status_code)
-                break
+                return []
             payload = json.loads(str(response.get("text", "") or ""))
         except Exception as error:
             _log_vinted_profile("profile-api-page-error", page=page, error=type(error).__name__)
-            break
+            return []
         if not isinstance(payload, dict):
             _log_vinted_profile("profile-api-page-invalid", page=page, payload_type=type(payload).__name__)
-            break
+            return []
         items = payload.get("items")
-        if not isinstance(items, list) or not items:
+        if not isinstance(items, list):
+            _log_vinted_profile("profile-api-page-invalid", page=page, payload_type=type(items).__name__)
+            return []
+        if not items:
             _log_vinted_profile("profile-api-page-empty", page=page, collected=len(collected))
             break
         page_added = 0
@@ -1241,9 +1270,19 @@ def _normalize_vinted_profile_api_item(item: object) -> dict:
         or photo.get("thumbnail_url")
         or ""
     )
-    price = source.get("price") or source.get("price_numeric") or ""
-    currency = str(source.get("currency", "") or "").strip()
-    price_text = normalize_whitespace(f"{price} {currency}".strip())
+    price_value = source.get("price") or source.get("price_numeric") or source.get("price_text") or ""
+    currency = str(source.get("currency", source.get("currency_code", "")) or "").strip()
+    if isinstance(price_value, dict):
+        currency = str(price_value.get("currency_code", price_value.get("currency", currency)) or currency).strip()
+        price_value = price_value.get("amount", price_value.get("value", ""))
+    price_text = _normalize_profile_price_text(price_value, currency=currency)
+    if not price_text:
+        price_text = _extract_profile_base_price_text(
+            " ".join(
+                str(source.get(key, "") or "")
+                for key in ("title", "name", "description", "raw_text")
+            )
+        )
     category = _vinted_profile_item_category(source)
     return {
         "source": "vinted_profile",
@@ -1379,6 +1418,10 @@ return links.map((link) => {
         title = normalize_whitespace(str(item.get("title", "") or ""))
         if not title:
             title = normalize_whitespace(str(item.get("image_alt", "") or ""))
+        raw_text = normalize_whitespace(str(item.get("raw_text", "") or ""))
+        price_text = _normalize_profile_price_text(item.get("price", ""))
+        if not price_text:
+            price_text = _extract_profile_base_price_text(f"{raw_text} {title}")
         rows.append(
             {
                 "source": "vinted_profile",
@@ -1386,15 +1429,52 @@ return links.map((link) => {
                 "member_id": "",
                 "item_id": item_id,
                 "name": title or link,
-                "price": normalize_whitespace(str(item.get("price", "") or "")),
+                "price": price_text,
                 "link": link,
                 "image_url": normalize_vinted_image_url(str(item.get("image_url", "") or "")),
-                "raw_text": normalize_whitespace(str(item.get("raw_text", "") or "")),
+                "raw_text": raw_text,
                 "profile_item_status": "current",
                 "extracted_at": datetime.now().isoformat(timespec="seconds"),
             }
         )
     return rows
+
+
+def _normalize_profile_price_text(value: object, *, currency: str = "") -> str:
+    """Keep the listing's base price, never the Vinted buyer-total amount."""
+    if isinstance(value, dict):
+        currency = str(value.get("currency_code", value.get("currency", currency)) or currency).strip()
+        value = value.get("amount", value.get("value", ""))
+    text = normalize_whitespace(str(value or ""))
+    if not text:
+        return ""
+    base_price = _extract_profile_base_price_text(text)
+    if base_price:
+        return base_price
+    if _PROFILE_COMMISSION_MARKER_PATTERN.search(text):
+        # A single amount followed by “incl.” is the buyer total, not a safe
+        # substitute for the listing price.
+        return ""
+    currency_key = currency.casefold()
+    amount_match = re.search(r"^\s*(\d[\d., ]*)\s*$", text)
+    if amount_match and currency_key in {"eur", "euro", "€"}:
+        return f"{normalize_whitespace(amount_match.group(1))} €"
+    return text
+
+
+def _extract_profile_base_price_text(value: object) -> str:
+    """Extract the first currency amount, excluding commission-inclusive totals."""
+    text = normalize_whitespace(str(value or "")).replace("â‚¬", "€")
+    if not text:
+        return ""
+    marker = _PROFILE_COMMISSION_MARKER_PATTERN.search(text)
+    price_region = text[: marker.start()] if marker else text
+    matches = list(_PROFILE_CURRENCY_AMOUNT_PATTERN.finditer(price_region))
+    if marker and len(matches) < 2:
+        return ""
+    if not matches:
+        return ""
+    return normalize_whitespace(matches[0].group(0))
 
 
 def _scroll_vinted_profile(driver: Driver) -> dict[str, object]:

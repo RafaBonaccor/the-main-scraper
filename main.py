@@ -55,6 +55,24 @@ def build_parser() -> argparse.ArgumentParser:
     run_subparsers = run_parser.add_subparsers(dest="source", required=True)
     contact_subparsers = contact_parser.add_subparsers(dest="contact_source", required=True)
 
+    linkedin_parser = run_subparsers.add_parser("linkedin_posts", help="Scan the personalized LinkedIn feed for high-engagement posts.")
+    linkedin_parser.add_argument("--scroll-rounds", default=0, type=int,
+                                 help="0 means unlimited scrolling until enough new qualifying posts are found.")
+    linkedin_parser.add_argument("--target-popular-posts", default=50, type=int,
+                                 help="Legacy total-post target, used only when --target-new-posts is 0.")
+    linkedin_parser.add_argument("--target-new-posts", default=10, type=int,
+                                 help="Stop after finding this many qualifying posts not in the LinkedIn database at the start of the run.")
+    linkedin_parser.add_argument("--min-reactions", default=1000, type=int)
+    linkedin_parser.add_argument("--min-post-age-days", default=1, type=int)
+    linkedin_parser.add_argument("--max-post-age-days", default=3, type=int)
+    linkedin_parser.add_argument("--show-browser", action="store_true",
+                                 help="Keep Chrome visible and in the foreground while scrolling the feed.")
+    linkedin_parser.add_argument("--scan-started-at", default="", help=argparse.SUPPRESS)
+    linkedin_parser.add_argument("--db-path", default="data/linkedin_posts.db")
+    _add_orchestrator_arguments(linkedin_parser)
+    _add_browser_arguments(linkedin_parser)
+    _add_export_arguments(linkedin_parser)
+
     google_parser = run_subparsers.add_parser("google_maps", help="Use the Google Maps-specific scraper.")
     google_parser.add_argument("--search", required=True, help="Google Maps query, comma-separated categories, or full URL.")
     google_parser.add_argument("--city", default="", help="Optional city or comma-separated cities to search.")
@@ -175,6 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="In deal-hunter mode, skip Vinted login/detail extraction and send public catalog candidate URLs to Discord.",
+    )
+    vinted_parser.add_argument(
+        "--skip-login-required",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Never open the Vinted/Google login flow; proceed with public pages or fail if access is blocked.",
     )
     vinted_parser.add_argument(
         "--auto-submit-offers",
@@ -325,6 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vinted_continuous_parser.add_argument("--profile-url", "--url", dest="profile_url", default="")
     vinted_continuous_parser.add_argument("--profile-urls", default="", help="Newline-separated marketplace member URLs.")
+    vinted_continuous_parser.add_argument("--owned-profile-urls", default="", help="Newline-separated owned seller profile URLs checked in full, without the competitor profile category filter.")
     vinted_continuous_parser.add_argument("--profile-categories", default="", help="Optional comma-separated profile categories to keep, using labels observed on the profile.")
     vinted_continuous_parser.add_argument("--profiles-file", default="", help="UTF-8 text or JSON file containing monitored profile URLs.")
     vinted_continuous_parser.add_argument("--max-items", default=0, type=int, help="Maximum items read for each monitored profile. Use 0 for all.")
@@ -411,6 +436,31 @@ def build_parser() -> argparse.ArgumentParser:
     _add_orchestrator_arguments(vinted_profile_parser)
     _add_browser_arguments(vinted_profile_parser)
     _add_export_arguments(vinted_profile_parser)
+
+    vinted_sold_image_backfill_parser = run_subparsers.add_parser(
+        "vinted_sold_image_backfill",
+        help="Backfill full-resolution DOM images for confirmed historical Vinted sales.",
+    )
+    vinted_sold_image_backfill_parser.add_argument("--db-path", default="data/scraper.db", help="SQLite database path.")
+    vinted_sold_image_backfill_parser.add_argument(
+        "--limit",
+        default=0,
+        type=int,
+        help="Maximum pages to check in total. Use 0 to continue in batches until all missing images are handled.",
+    )
+    vinted_sold_image_backfill_parser.add_argument("--batch-size", default=40, type=int, help="Page count per browser batch.")
+    vinted_sold_image_backfill_parser.add_argument(
+        "--delay-seconds",
+        default=3.0,
+        type=float,
+        help="Minimum pause between listing pages (at least 2 seconds; randomized +0–1 second).",
+    )
+    vinted_sold_image_backfill_parser.add_argument("--cooldown-seconds", default=180.0, type=float, help="Pause between successful batches.")
+    vinted_sold_image_backfill_parser.add_argument("--rate-limit-cooldown-seconds", default=900.0, type=float, help="Initial cooldown after a detected rate limit; it increases on repeated limits.")
+    vinted_sold_image_backfill_parser.add_argument("--refresh-browser-profile", action="store_true")
+    _add_orchestrator_arguments(vinted_sold_image_backfill_parser)
+    _add_browser_arguments(vinted_sold_image_backfill_parser)
+    _add_export_arguments(vinted_sold_image_backfill_parser)
 
     vinted_details_parser = run_subparsers.add_parser(
         "vinted_descriptions",
@@ -796,6 +846,9 @@ def main() -> int:
     payload.pop("command", None)
     payload.pop("stdout_json", None)
     payload.pop("quiet", None)
+    if source == "vinted" and int(payload.get("deal_hunter_min_favorites", 0) or 0) > 0:
+        # Procacciatore history must never mix with the shared charm/Pandora archive.
+        payload["db_path"] = str(Path(__file__).resolve().parent / "data" / "procacciatore.db")
     try:
         outcome = run_scraper(source=source, **payload)
         outcome.rows = annotate_rows_with_contact_history(outcome.rows)
@@ -918,7 +971,7 @@ def _build_status_payload() -> dict:
         "platform": os.name,
         "active_venv_candidate": active_venv,
         "recommended_browser_mode": "sessione_persistente",
-        "supported_sources": ["google_maps", "aliexpress_image", "vinted", "vinted_competitors", "vinted_trends", "vinted_continuous", "vinted_descriptions", "vinted_profile", "subito", "subito_caregiver", "custom_site"],
+        "supported_sources": ["google_maps", "linkedin_posts", "aliexpress_image", "vinted", "vinted_competitors", "vinted_trends", "vinted_continuous", "vinted_descriptions", "vinted_profile", "subito", "subito_caregiver", "custom_site"],
         "supported_contact_sources": ["subito", "vinted", "vinted_upload"],
         "features": {
             "gui": True,
@@ -958,6 +1011,23 @@ def _normalize_run_result(source: str, rows: list[dict], meta: dict, export_path
 
 
 def _normalize_meta_summary(source: str, meta: dict) -> dict:
+    if source == "linkedin_posts":
+        return {"row_count": int(meta.get("row_count", 0) or 0),
+                "candidates_seen": int(meta.get("candidates_seen", 0) or 0),
+                "target_popular_posts": int(meta.get("target_popular_posts", 0) or 0),
+                "target_new_posts": int(meta.get("target_new_posts", 0) or 0),
+                "new_qualifying": int(meta.get("new_qualifying", 0) or 0),
+                "unlimited_scroll": bool(meta.get("unlimited_scroll", False)),
+                "scan_started_at": str(meta.get("scan_started_at", "") or ""),
+                "min_reactions": int(meta.get("min_reactions", 0) or 0),
+                "min_post_age_days": int(meta.get("min_post_age_days", 0) or 0),
+                "max_post_age_days": int(meta.get("max_post_age_days", 0) or 0),
+                "db_path": str(meta.get("db_path", "") or ""),
+                "feed_url": str(meta.get("feed_url", "") or ""),
+                "scroll_attempts": int(meta.get("scroll_attempts", 0) or 0),
+                "target_reached": bool(meta.get("target_reached", False)),
+                "previous_qualifying": int(meta.get("previous_qualifying", 0) or 0),
+                "stop_reason": str(meta.get("stop_reason", "") or "")}
     if source == "aliexpress_image":
         return {
             "row_count": int(meta.get("row_count", 0) or 0),
@@ -994,6 +1064,7 @@ def _normalize_meta_summary(source: str, meta: dict) -> dict:
             "article_interval_seconds": int(meta.get("article_interval_seconds", 0) or 0),
             "profile_interval_seconds": int(meta.get("profile_interval_seconds", 0) or 0),
             "profile_count": int(meta.get("profile_count", 0) or 0),
+            "owned_profile_count": int(meta.get("owned_profile_count", 0) or 0),
             "competitor_search_count": int(meta.get("competitor_search_count", 0) or 0),
             "component_errors": list(meta.get("component_errors", []) or []),
             "db_path": str(meta.get("db_path", "") or ""),
@@ -1033,6 +1104,8 @@ def _normalize_meta_summary(source: str, meta: dict) -> dict:
 
 
 def _normalize_row(source: str, row: dict) -> dict:
+    if source == "linkedin_posts":
+        return {"id": row.get("post_id", ""), "title": str(row.get("text", ""))[:120], "link": row.get("link", ""), "author": row.get("author", ""), "keyword": row.get("keyword", ""), "reactions": row.get("reactions", 0), "comments": row.get("comments", 0), "reposts": row.get("reposts", 0), "engagement_score": row.get("engagement_score", 0), "published_text": row.get("published_text", ""), "image_url": row.get("image_url", ""), "last_seen_at": row.get("observed_at", "")}
     if source == "aliexpress_image":
         return {
             "id": str(row.get("product_id", "") or ""),

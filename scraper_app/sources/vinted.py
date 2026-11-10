@@ -1,9 +1,11 @@
 import json
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +42,7 @@ from ..vinted_database import (
     normalize_vinted_member_id,
     save_vinted_deal_notifications,
     save_vinted_rows,
+    record_vinted_procacciatore_observations,
     track_vinted_deal_sales,
 )
 from ..vinted_access import emit_vinted_access_signal, read_vinted_access_status, wait_for_vinted_access_status
@@ -70,6 +73,39 @@ VINTED_PAGE_NOT_FOUND_PATTERN = re.compile(r"\b((?:page\s+)?not found|pagina non
 VINTED_NAVIGATION_TIMEOUT_SECONDS = 15
 VINTED_NAVIGATION_WAIT = Wait.SHORT
 VINTED_DETAIL_ITEM_TIMEOUT_SECONDS = 60
+VINTED_DOM_READY_TIMEOUT_SECONDS = 8.0
+VINTED_DOM_STABLE_OBSERVATIONS = 2
+
+
+def _arm_vinted_item_timeout(timeout_seconds: int, item_url: str):
+    """Interrupt a hung browser command while processing one listing.
+
+    Botasaurus' per-navigation timeout does not cover every synchronous CDP/DOM
+    call. On the scraper's main thread, SIGALRM gives the whole item operation a
+    hard upper bound so the caller can record a timeout and continue to the next
+    listing. Other threads retain the existing elapsed-time checks.
+    """
+    if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+        return None
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer[0] > 0:
+        # Do not overwrite a watchdog owned by another layer.
+        return None
+
+    def timeout_handler(_signum, _frame):
+        raise TimeoutError(f"listing hard timeout > {int(timeout_seconds)}s: {item_url}")
+
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, max(float(timeout_seconds), 1.0))
+    return previous_handler
+
+
+def _disarm_vinted_item_timeout(previous_handler) -> None:
+    if previous_handler is None or not hasattr(signal, "setitimer"):
+        return
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, previous_handler)
 
 
 def run_vinted_scraper(
@@ -222,10 +258,11 @@ def run_vinted_description_extractor(
 def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
     search_url = config["search_url"]
     driver.get(search_url, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
-    _wait_for_vinted_catalog_page_ready(
+    if not _wait_for_vinted_catalog_page_ready(
         driver,
         max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-    )
+    ):
+        raise RuntimeError("Il catalogo Vinted non ha raggiunto uno stato DOM stabile.")
     cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
     if cookie_action:
         time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
@@ -243,10 +280,11 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
             page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
         )
 
-    _wait_for_vinted_catalog_cards(
+    if not _wait_for_vinted_catalog_cards(
         driver,
         max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-    )
+    ):
+        raise RuntimeError("Le card del catalogo Vinted non sono comparse in modo stabile.")
     rows_by_link: dict[str, dict] = {}
     max_results = int(config.get("max_results", 100) or 0)
     max_price = _normalize_vinted_max_price(config.get("max_price"))
@@ -269,6 +307,7 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
             break
         seen_pages.add(current_page)
         pages_visited.append(current_page)
+        page_observations: list[dict] = []
 
         for payload in _read_vinted_cards(driver):
             row = _card_payload_to_row(
@@ -293,6 +332,7 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
                 filtered_out_by_min_price += 1
                 continue
             rows_by_link[row["link"]] = row
+            page_observations.append(row)
             _persist_vinted_progress_results(
                 rows=rows_by_link.values(),
                 config=config,
@@ -307,6 +347,25 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
                 live_stage="catalog",
             )
 
+        # Persist each catalog page as soon as it has been read. Do not wait for
+        # detail enrichment of every candidate: that can take several minutes
+        # and the Procacciatore report should show the inventory while the job
+        # is still running.
+        if page_observations and bool(config.get("deal_hunter_enabled", False)) and str(config.get("run_kind", "") or "") == "procacciatore":
+            try:
+                saved = record_vinted_procacciatore_observations(
+                    page_observations,
+                    db_path=str(config.get("db_path", "") or DEFAULT_VINTED_DB_PATH),
+                    snapshot_interval_seconds=int(config.get("procacciatore_snapshot_interval_seconds", 1800) or 1800),
+                )
+                print(
+                    f"[vinted-procacciatore] page-saved page={current_page} "
+                    f"observed={saved.get('observed', 0)} snapshots={saved.get('snapshots', 0)}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[vinted-procacciatore] observation-save-failed page={current_page} error={type(exc).__name__}: {exc}", flush=True)
+
         if max_results > 0 and len(rows_by_link) >= max_results:
             break
 
@@ -318,10 +377,12 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
         )
         if not next_page_url:
             break
-        _wait_for_vinted_catalog_cards(
+        if not _wait_for_vinted_catalog_cards(
             driver,
             max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-        )
+        ):
+            print("[vinted-dom] catalog cards unstable after pagination; stopping before partial extraction", flush=True)
+            break
         page_cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
         if page_cookie_action:
             time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
@@ -339,10 +400,12 @@ def _scrape_vinted_task(driver: Driver, config: dict) -> dict:
                 action_delay_seconds=float(config.get("action_delay_seconds", 1.5) or 0),
                 page_settle_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
             )
-        _wait_for_vinted_catalog_cards(
+        if not _wait_for_vinted_catalog_cards(
             driver,
             max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-        )
+        ):
+            print("[vinted-dom] catalog cards unstable after access check; stopping before partial extraction", flush=True)
+            break
 
     rows = _prioritize_vinted_rows(rows_by_link.values())
     if max_results > 0:
@@ -706,12 +769,14 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
             cached_detail_count += 1
             continue
         detail_started_at = time.monotonic()
+        item_timeout_handler = _arm_vinted_item_timeout(detail_timeout_seconds, current_link)
         try:
             driver.get(current_link, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
-            _wait_for_vinted_detail_page_ready(
+            if not _wait_for_vinted_detail_page_ready(
                 driver,
                 max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-            )
+            ):
+                raise TimeoutError("detail DOM did not become stable")
             cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
             if cookie_action:
                 time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
@@ -757,6 +822,8 @@ def _scrape_vinted_descriptions_task(driver: Driver, config: dict) -> dict:
                 page_text=str(base_row.get("raw_text", "") or ""),
                 detail_error="detail_timeout",
             )
+        finally:
+            _disarm_vinted_item_timeout(item_timeout_handler)
         if str(row.get("detail_error", "") or "").strip() == "page_not_found":
             archived = delete_vinted_item_by_link(
                 current_link,
@@ -1152,10 +1219,15 @@ def _like_vinted_deal_if_needed(
     try:
         if not page_already_open or current_url != target_url:
             driver.get(target_url, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
-            _wait_for_vinted_detail_page_ready(
+            if not _wait_for_vinted_detail_page_ready(
                 driver,
                 max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-            )
+            ):
+                return {
+                    "favorite_button_found": False,
+                    "favorite_clicked": False,
+                    "favorite_action": "skipped_dom_not_stable",
+                }
             cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
             if cookie_action:
                 time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
@@ -1341,14 +1413,16 @@ def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict)
             )
             continue
         detail_started_at = time.monotonic()
+        item_timeout_handler = _arm_vinted_item_timeout(detail_timeout_seconds, current_link)
         try:
             use_status_tab = bool(config.get("separate_status_tab", False))
             if not use_status_tab or not navigate_vinted_status_tab(driver, current_link):
                 driver.get(current_link, wait=VINTED_NAVIGATION_WAIT, timeout=VINTED_NAVIGATION_TIMEOUT_SECONDS)
-            _wait_for_vinted_detail_page_ready(
+            if not _wait_for_vinted_detail_page_ready(
                 driver,
                 max_wait_seconds=float(config.get("page_settle_seconds", 3.0) or 0),
-            )
+            ):
+                raise TimeoutError("detail DOM did not become stable")
             cookie_action = click_first_matching_text(driver, DEFAULT_COOKIE_REJECT_TEXTS)
             if cookie_action:
                 time.sleep(min(float(config.get("action_delay_seconds", 1.5) or 0), 0.35))
@@ -1397,6 +1471,8 @@ def _enrich_vinted_priority_rows(driver: Driver, rows: list[dict], config: dict)
                 page_text=str(row.get("raw_text", "") or ""),
                 detail_error="detail_timeout",
             )
+        finally:
+            _disarm_vinted_item_timeout(item_timeout_handler)
         if str(enriched_row.get("detail_error", "") or "").strip() == "page_not_found":
             archived = delete_vinted_item_by_link(
                 current_link,
@@ -1781,18 +1857,34 @@ def _wait_for_vinted_detail_page_ready(
     max_wait_seconds: float,
     poll_interval_seconds: float = 0.1,
 ) -> bool:
-    max_wait = _nonnegative_float(max_wait_seconds, 0.0)
-    if max_wait <= 0:
-        return _is_vinted_detail_page_ready(driver)
+    max_wait = max(_nonnegative_float(max_wait_seconds, 0.0), VINTED_DOM_READY_TIMEOUT_SECONDS)
     poll_interval = max(_nonnegative_float(poll_interval_seconds, 0.2), 0.05)
     deadline = time.monotonic() + max_wait
+    last_signature = ""
+    stable_observations = 0
     while True:
-        if _is_vinted_detail_page_ready(driver):
+        signature, terminal = _vinted_detail_ready_signature(driver)
+        if terminal:
+            return True
+        if signature and signature == last_signature:
+            stable_observations += 1
+        elif signature:
+            last_signature = signature
+            stable_observations = 1
+        else:
+            last_signature = ""
+            stable_observations = 0
+        if stable_observations >= VINTED_DOM_STABLE_OBSERVATIONS:
             return True
         if time.monotonic() >= deadline:
             break
         time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.05)))
-    return _is_vinted_detail_page_ready(driver)
+    print(
+        f"[vinted-dom] detail-ready timeout stable_observations={stable_observations} "
+        f"required={VINTED_DOM_STABLE_OBSERVATIONS}",
+        flush=True,
+    )
+    return False
 
 
 def _wait_for_vinted_catalog_page_ready(
@@ -1800,18 +1892,32 @@ def _wait_for_vinted_catalog_page_ready(
     max_wait_seconds: float,
     poll_interval_seconds: float = 0.1,
 ) -> bool:
-    max_wait = _nonnegative_float(max_wait_seconds, 0.0)
-    if max_wait <= 0:
-        return _is_vinted_catalog_page_ready(driver)
+    max_wait = max(_nonnegative_float(max_wait_seconds, 0.0), VINTED_DOM_READY_TIMEOUT_SECONDS)
     poll_interval = max(_nonnegative_float(poll_interval_seconds, 0.2), 0.05)
     deadline = time.monotonic() + max_wait
+    last_signature = ""
+    stable_observations = 0
     while True:
-        if _is_vinted_catalog_page_ready(driver):
+        signature = _vinted_catalog_ready_signature(driver)
+        if signature and signature == last_signature:
+            stable_observations += 1
+        elif signature:
+            last_signature = signature
+            stable_observations = 1
+        else:
+            last_signature = ""
+            stable_observations = 0
+        if stable_observations >= VINTED_DOM_STABLE_OBSERVATIONS:
             return True
         if time.monotonic() >= deadline:
             break
         time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.05)))
-    return _is_vinted_catalog_page_ready(driver)
+    print(
+        f"[vinted-dom] catalog-ready timeout stable_observations={stable_observations} "
+        f"required={VINTED_DOM_STABLE_OBSERVATIONS}",
+        flush=True,
+    )
+    return False
 
 
 def _wait_for_vinted_catalog_cards(
@@ -1819,18 +1925,99 @@ def _wait_for_vinted_catalog_cards(
     max_wait_seconds: float,
     poll_interval_seconds: float = 0.1,
 ) -> bool:
-    max_wait = _nonnegative_float(max_wait_seconds, 0.0)
-    if max_wait <= 0:
-        return _vinted_catalog_card_count(driver) > 0
+    max_wait = max(_nonnegative_float(max_wait_seconds, 0.0), VINTED_DOM_READY_TIMEOUT_SECONDS)
     poll_interval = max(_nonnegative_float(poll_interval_seconds, 0.1), 0.05)
     deadline = time.monotonic() + max_wait
+    last_signature = ""
+    stable_observations = 0
     while True:
-        if _vinted_catalog_card_count(driver) > 0:
+        signature = _vinted_catalog_cards_signature(driver)
+        if signature and signature == last_signature:
+            stable_observations += 1
+        elif signature:
+            last_signature = signature
+            stable_observations = 1
+        else:
+            last_signature = ""
+            stable_observations = 0
+        if stable_observations >= VINTED_DOM_STABLE_OBSERVATIONS:
             return True
         if time.monotonic() >= deadline:
             break
         time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.05)))
-    return _vinted_catalog_card_count(driver) > 0
+    print(
+        f"[vinted-dom] catalog-cards timeout stable_observations={stable_observations} "
+        f"required={VINTED_DOM_STABLE_OBSERVATIONS}",
+        flush=True,
+    )
+    return False
+
+
+def _vinted_detail_ready_signature(driver: Driver) -> tuple[str, bool]:
+    payload = _read_vinted_detail_payload(driver)
+    if not isinstance(payload, dict):
+        return "", False
+    if bool(payload.get("pageNotFound", False)):
+        return "page-not-found", True
+    has_title = bool(str(payload.get("title", "") or "").strip())
+    has_price = bool(str(payload.get("rawPriceText", "") or "").strip())
+    has_offer = bool(str(payload.get("offerText", "") or "").strip())
+    body_length = int(payload.get("bodyLength", 0) or 0)
+    ready_state = str(payload.get("readyState", "") or "").strip().lower()
+    ready = (has_title and (has_price or has_offer)) or (ready_state == "complete" and has_title and body_length >= 120)
+    if not ready:
+        return "", False
+    # Values used later by the extraction must remain unchanged across two DOM
+    # observations.  The body length is bucketed to tolerate harmless UI text
+    # changes while still rejecting a page that is visibly hydrating.
+    signature = "|".join(
+        [
+            ready_state,
+            str(payload.get("title", "") or "").strip(),
+            str(payload.get("rawPriceText", "") or "").strip(),
+            str(payload.get("offerText", "") or "").strip(),
+            str(payload.get("publishedText", "") or "").strip(),
+            str(payload.get("shippingText", "") or "").strip(),
+            str(payload.get("sellerMemberId", "") or "").strip(),
+            str(body_length // 80),
+        ]
+    )
+    return signature, False
+
+
+def _vinted_catalog_ready_signature(driver: Driver) -> str:
+    try:
+        payload = driver.run_js(
+            """
+const itemLinks = document.querySelectorAll('a[href*="/items/"]').length;
+const paginationNodes = document.querySelectorAll('[data-testid^="catalog-pagination--page-"]').length;
+const bodyText = (document.body ? (document.body.innerText || document.body.textContent || '') : '').trim();
+const readyState = document.readyState || '';
+const ready = (readyState === 'interactive' || readyState === 'complete') && (itemLinks > 0 || paginationNodes > 0 || bodyText.length > 160);
+return ready ? [readyState, itemLinks, paginationNodes, Math.floor(bodyText.length / 160)].join('|') : '';
+            """
+        )
+    except Exception:
+        return ""
+    return str(payload or "").strip()
+
+
+def _vinted_catalog_cards_signature(driver: Driver) -> str:
+    try:
+        payload = driver.run_js(
+            """
+const links = [...document.querySelectorAll('a[href*="/items/"]')];
+const sample = links.slice(0, 6).map((link) => {
+  const root = link.closest('[data-testid^="grid-item"], article') || link.parentElement || link;
+  const text = (root.innerText || root.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+  return `${link.href}|${text}`;
+});
+return sample.length ? `${links.length}|${sample.join('||')}` : '';
+            """
+        )
+    except Exception:
+        return ""
+    return str(payload or "").strip()
 
 
 def _vinted_catalog_card_count(driver: Driver) -> int:

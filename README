@@ -66,6 +66,49 @@ conformità e proprietà intellettuale richiedono controlli separati.
 - sul dettaglio usa il prezzo con `Protezione acquisti`, non il prezzo base
 - se un annuncio `da valutare assolutamente` risulta più vecchio di una settimana, viene riclassificato in `da valutare`
 
+#### Monitoraggio dei profili venditore
+
+Il monitoraggio profili può includere sia i tuoi profili sia quelli dei competitor:
+inserisci gli URL dei membri nella GUI oppure passali al comando `vinted_profile`.
+Il primo controllo parte subito; con un intervallo positivo il job ripete poi il
+ciclo automaticamente. `max-items` è il limite per singolo profilo; `0` prova a
+leggere tutti gli annunci disponibili.
+
+Quando un annuncio presente nello storico non compare più nel profilo, il sistema
+apre la sua pagina per determinarne lo stato. La scomparsa dal profilo da sola
+non è considerata una vendita:
+
+- `sold`: la pagina mostra esplicitamente il marker “Venduto”;
+- `unavailable`: la pagina è Not Found;
+- `gone`: la pagina dell’annuncio è ancora attiva, ma non compare più nel profilo;
+- `unknown`: il controllo non è riuscito e verrà riprovato in un ciclo successivo.
+
+Gli annunci già verificati come venduti, non disponibili o ancora attivi sulla
+pagina ma assenti dal profilo non vengono riaperti a ogni ciclo. Per le vendite,
+il tempo viene ricavato dall’età dell’annuncio quando disponibile; altrimenti si
+usa il primo avvistamento nel profilo. Se la lettura del profilo è vuota o sembra
+incompleta, il sistema conserva l’ultimo inventario completo e salta il controllo
+degli annunci mancanti per evitare falsi “venduto” o “gone”.
+
+Controllo una tantum di più profili:
+
+```bash
+python main.py run vinted_profile \
+  --profile-urls "https://www.vinted.it/member/225753959,https://www.vinted.it/member/306388399" \
+  --max-items 0 --interval-seconds 0 --db-path data/scraper.db
+```
+
+Monitoraggio continuo, con un controllo immediato e poi ogni ora:
+
+```bash
+python main.py run vinted_profile \
+  --profiles-file data/vinted_profiles.json \
+  --max-items 0 --interval-seconds 3600 --db-path data/scraper.db
+```
+
+Il controllo dettagliato degli annunci mancanti è attivo per impostazione
+predefinita. `--no-check-listing-statuses` lo disattiva esplicitamente.
+
 ## Struttura rapida
 
 ```text
